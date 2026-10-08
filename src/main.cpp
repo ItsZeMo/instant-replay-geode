@@ -165,8 +165,11 @@ $on_mod(Loaded) {
         if (down && !repeat) triggerOpenMenu();
     });
 
-    // 4. Automatically restart recording when any replay parameter is changed via Geode Mod Settings
+    // 4. Handle replay parameter changes via Geode Mod Settings (only allowed when recording is OFF)
     listenForAllSettingChanges([](std::string_view key, std::shared_ptr<SettingV3>) {
+        if (ReplayConfig::s_isSavingSettings) {
+            return;
+        }
         if (key == "save-replay" || key == "toggle-replay" || key == "toggle-buffer" || key == "open-menu") {
             return;
         }
@@ -174,6 +177,16 @@ $on_mod(Loaded) {
             return;
         }
         if (key == "enabled") {
+            return;
+        }
+
+        if (ReplayManager::get()->isReplayActive()) {
+            geode::Notification::create(
+                "Recording settings can only be changed when recording is OFF!",
+                geode::NotificationIcon::Warning,
+                1.5f
+            )->show();
+            ReplayConfig::get().saveToSettings();
             return;
         }
 
@@ -185,7 +198,6 @@ $on_mod(Loaded) {
                 AudioGrabber::get()->stopMicCapture();
             }
         }
-        ReplayManager::get()->restartReplay();
     });
 
     // 4. Scan existing hooks and enforce priority 100000 on swapBuffers

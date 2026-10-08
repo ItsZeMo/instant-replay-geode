@@ -8,7 +8,7 @@ else()
 endif()
 set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 
-project(InstantReplay VERSION 1.0.0)
+project(InstantReplay VERSION 1.0.1)
 
 add_library(${PROJECT_NAME} SHARED
     src/main.cpp

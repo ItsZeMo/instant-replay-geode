@@ -82,6 +82,18 @@ private:
     CCMenuItemToggler* m_hwAccelToggle = nullptr;
     cocos2d::CCLabelBMFont* m_hwAccelLabel = nullptr;
 
+    // Warning banner and page lock notices
+    cocos2d::CCLabelBMFont* m_lockWarningBanner = nullptr;
+    cocos2d::CCLabelBMFont* m_pageNoticeLabels[4] = {nullptr, nullptr, nullptr, nullptr};
+
+    // Action buttons that need enable/disable state
+    CCMenuItemSpriteExtra* m_toggleBtn = nullptr;
+    CCMenuItemSpriteExtra* m_quickBrowseBtn = nullptr;
+    CCMenuItemSpriteExtra* m_browseFolderBtn = nullptr;
+    CCMenuItemSpriteExtra* m_resetFolderBtn = nullptr;
+    CCMenuItemSpriteExtra* m_micPrevBtn = nullptr;
+    CCMenuItemSpriteExtra* m_micNextBtn = nullptr;
+
     // Microphone device selection
     CCMenuItemSpriteExtra* m_micDeviceBtn = nullptr;
     std::vector<AudioDeviceInfo> m_availableMics;

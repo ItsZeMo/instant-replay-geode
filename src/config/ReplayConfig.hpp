@@ -215,6 +215,8 @@ struct ReplayConfig {
         }
     }
 
+    static inline bool s_isSavingSettings = false;
+
     static ReplayConfig& get() {
         static ReplayConfig instance;
         return instance;
@@ -241,7 +243,7 @@ struct ReplayConfig {
             codec = CodecType::H264;
             hardwareAcceleration = false;
         }
-        else if (codecStr == "custom" || !customCodec.empty()) codec = CodecType::CUSTOM;
+        else if (codecStr == "custom") codec = CodecType::CUSTOM;
         else codec = CodecType::H264;
 
         std::string resStr = mod->getSettingValue<std::string>("resolution");
@@ -286,6 +288,8 @@ struct ReplayConfig {
         auto mod = geode::Mod::get();
         if (!mod) return;
 
+        s_isSavingSettings = true;
+
         (void)mod->setSettingValue("enabled", enabled);
         (void)mod->setSettingValue("duration", static_cast<int64_t>(durationSeconds));
         (void)mod->setSettingValue("hardware-accel", hardwareAcceleration);
@@ -329,6 +333,8 @@ struct ReplayConfig {
 
         // Immediate disk flush so settings survive game termination/closing
         (void)mod->saveData();
+
+        s_isSavingSettings = false;
     }
 
     // Returns the encoded video size for a given game framebuffer size.

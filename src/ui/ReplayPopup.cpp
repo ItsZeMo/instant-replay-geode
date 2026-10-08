@@ -65,6 +65,36 @@ void setBtnScale(CCMenuItemSpriteExtra* btn, float scale) {
     btn->setScale(scale);
     btn->m_baseScale = scale;
 }
+
+void setupMenuPrio(CCMenu* menu) {
+    if (!menu) return;
+    menu->setTouchPriority(-505);
+}
+
+void setupInputPrio(TextInput* input) {
+    if (!input) return;
+    if (auto inner = input->getInputNode()) {
+        inner->setTouchPriority(-505);
+    }
+}
+
+void fixAllTouchPriorities(CCNode* node) {
+    if (!node) return;
+    if (auto menu = typeinfo_cast<CCMenu*>(node)) {
+        menu->setTouchPriority(-505);
+    } else if (auto input = typeinfo_cast<TextInput*>(node)) {
+        if (auto inner = input->getInputNode()) {
+            inner->setTouchPriority(-505);
+        }
+    } else if (auto slider = typeinfo_cast<Slider*>(node)) {
+        if (slider->m_touchLogic) {
+            slider->m_touchLogic->setTouchPriority(-505);
+        }
+    }
+    for (auto child : CCArrayExt<CCNode*>(node->getChildren())) {
+        fixAllTouchPriorities(child);
+    }
+}
 }
 
 void ReplayPopup::setup() {
@@ -82,7 +112,8 @@ void ReplayPopup::setup() {
 
     // 1. Navigation Tab Bar (4 tabs)
     auto tabMenu = CCMenu::create();
-    tabMenu->setPosition(ccp(centerX, winSize.height - 48.0f));
+    tabMenu->setPosition(ccp(centerX, winSize.height - 46.0f));
+    setupMenuPrio(tabMenu);
     m_mainLayer->addChild(tabMenu);
 
     const char* tabNames[] = {"Dashboard", "Video Codec", "Bitrate (VBR)", "Audio & Storage"};
@@ -97,6 +128,13 @@ void ReplayPopup::setup() {
         m_tabButtons[i] = btn;
     }
     tabMenu->alignItemsHorizontallyWithPadding(5.0f);
+
+    // Global persistent warning banner across all tabs
+    m_lockWarningBanner = CCLabelBMFont::create("(!) Recording settings can only be changed when recording is disabled", "goldFont.fnt");
+    m_lockWarningBanner->setScale(0.32f);
+    m_lockWarningBanner->setColor(ccc3(255, 195, 45));
+    m_lockWarningBanner->setPosition(ccp(centerX, winSize.height - 62.0f));
+    m_mainLayer->addChild(m_lockWarningBanner, 50);
 
     // Create 4 Page Nodes
     for (int i = 0; i < 4; ++i) {
@@ -141,6 +179,7 @@ void ReplayPopup::setup() {
         // Action Buttons Menu
         auto actionMenu = CCMenu::create();
         actionMenu->setPosition(ccp(centerX, winSize.height - 144.0f));
+        setupMenuPrio(actionMenu);
         page->addChild(actionMenu);
 
         auto saveSpr = ButtonSprite::create("Save Replay (F6)", "goldFont.fnt", "GJ_button_01.png", 0.75f);
@@ -152,12 +191,13 @@ void ReplayPopup::setup() {
         actionMenu->addChild(saveBtn);
 
         auto toggleSpr = ButtonSprite::create("Toggle Replay", "goldFont.fnt", "GJ_button_04.png", 0.75f);
-        auto toggleBtn = CCMenuItemExt::createSpriteExtra(toggleSpr, [this](auto*) {
+        m_toggleBtn = CCMenuItemExt::createSpriteExtra(toggleSpr, [this](auto*) {
             ReplayManager::get()->toggleReplay();
+            this->refreshUI();
             this->updateStatusDisplay(0.0f);
         });
-        setBtnScale(toggleBtn, 0.68f);
-        actionMenu->addChild(toggleBtn);
+        setBtnScale(m_toggleBtn, 0.68f);
+        actionMenu->addChild(m_toggleBtn);
 
         auto folderSpr = ButtonSprite::create("Open Folder", "goldFont.fnt", "GJ_button_05.png", 0.75f);
         auto folderBtn = CCMenuItemExt::createSpriteExtra(folderSpr, [](auto*) {
@@ -177,6 +217,7 @@ void ReplayPopup::setup() {
 
         m_durationMenu = CCMenu::create();
         m_durationMenu->setPosition(ccp(centerX + 35.0f, winSize.height - 180.0f));
+        setupMenuPrio(m_durationMenu);
         page->addChild(m_durationMenu);
 
         struct DurOpt { const char* label; int seconds; };
@@ -184,9 +225,12 @@ void ReplayPopup::setup() {
         for (const auto& opt : durOpts) {
             auto spr = ButtonSprite::create(opt.label, "goldFont.fnt", "GJ_button_04.png", 0.75f);
             auto btn = CCMenuItemExt::createSpriteExtra(spr, [this, sec = opt.seconds](auto*) {
+                if (ReplayManager::get()->isReplayActive()) {
+                    Notification::create("Recording settings can only be changed when recording is OFF!", NotificationIcon::Warning, 1.2f)->show();
+                    return;
+                }
                 ReplayConfig::get().durationSeconds = sec;
                 ReplayConfig::get().saveToSettings();
-                ReplayManager::get()->restartReplay();
                 if (m_durationInput) {
                     m_durationInput->setString(std::to_string(sec));
                 }
@@ -210,14 +254,19 @@ void ReplayPopup::setup() {
         m_durationInput->setCommonFilter(CommonFilter::Uint);
         m_durationInput->setString(std::to_string(ReplayConfig::get().durationSeconds));
         m_durationInput->setPosition(ccp(160.0f, winSize.height - 215.0f));
+        setupInputPrio(m_durationInput);
         m_durationInput->setCallback([this](std::string const& str) {
+            if (ReplayManager::get()->isReplayActive()) {
+                Notification::create("Recording settings can only be changed when recording is OFF!", NotificationIcon::Warning, 1.2f)->show();
+                m_durationInput->setString(std::to_string(ReplayConfig::get().durationSeconds));
+                return;
+            }
             if (!str.empty()) {
                 try {
                     int sec = std::stoi(str);
                     sec = std::clamp(sec, 5, 3600);
                     ReplayConfig::get().durationSeconds = sec;
                     ReplayConfig::get().saveToSettings();
-                    ReplayManager::get()->restartReplay();
                     this->refreshUI();
                     this->updateStatusDisplay(0.0f);
                 } catch (...) {}
@@ -256,14 +305,20 @@ void ReplayPopup::setup() {
 
         auto folderQuickMenu = CCMenu::create();
         folderQuickMenu->setPosition(ccp(winSize.width - 80.0f, winSize.height - 250.0f));
+        setupMenuPrio(folderQuickMenu);
         page->addChild(folderQuickMenu);
 
         auto browseSpr = ButtonSprite::create("Browse", "goldFont.fnt", "GJ_button_04.png", 0.75f);
         auto browseBtn = CCMenuItemExt::createSpriteExtra(browseSpr, [this](auto*) {
+            if (ReplayManager::get()->isReplayActive()) {
+                Notification::create("Recording settings can only be changed when recording is OFF!", NotificationIcon::Warning, 1.2f)->show();
+                return;
+            }
             this->onBrowseFolder();
         });
         setBtnScale(browseBtn, 0.62f);
         folderQuickMenu->addChild(browseBtn);
+        m_quickBrowseBtn = browseBtn;
     }
 
     // =========================================================================
@@ -282,6 +337,7 @@ void ReplayPopup::setup() {
 
         m_codecMenu = CCMenu::create();
         m_codecMenu->setPosition(ccp(175.0f, winSize.height - 76.0f));
+        setupMenuPrio(m_codecMenu);
         page->addChild(m_codecMenu);
 
         struct CodecOpt { const char* label; int tag; };
@@ -293,10 +349,15 @@ void ReplayPopup::setup() {
         for (const auto& opt : codecOpts) {
             auto spr = ButtonSprite::create(opt.label, "goldFont.fnt", "GJ_button_04.png", 0.75f);
             auto btn = CCMenuItemExt::createSpriteExtra(spr, [this, tag = opt.tag](auto*) {
-                ReplayConfig::get().codec = static_cast<CodecType>(tag);
-                ReplayConfig::get().sanitizeCodecSettings();
-                ReplayConfig::get().saveToSettings();
-                ReplayManager::get()->restartReplay();
+                if (ReplayManager::get()->isReplayActive()) {
+                    Notification::create("Recording settings can only be changed when recording is OFF!", NotificationIcon::Warning, 1.2f)->show();
+                    return;
+                }
+                auto& cfg = ReplayConfig::get();
+                cfg.codec = static_cast<CodecType>(tag);
+                cfg.customCodec = "";
+                cfg.sanitizeCodecSettings();
+                cfg.saveToSettings();
                 if (m_customCodecInput) {
                     m_customCodecInput->setString("");
                 }
@@ -312,16 +373,21 @@ void ReplayPopup::setup() {
         // Hardware Acceleration Checkbox (Auto GPU: NVENC / AMF / QSV)
         auto hwMenu = CCMenu::create();
         hwMenu->setPosition(CCPointZero);
+        setupMenuPrio(hwMenu);
         page->addChild(hwMenu);
 
         float hwX = 35.0f;
         float hwY = winSize.height - 105.0f;
 
         m_hwAccelToggle = CCMenuItemExt::createTogglerWithStandardSprites(0.65f, [this](auto* toggler) {
+            if (ReplayManager::get()->isReplayActive()) {
+                Notification::create("Recording settings can only be changed when recording is OFF!", NotificationIcon::Warning, 1.2f)->show();
+                toggler->toggle(ReplayConfig::get().hardwareAcceleration);
+                return;
+            }
             auto& cfg = ReplayConfig::get();
             cfg.hardwareAcceleration = !cfg.hardwareAcceleration;
             cfg.saveToSettings();
-            ReplayManager::get()->restartReplay();
             toggler->toggle(cfg.hardwareAcceleration);
             this->refreshUI();
             this->updateStatusDisplay(0.0f);
@@ -348,14 +414,19 @@ void ReplayPopup::setup() {
         m_customCodecInput->setCommonFilter(CommonFilter::Any);
         m_customCodecInput->setString(ReplayConfig::get().customCodec);
         m_customCodecInput->setPosition(ccp(centerX - 10.0f, winSize.height - 135.0f));
+        setupInputPrio(m_customCodecInput);
         m_customCodecInput->setCallback([this](std::string const& str) {
+            if (ReplayManager::get()->isReplayActive()) {
+                Notification::create("Recording settings can only be changed when recording is OFF!", NotificationIcon::Warning, 1.2f)->show();
+                m_customCodecInput->setString(ReplayConfig::get().customCodec);
+                return;
+            }
             auto& c = ReplayConfig::get();
             c.customCodec = str;
             if (!str.empty()) {
                 c.codec = CodecType::CUSTOM;
             }
             c.saveToSettings();
-            ReplayManager::get()->restartReplay();
             this->refreshUI();
             this->updateStatusDisplay(0.0f);
         });
@@ -364,6 +435,7 @@ void ReplayPopup::setup() {
         // Guide / Info Button
         auto guideMenu = CCMenu::create();
         guideMenu->setPosition(ccp(winSize.width - 65.0f, winSize.height - 135.0f));
+        setupMenuPrio(guideMenu);
         page->addChild(guideMenu);
 
         auto guideSpr = ButtonSprite::create("? Guide", "goldFont.fnt", "GJ_button_02.png", 0.75f);
@@ -382,6 +454,7 @@ void ReplayPopup::setup() {
 
         m_resMenu = CCMenu::create();
         m_resMenu->setPosition(ccp(centerX + 35.0f, winSize.height - 162.0f));
+        setupMenuPrio(m_resMenu);
         page->addChild(m_resMenu);
 
         struct ResOpt { const char* label; int tag; };
@@ -395,13 +468,16 @@ void ReplayPopup::setup() {
         for (const auto& opt : resOpts) {
             auto spr = ButtonSprite::create(opt.label, "goldFont.fnt", "GJ_button_04.png", 0.75f);
             auto btn = CCMenuItemExt::createSpriteExtra(spr, [this, tag = opt.tag](auto*) {
+                if (ReplayManager::get()->isReplayActive()) {
+                    Notification::create("Recording settings can only be changed when recording is OFF!", NotificationIcon::Warning, 1.2f)->show();
+                    return;
+                }
                 auto newRes = static_cast<ResolutionType>(tag);
                 if (ReplayConfig::get().codec == CodecType::H264 && ReplayConfig::isH264Conflict(newRes, ReplayConfig::get().targetFps)) {
                     ReplayConfig::get().targetFps = 120;
                 }
                 ReplayConfig::get().resolution = newRes;
                 ReplayConfig::get().saveToSettings();
-                ReplayManager::get()->restartReplay();
                 this->refreshUI();
                 this->updateStatusDisplay(0.0f);
             });
@@ -420,6 +496,7 @@ void ReplayPopup::setup() {
 
         m_fpsMenu = CCMenu::create();
         m_fpsMenu->setPosition(ccp(centerX + 35.0f, winSize.height - 200.0f));
+        setupMenuPrio(m_fpsMenu);
         page->addChild(m_fpsMenu);
 
         int fpsOpts[] = { 60, 120, 240 };
@@ -428,12 +505,15 @@ void ReplayPopup::setup() {
             snprintf(buf, sizeof(buf), "%d FPS", fps);
             auto spr = ButtonSprite::create(buf, "goldFont.fnt", "GJ_button_04.png", 0.75f);
             auto btn = CCMenuItemExt::createSpriteExtra(spr, [this, fps](auto*) {
+                if (ReplayManager::get()->isReplayActive()) {
+                    Notification::create("Recording settings can only be changed when recording is OFF!", NotificationIcon::Warning, 1.2f)->show();
+                    return;
+                }
                 if (ReplayConfig::get().codec == CodecType::H264 && ReplayConfig::isH264Conflict(ReplayConfig::get().resolution, fps)) {
                     ReplayConfig::get().resolution = ResolutionType::QHD_1440P;
                 }
                 ReplayConfig::get().targetFps = fps;
                 ReplayConfig::get().saveToSettings();
-                ReplayManager::get()->restartReplay();
                 this->refreshUI();
                 this->updateStatusDisplay(0.0f);
             });
@@ -457,11 +537,11 @@ void ReplayPopup::setup() {
         m_codecConflictLabel->setVisible(false);
         page->addChild(m_codecConflictLabel);
 
-        auto infoNote = CCLabelBMFont::create("Click '? Guide' to view codec recommendations for NVIDIA, AMD, Intel & CPU.", "chatFont.fnt");
-        infoNote->setScale(0.36f);
-        infoNote->setColor(ccc3(130, 240, 190));
-        infoNote->setPosition(ccp(centerX, winSize.height - 264.0f));
-        page->addChild(infoNote);
+        m_pageNoticeLabels[1] = CCLabelBMFont::create("Select your preferred codec, GPU acceleration, resolution & FPS.", "chatFont.fnt");
+        m_pageNoticeLabels[1]->setScale(0.36f);
+        m_pageNoticeLabels[1]->setColor(ccc3(130, 240, 190));
+        m_pageNoticeLabels[1]->setPosition(ccp(centerX, winSize.height - 264.0f));
+        page->addChild(m_pageNoticeLabels[1]);
     }
 
     // =========================================================================
@@ -479,6 +559,7 @@ void ReplayPopup::setup() {
 
         m_rateControlMenu = CCMenu::create();
         m_rateControlMenu->setPosition(ccp(centerX + 40.0f, winSize.height - 82.0f));
+        setupMenuPrio(m_rateControlMenu);
         page->addChild(m_rateControlMenu);
 
         struct RCOpt { const char* label; int tag; };
@@ -489,9 +570,12 @@ void ReplayPopup::setup() {
         for (const auto& opt : rcOpts) {
             auto spr = ButtonSprite::create(opt.label, "goldFont.fnt", "GJ_button_04.png", 0.75f);
             auto btn = CCMenuItemExt::createSpriteExtra(spr, [this, tag = opt.tag](auto*) {
+                if (ReplayManager::get()->isReplayActive()) {
+                    Notification::create("Recording settings can only be changed when recording is OFF!", NotificationIcon::Warning, 1.2f)->show();
+                    return;
+                }
                 ReplayConfig::get().rateControl = static_cast<RateControlMode>(tag);
                 ReplayConfig::get().saveToSettings();
-                ReplayManager::get()->restartReplay();
                 this->refreshUI();
                 this->updateStatusDisplay(0.0f);
             });
@@ -510,6 +594,7 @@ void ReplayPopup::setup() {
 
         m_bitrateMenu = CCMenu::create();
         m_bitrateMenu->setPosition(ccp(centerX + 40.0f, winSize.height - 120.0f));
+        setupMenuPrio(m_bitrateMenu);
         page->addChild(m_bitrateMenu);
 
         int bitrates[] = { 15, 25, 35, 50, 80 };
@@ -518,12 +603,15 @@ void ReplayPopup::setup() {
             snprintf(buf, sizeof(buf), "%dM", b);
             auto spr = ButtonSprite::create(buf, "goldFont.fnt", "GJ_button_04.png", 0.75f);
             auto btn = CCMenuItemExt::createSpriteExtra(spr, [this, b](auto*) {
+                if (ReplayManager::get()->isReplayActive()) {
+                    Notification::create("Recording settings can only be changed when recording is OFF!", NotificationIcon::Warning, 1.2f)->show();
+                    return;
+                }
                 ReplayConfig::get().bitrateMbps = b;
                 if (ReplayConfig::get().maxBitrateMbps < b) {
                     ReplayConfig::get().maxBitrateMbps = b;
                 }
                 ReplayConfig::get().saveToSettings();
-                ReplayManager::get()->restartReplay();
                 if (m_customBitrateInput) {
                     m_customBitrateInput->setString(std::to_string(b));
                 }
@@ -547,7 +635,13 @@ void ReplayPopup::setup() {
         m_customBitrateInput->setCommonFilter(CommonFilter::Uint);
         m_customBitrateInput->setString(std::to_string(ReplayConfig::get().bitrateMbps));
         m_customBitrateInput->setPosition(ccp(160.0f, winSize.height - 156.0f));
+        setupInputPrio(m_customBitrateInput);
         m_customBitrateInput->setCallback([this](std::string const& str) {
+            if (ReplayManager::get()->isReplayActive()) {
+                Notification::create("Recording settings can only be changed when recording is OFF!", NotificationIcon::Warning, 1.2f)->show();
+                m_customBitrateInput->setString(std::to_string(ReplayConfig::get().bitrateMbps));
+                return;
+            }
             if (!str.empty()) {
                 try {
                     int b = std::stoi(str);
@@ -557,7 +651,6 @@ void ReplayPopup::setup() {
                         ReplayConfig::get().maxBitrateMbps = b;
                     }
                     ReplayConfig::get().saveToSettings();
-                    ReplayManager::get()->restartReplay();
                     this->refreshUI();
                     this->updateStatusDisplay(0.0f);
                 } catch (...) {}
@@ -586,6 +679,7 @@ void ReplayPopup::setup() {
 
         m_maxBitrateMenu = CCMenu::create();
         m_maxBitrateMenu->setPosition(ccp(centerX + 40.0f, winSize.height - 192.0f));
+        setupMenuPrio(m_maxBitrateMenu);
         m_peakBitrateNode->addChild(m_maxBitrateMenu);
 
         int maxBits[] = { 35, 50, 60, 80, 120 };
@@ -594,9 +688,12 @@ void ReplayPopup::setup() {
             snprintf(buf, sizeof(buf), "%dM", mb);
             auto spr = ButtonSprite::create(buf, "goldFont.fnt", "GJ_button_04.png", 0.75f);
             auto btn = CCMenuItemExt::createSpriteExtra(spr, [this, mb](auto*) {
+                if (ReplayManager::get()->isReplayActive()) {
+                    Notification::create("Recording settings can only be changed when recording is OFF!", NotificationIcon::Warning, 1.2f)->show();
+                    return;
+                }
                 ReplayConfig::get().maxBitrateMbps = mb;
                 ReplayConfig::get().saveToSettings();
-                ReplayManager::get()->restartReplay();
                 this->refreshUI();
                 this->updateStatusDisplay(0.0f);
             });
@@ -613,11 +710,11 @@ void ReplayPopup::setup() {
         m_estSizeBitrateLabel->setPosition(ccp(centerX, winSize.height - 226.0f));
         page->addChild(m_estSizeBitrateLabel);
 
-        auto vbrDesc = CCLabelBMFont::create("Adaptive VBR dynamically allocates bitrate: saves space in menus, peaks in fast gameplay.", "chatFont.fnt");
-        vbrDesc->setScale(0.38f);
-        vbrDesc->setColor(ccc3(220, 220, 160));
-        vbrDesc->setPosition(ccp(centerX, winSize.height - 252.0f));
-        page->addChild(vbrDesc);
+        m_pageNoticeLabels[2] = CCLabelBMFont::create("Adaptive VBR dynamically allocates bitrate: saves space in menus, peaks in fast gameplay.", "chatFont.fnt");
+        m_pageNoticeLabels[2]->setScale(0.38f);
+        m_pageNoticeLabels[2]->setColor(ccc3(220, 220, 160));
+        m_pageNoticeLabels[2]->setPosition(ccp(centerX, winSize.height - 252.0f));
+        page->addChild(m_pageNoticeLabels[2]);
     }
 
     // =========================================================================
@@ -628,6 +725,7 @@ void ReplayPopup::setup() {
 
         auto audioMenu = CCMenu::create();
         audioMenu->setPosition(CCPointZero);
+        setupMenuPrio(audioMenu);
         page->addChild(audioMenu);
 
         // Separate Audio Tracks
@@ -636,10 +734,14 @@ void ReplayPopup::setup() {
         float row2Y = winSize.height - 110.0f;
 
         m_splitAudioToggle = CCMenuItemExt::createTogglerWithStandardSprites(0.68f, [this](auto* toggler) {
+            if (ReplayManager::get()->isReplayActive()) {
+                Notification::create("Recording settings can only be changed when recording is OFF!", NotificationIcon::Warning, 1.2f)->show();
+                toggler->toggle(ReplayConfig::get().splitAudioTracks);
+                return;
+            }
             auto& cfg = ReplayConfig::get();
             cfg.splitAudioTracks = !cfg.splitAudioTracks;
             cfg.saveToSettings();
-            ReplayManager::get()->restartReplay();
             toggler->toggle(cfg.splitAudioTracks);
             this->updateStatusDisplay(0.0f);
         });
@@ -655,6 +757,11 @@ void ReplayPopup::setup() {
 
         // Mic Toggle
         m_micToggle = CCMenuItemExt::createTogglerWithStandardSprites(0.68f, [this](auto* toggler) {
+            if (ReplayManager::get()->isReplayActive()) {
+                Notification::create("Recording settings can only be changed when recording is OFF!", NotificationIcon::Warning, 1.2f)->show();
+                toggler->toggle(ReplayConfig::get().recordMic);
+                return;
+            }
             auto& cfg = ReplayConfig::get();
             cfg.recordMic = !cfg.recordMic;
             cfg.saveToSettings();
@@ -664,7 +771,6 @@ void ReplayPopup::setup() {
             } else {
                 AudioGrabber::get()->stopMicCapture();
             }
-            ReplayManager::get()->restartReplay();
             this->updateStatusDisplay(0.0f);
         });
         m_micToggle->toggle(ReplayConfig::get().recordMic);
@@ -696,6 +802,7 @@ void ReplayPopup::setup() {
 
         m_micDevMenu = CCMenu::create();
         m_micDevMenu->setPosition(ccp(270.0f, winSize.height - 138.0f));
+        setupMenuPrio(m_micDevMenu);
         page->addChild(m_micDevMenu);
 
         auto prevSpr = CCSprite::createWithSpriteFrameName("GJ_arrow_03_001.png");
@@ -704,6 +811,7 @@ void ReplayPopup::setup() {
         });
         setBtnScale(prevBtn, 0.65f);
         m_micDevMenu->addChild(prevBtn);
+        m_micPrevBtn = prevBtn;
 
         std::string initialName = m_availableMics.empty() ? "Default Device" : m_availableMics[m_currentMicIndex].name;
         if (initialName.length() > 24) {
@@ -723,6 +831,7 @@ void ReplayPopup::setup() {
         });
         setBtnScale(nextBtn, 0.65f);
         m_micDevMenu->addChild(nextBtn);
+        m_micNextBtn = nextBtn;
 
         m_micDevMenu->alignItemsHorizontallyWithPadding(6.0f);
 
@@ -782,10 +891,15 @@ void ReplayPopup::setup() {
         m_saveFolderInput->setCommonFilter(CommonFilter::Any);
         m_saveFolderInput->setString(ReplayConfig::get().customSaveFolder);
         m_saveFolderInput->setPosition(ccp(centerX - 10.0f, winSize.height - 224.0f));
+        setupInputPrio(m_saveFolderInput);
         m_saveFolderInput->setCallback([this](std::string const& str) {
+            if (ReplayManager::get()->isReplayActive()) {
+                Notification::create("Recording settings can only be changed when recording is OFF!", NotificationIcon::Warning, 1.2f)->show();
+                m_saveFolderInput->setString(ReplayConfig::get().customSaveFolder);
+                return;
+            }
             ReplayConfig::get().customSaveFolder = str;
             ReplayConfig::get().saveToSettings();
-            ReplayManager::get()->restartReplay();
             this->updateFolderDisplay();
         });
         page->addChild(m_saveFolderInput);
@@ -793,6 +907,7 @@ void ReplayPopup::setup() {
         // Storage Action Buttons
         auto storageActionMenu = CCMenu::create();
         storageActionMenu->setPosition(ccp(centerX, winSize.height - 258.0f));
+        setupMenuPrio(storageActionMenu);
         page->addChild(storageActionMenu);
 
         auto bSpr = ButtonSprite::create("Browse...", "goldFont.fnt", "GJ_button_01.png", 0.75f);
@@ -801,6 +916,7 @@ void ReplayPopup::setup() {
         });
         setBtnScale(bBtn, 0.65f);
         storageActionMenu->addChild(bBtn);
+        m_browseFolderBtn = bBtn;
 
         auto oSpr = ButtonSprite::create("Open Folder", "goldFont.fnt", "GJ_button_05.png", 0.75f);
         auto oBtn = CCMenuItemExt::createSpriteExtra(oSpr, [](auto*) {
@@ -815,9 +931,12 @@ void ReplayPopup::setup() {
         });
         setBtnScale(rBtn, 0.65f);
         storageActionMenu->addChild(rBtn);
+        m_resetFolderBtn = rBtn;
 
         storageActionMenu->alignItemsHorizontallyWithPadding(8.0f);
     }
+
+    fixAllTouchPriorities(m_mainLayer);
 
     switchTab(0);
     this->schedule(schedule_selector(ReplayPopup::updateStatusDisplay), 0.5f);
@@ -856,6 +975,10 @@ void ReplayPopup::updateFolderDisplay() {
 }
 
 void ReplayPopup::onBrowseFolder() {
+    if (ReplayManager::get()->isReplayActive()) {
+        Notification::create("Recording settings can only be changed when recording is OFF!", NotificationIcon::Warning, 1.2f)->show();
+        return;
+    }
     auto defaultDir = ReplayConfig::get().getRecordingsDirectory();
 
     file::FilePickOptions options;
@@ -869,7 +992,6 @@ void ReplayPopup::onBrowseFolder() {
                 auto path = std::move(result).unwrap().value();
                 ReplayConfig::get().customSaveFolder = path.string();
                 ReplayConfig::get().saveToSettings();
-                ReplayManager::get()->restartReplay();
                 self->updateFolderDisplay();
                 Notification::create("Save folder updated", NotificationIcon::Success, 1.0f)->show();
             }
@@ -878,18 +1000,28 @@ void ReplayPopup::onBrowseFolder() {
 }
 
 void ReplayPopup::onResetFolder() {
+    if (ReplayManager::get()->isReplayActive()) {
+        Notification::create("Recording settings can only be changed when recording is OFF!", NotificationIcon::Warning, 1.2f)->show();
+        return;
+    }
     ReplayConfig::get().customSaveFolder = "";
     ReplayConfig::get().saveToSettings();
-    ReplayManager::get()->restartReplay();
     updateFolderDisplay();
 }
 
 void ReplayPopup::restartReplayScheduled(float) {
-    ReplayManager::get()->restartReplay();
+    if (ReplayManager::get()->isReplayActive()) {
+        ReplayManager::get()->restartReplay();
+    }
 }
 
 void ReplayPopup::onGameVolumeChanged(CCObject*) {
     if (!m_gameVolSlider) return;
+    if (ReplayManager::get()->isReplayActive()) {
+        Notification::create("Recording settings can only be changed when recording is OFF!", NotificationIcon::Warning, 1.2f)->show();
+        m_gameVolSlider->setValue(std::clamp(ReplayConfig::get().systemVolume / 1.5f, 0.0f, 1.0f));
+        return;
+    }
     float val = m_gameVolSlider->getValue();
     float vol = val * 1.5f;
     auto& cfg = ReplayConfig::get();
@@ -899,12 +1031,15 @@ void ReplayPopup::onGameVolumeChanged(CCObject*) {
         int pct = static_cast<int>(vol * 100.0f + 0.5f);
         m_gameVolLabel->setString((std::to_string(pct) + "%").c_str());
     }
-    this->unschedule(schedule_selector(ReplayPopup::restartReplayScheduled));
-    this->scheduleOnce(schedule_selector(ReplayPopup::restartReplayScheduled), 0.35f);
 }
 
 void ReplayPopup::onMicVolumeChanged(CCObject*) {
     if (!m_micVolSlider) return;
+    if (ReplayManager::get()->isReplayActive()) {
+        Notification::create("Recording settings can only be changed when recording is OFF!", NotificationIcon::Warning, 1.2f)->show();
+        m_micVolSlider->setValue(std::clamp(ReplayConfig::get().micVolume / 1.5f, 0.0f, 1.0f));
+        return;
+    }
     float val = m_micVolSlider->getValue();
     float vol = val * 1.5f;
     auto& cfg = ReplayConfig::get();
@@ -914,24 +1049,46 @@ void ReplayPopup::onMicVolumeChanged(CCObject*) {
         int pct = static_cast<int>(vol * 100.0f + 0.5f);
         m_micVolLabel->setString((std::to_string(pct) + "%").c_str());
     }
-    this->unschedule(schedule_selector(ReplayPopup::restartReplayScheduled));
-    this->scheduleOnce(schedule_selector(ReplayPopup::restartReplayScheduled), 0.35f);
 }
 
 void ReplayPopup::updateStatusDisplay(float) {
     auto mgr = ReplayManager::get();
+    bool isRec = mgr->isReplayActive();
 
     if (m_statusLabel) {
-        m_statusLabel->setString(mgr->getStatusText().c_str());
+        if (mgr->isSaving()) {
+            m_statusLabel->setString("Saving Replay...");
+        } else if (isRec) {
+            m_statusLabel->setString("Replay Active (Settings Locked)");
+        } else {
+            m_statusLabel->setString("Replay Disabled (Ready to Configure)");
+        }
     }
 
     if (m_statusDot) {
         if (mgr->isSaving()) {
             m_statusDot->setColor(ccc3(0, 220, 255)); // Cyan
-        } else if (mgr->isReplayActive()) {
+        } else if (isRec) {
             m_statusDot->setColor(ccc3(50, 255, 50)); // Green
         } else {
             m_statusDot->setColor(ccc3(255, 60, 60)); // Red
+        }
+    }
+
+    if (m_lockWarningBanner) {
+        if (isRec) {
+            m_lockWarningBanner->setString("(!) Recording is ACTIVE: settings locked! Stop recording to edit.");
+            m_lockWarningBanner->setColor(ccc3(255, 85, 85));
+        } else {
+            m_lockWarningBanner->setString("Settings Unlocked: modify parameters, then start recording.");
+            m_lockWarningBanner->setColor(ccc3(110, 245, 140));
+        }
+    }
+
+    if (m_toggleBtn) {
+        if (auto spr = typeinfo_cast<ButtonSprite*>(m_toggleBtn->getNormalImage())) {
+            spr->setString(isRec ? "Stop Recording" : "Start Recording");
+            spr->updateBGImage(isRec ? "GJ_button_06.png" : "GJ_button_01.png");
         }
     }
 
@@ -1143,6 +1300,10 @@ void ReplayPopup::refreshUI() {
 }
 
 void ReplayPopup::cycleMicDevice(int direction) {
+    if (ReplayManager::get()->isReplayActive()) {
+        Notification::create("Recording settings can only be changed when recording is OFF!", NotificationIcon::Warning, 1.2f)->show();
+        return;
+    }
     if (m_availableMics.empty()) return;
 
     int n = static_cast<int>(m_availableMics.size());
@@ -1154,7 +1315,6 @@ void ReplayPopup::cycleMicDevice(int direction) {
     cfg.saveToSettings();
 
     AudioGrabber::get()->restartMicCapture();
-    ReplayManager::get()->restartReplay();
 
     refreshMicDeviceButton();
 
