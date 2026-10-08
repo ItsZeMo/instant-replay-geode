@@ -1,0 +1,8 @@
+build/
+*.geode
+*.dll
+*.pdb
+*.obj
+.cache/
+.vs/
+.idea/

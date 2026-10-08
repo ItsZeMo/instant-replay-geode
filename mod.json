@@ -1,0 +1,245 @@
+{
+    "geode": "5.10.1",
+    "gd": {
+        "win": "2.2081",
+        "mac": "2.2081",
+        "android": "2.2081",
+        "ios": "2.2081"
+    },
+    "version": "v1.0.0",
+    "id": "zemo.instant-replay",
+    "name": "Instant Replay",
+    "developer": "ZeMo",
+    "description": "Capture your best completions and new bests with zero FPS loss! GPU hardware-accelerated Instant Replay featuring AV1, HEVC, H.264, Adaptive VBR, multi-track studio audio, mic device picker, and real-time file size estimator.",
+    "links": {
+        "source": "https://github.com/ItsZeMo/instant-replay-geode"
+    },
+    "tags": [
+        "recording",
+        "utility",
+        "customization"
+    ],
+    "settings": {
+        "general-title": {
+            "name": "General Settings",
+            "type": "title"
+        },
+        "enabled": {
+            "name": "Background Replay Active",
+            "description": "Keep instant replay active in background",
+            "type": "bool",
+            "default": true
+        },
+        "duration": {
+            "name": "Replay Duration (Seconds)",
+            "description": "How many last seconds of gameplay to save (e.g. 30s, 60s = 1m, 120s = 2m, 300s = 5m, up to 3600s = 1h)",
+            "type": "int",
+            "default": 120,
+            "min": 5,
+            "max": 3600,
+            "control": {
+                "slider": true,
+                "step": 5
+            }
+        },
+        "video-title": {
+            "name": "Video & Codec",
+            "type": "title"
+        },
+        "codec": {
+            "name": "Video Codec",
+            "description": "Video encoding format: av1, hevc, h264, or custom",
+            "type": "string",
+            "default": "av1",
+            "one-of": [
+                "av1",
+                "hevc",
+                "h264",
+                "custom"
+            ]
+        },
+        "hardware-accel": {
+            "name": "Hardware Acceleration (GPU)",
+            "description": "Automatically use GPU hardware encoder (NVIDIA NVENC, AMD AMF, Intel QuickSync) based on your graphics card. Falls back to CPU software encoding if disabled.",
+            "type": "bool",
+            "default": true
+        },
+        "custom-codec": {
+            "name": "Custom Codec Name",
+            "description": "Custom codec for your GPU/CPU (e.g. av1_nvenc, hevc_nvenc, h264_nvenc, amf_av1, qsv_av1, software_h264)",
+            "type": "string",
+            "default": ""
+        },
+        "resolution": {
+            "name": "Resolution",
+            "description": "Recording resolution (Native = 1:1 Game Resolution)",
+            "type": "string",
+            "default": "native",
+            "one-of": [
+                "native",
+                "2160p",
+                "1440p",
+                "1080p",
+                "720p"
+            ]
+        },
+        "fps": {
+            "name": "Frame Rate (FPS)",
+            "description": "Target video frame rate (60, 120, 240)",
+            "type": "int",
+            "default": 60,
+            "min": 30,
+            "max": 240,
+            "control": {
+                "slider": true,
+                "step": 30
+            }
+        },
+        "rate-control-title": {
+            "name": "Bitrate & Rate Control",
+            "type": "title"
+        },
+        "rate-control": {
+            "name": "Rate Control Mode",
+            "description": "Adaptive VBR dynamically scales bitrate based on scene motion complexity. CBR is fixed. CQ targets constant visual quality.",
+            "type": "string",
+            "default": "adaptive_vbr",
+            "one-of": [
+                "adaptive_vbr",
+                "constant_cbr",
+                "constant_quality"
+            ]
+        },
+        "bitrate": {
+            "name": "Target Bitrate (Mbps)",
+            "description": "Average target bitrate in Megabits per second",
+            "type": "int",
+            "default": 35,
+            "min": 5,
+            "max": 120,
+            "control": {
+                "slider": true,
+                "step": 5
+            }
+        },
+        "max-bitrate": {
+            "name": "Max Peak Bitrate (Mbps)",
+            "description": "Maximum peak bitrate for high-speed gameplay during Adaptive VBR",
+            "type": "int",
+            "default": 60,
+            "min": 10,
+            "max": 150,
+            "control": {
+                "slider": true,
+                "step": 5
+            }
+        },
+        "quality-level": {
+            "name": "Quality Factor (CQ)",
+            "description": "Constant quality factor from 20 (low) to 100 (near lossless)",
+            "type": "int",
+            "default": 80,
+            "min": 20,
+            "max": 100,
+            "control": {
+                "slider": true,
+                "step": 5
+            }
+        },
+        "audio-title": {
+            "name": "Audio Settings",
+            "type": "title"
+        },
+        "split-audio": {
+            "name": "Separate Audio Tracks",
+            "description": "Record Game Audio and Microphone into TWO SEPARATE audio tracks in MP4 (for DaVinci Resolve, Premiere Pro, Vegas)",
+            "type": "bool",
+            "default": true
+        },
+        "record-mic": {
+            "name": "Record Microphone",
+            "description": "Enable microphone audio capture",
+            "type": "bool",
+            "default": true
+        },
+        "mic-device-id": {
+            "name": "Microphone Device ID",
+            "description": "Selected microphone device endpoint ID",
+            "type": "string",
+            "default": "default"
+        },
+        "mic-device-name": {
+            "name": "Microphone Device Name",
+            "description": "Selected microphone friendly name",
+            "type": "string",
+            "default": "Default System Device"
+        },
+        "system-volume": {
+            "name": "Game Audio Volume",
+            "description": "Volume multiplier for game/system audio",
+            "type": "float",
+            "default": 1.0,
+            "min": 0.0,
+            "max": 2.0,
+            "control": {
+                "slider": true
+            }
+        },
+        "mic-volume": {
+            "name": "Microphone Volume",
+            "description": "Volume multiplier for microphone audio",
+            "type": "float",
+            "default": 1.0,
+            "min": 0.0,
+            "max": 2.0,
+            "control": {
+                "slider": true
+            }
+        },
+        "storage-title": {
+            "name": "Storage & Save Location",
+            "type": "title"
+        },
+        "save-folder": {
+            "name": "Save Directory Path",
+            "description": "Custom folder path to save replay MP4 videos (leave empty for default Videos/Geometry Dash)",
+            "type": "string",
+            "default": ""
+        },
+        "overlay-title": {
+            "name": "Overlay & Notifications",
+            "type": "title"
+        },
+        "show-notification": {
+            "name": "Show Toast Notification",
+            "description": "Show floating notification banner when replay is saved",
+            "type": "bool",
+            "default": true
+        },
+        "keybinds-title": {
+            "name": "Keybinds (Custom Keybinds compatible)",
+            "type": "title"
+        },
+        "save-replay": {
+            "name": "Save Instant Replay",
+            "description": "Save the last minutes of gameplay to an MP4 video file (F6 default)",
+            "type": "keybind",
+            "category": "universal",
+            "default": "F6"
+        },
+        "toggle-replay": {
+            "name": "Toggle Instant Replay",
+            "description": "Turn background replay on or off (Ctrl+F6 default)",
+            "type": "keybind",
+            "category": "universal",
+            "default": "Ctrl+F6"
+        },
+        "open-menu": {
+            "name": "Open Instant Replay Menu",
+            "description": "Open Instant Replay management and settings popup (F9 default)",
+            "type": "keybind",
+            "category": "universal",
+            "default": "F9"
+        }
+    }
+}
