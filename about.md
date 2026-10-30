@@ -1,7 +1,7 @@
 # 🎬 Instant Replay
 
 > **Developer:** **ZeMo**  
-> **Version:** **v1.0.0** | **Platform:** Windows 64-bit (Geometry Dash 2.2081 / Geode v5.10.1)
+> **Version:** **v1.0.2** | **Platform:** Windows 64-bit (Geometry Dash 2.2081 / Geode v5.10.1)
 
 Never lose an epic demon completion, new best, or hilarious fail again! **Instant Replay** brings high-performance, background replay recording directly into Geometry Dash with zero FPS impact, GPU hardware acceleration, adaptive bitrate, multi-track audio, and seamless Geode integration.
 

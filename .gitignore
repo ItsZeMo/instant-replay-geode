@@ -1,8 +1,15 @@
 build/
+out/
 *.geode
 *.dll
 *.pdb
 *.obj
+*.lib
+*.exp
 .cache/
 .vs/
+.vscode/
 .idea/
+CMakeFiles/
+CMakeCache.txt
+compile_commands.json
