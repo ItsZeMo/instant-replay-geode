@@ -16,31 +16,27 @@ using namespace geode::prelude;
 using namespace replay;
 
 static bool isKeybindMatch(cocos2d::enumKeyCodes key, KeyboardModifier mods, std::string const& settingKey, Keybind const& defaultBind) {
-    uint8_t defMods = defaultBind.modifiers.value & (KeyboardModifier::Shift | KeyboardModifier::Control | KeyboardModifier::Alt | KeyboardModifier::Super);
-    uint8_t curMods = mods.value & (KeyboardModifier::Shift | KeyboardModifier::Control | KeyboardModifier::Alt | KeyboardModifier::Super);
+    constexpr uint8_t kModMask = KeyboardModifier::Shift | KeyboardModifier::Control | KeyboardModifier::Alt | KeyboardModifier::Super;
+    uint8_t curMods = mods.value & kModMask;
 
-    // Default bind (F6, Ctrl+F6, F9) always matches
-    if (defaultBind.key == key && defMods == curMods) {
-        return true;
-    }
-
-    auto mod = geode::Mod::get();
-    if (auto setting = mod->getSetting(settingKey)) {
-        if (auto kbSetting = geode::cast::typeinfo_pointer_cast<KeybindSettingV3>(setting)) {
-            auto const& list = kbSetting->getValue();
-            for (auto const& kb : list) {
-                // Ignore leftover Alt+F10 from previous version so it never clashes with Nvidia
-                if (kb.key == KEY_F10 && (kb.modifiers.value & KeyboardModifier::Alt)) {
-                    continue;
+    if (auto mod = geode::Mod::get()) {
+        if (auto setting = mod->getSetting(settingKey)) {
+            if (auto kbSetting = geode::cast::typeinfo_pointer_cast<KeybindSettingV3>(setting)) {
+                auto const& list = kbSetting->getValue();
+                for (auto const& kb : list) {
+                    uint8_t kbMods = kb.modifiers.value & kModMask;
+                    if (kb.key == key && kbMods == curMods) {
+                        return true;
+                    }
                 }
-                uint8_t kbMods = kb.modifiers.value & (KeyboardModifier::Shift | KeyboardModifier::Control | KeyboardModifier::Alt | KeyboardModifier::Super);
-                if (kb.key == key && kbMods == curMods) {
-                    return true;
-                }
+                return false;
             }
         }
     }
-    return false;
+
+    // Fallback to default bind only if the setting does not exist
+    uint8_t defMods = defaultBind.modifiers.value & kModMask;
+    return defaultBind.key == key && defMods == curMods;
 }
 
 static void triggerSaveReplay() {
@@ -104,8 +100,7 @@ static bool handleKeyPress(cocos2d::enumKeyCodes key, KeyboardModifier mods) {
     }
 
     // 2. Toggle Replay (Default: Ctrl+F6)
-    if (isKeybindMatch(key, mods, "toggle-replay", Keybind(KEY_F6, KeyboardModifier::Control)) ||
-        isKeybindMatch(key, mods, "toggle-buffer", Keybind(KEY_F6, KeyboardModifier::Control))) {
+    if (isKeybindMatch(key, mods, "toggle-replay", Keybind(KEY_F6, KeyboardModifier::Control))) {
         triggerToggleReplay();
         return true;
     }
@@ -174,9 +169,16 @@ $on_mod(Loaded) {
             return;
         }
         if (key == "show-notification") {
+            if (auto mod = geode::Mod::get()) {
+                ReplayConfig::get().showNotification = mod->getSettingValue<bool>("show-notification");
+            }
             return;
         }
         if (key == "enabled") {
+            if (auto mod = geode::Mod::get()) {
+                bool newEnabled = mod->getSettingValue<bool>("enabled");
+                ReplayManager::get()->setReplayEnabled(newEnabled);
+            }
             return;
         }
 

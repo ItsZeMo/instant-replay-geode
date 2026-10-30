@@ -57,7 +57,8 @@ private:
     std::chrono::steady_clock::time_point m_pboTime[2];
     int m_pboIndex = 0;
 
-    std::chrono::steady_clock::time_point m_lastCaptureTime;
+    std::chrono::steady_clock::time_point m_nextCaptureTime{};
+    int m_lastTargetFps = 0;
     FrameCallback m_callback;
 };
 

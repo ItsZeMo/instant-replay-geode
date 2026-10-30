@@ -12,9 +12,7 @@ FrameGrabber* FrameGrabber::get() {
     return &instance;
 }
 
-FrameGrabber::FrameGrabber() {
-    m_lastCaptureTime = std::chrono::steady_clock::now();
-}
+FrameGrabber::FrameGrabber() = default;
 
 FrameGrabber::~FrameGrabber() {
     cleanup();
@@ -118,14 +116,23 @@ void FrameGrabber::captureCurrentFrame() {
     const auto& config = ReplayConfig::get();
     if (!config.enabled) return;
 
-    // Throttle capture to target FPS
+    // Throttle capture to target FPS while preserving fractional frame-interval remainders
+    int targetFps = std::max(1, config.targetFps);
+    auto interval = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<double>(1.0 / static_cast<double>(targetFps))
+    );
     auto now = std::chrono::steady_clock::now();
-    double minInterval = 1.0 / static_cast<double>(std::max(1, config.targetFps));
-    double elapsed = std::chrono::duration<double>(now - m_lastCaptureTime).count();
-    if (elapsed < (minInterval - 0.002)) {
+    if (m_lastTargetFps != targetFps) {
+        m_lastTargetFps = targetFps;
+        m_nextCaptureTime = now;
+    }
+    if (now < m_nextCaptureTime) {
         return;
     }
-    m_lastCaptureTime = now;
+    m_nextCaptureTime += interval;
+    if (m_nextCaptureTime <= now) {
+        m_nextCaptureTime = now + interval;
+    }
 
     if (!m_initialized) {
         initialize();

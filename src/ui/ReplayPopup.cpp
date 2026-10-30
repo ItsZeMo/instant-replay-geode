@@ -565,7 +565,8 @@ void ReplayPopup::setup() {
         struct RCOpt { const char* label; int tag; };
         RCOpt rcOpts[] = {
             {"Adaptive (VBR)", 0},
-            {"Constant (CBR)", 1}
+            {"Constant (CBR)", 1},
+            {"Quality (CQ)", 2}
         };
         for (const auto& opt : rcOpts) {
             auto spr = ButtonSprite::create(opt.label, "goldFont.fnt", "GJ_button_04.png", 0.75f);
@@ -579,11 +580,11 @@ void ReplayPopup::setup() {
                 this->refreshUI();
                 this->updateStatusDisplay(0.0f);
             });
-            setBtnScale(btn, 0.62f);
+            setBtnScale(btn, 0.56f);
             btn->setTag(opt.tag);
             m_rateControlMenu->addChild(btn);
         }
-        m_rateControlMenu->alignItemsHorizontallyWithPadding(10.0f);
+        m_rateControlMenu->alignItemsHorizontallyWithPadding(6.0f);
 
         // Target Bitrate Row
         auto bitTitle = CCLabelBMFont::create("Target Bitrate:", "goldFont.fnt");
@@ -1117,10 +1118,13 @@ void ReplayPopup::updateStatusDisplay(float) {
         else if (cfg.resolution == ResolutionType::FHD_1080P) rName = "1080p";
         else if (cfg.resolution == ResolutionType::HD_720P) rName = "720p";
 
-        const char* rcName = (cfg.rateControl == RateControlMode::CONSTANT_CBR) ? "CBR" : "Adaptive VBR";
-
         char buf[160];
-        snprintf(buf, sizeof(buf), "%s | %s | %d Mbps (%s)", cName.c_str(), rName, cfg.getEffectiveBitrateMbps(), rcName);
+        if (cfg.rateControl == RateControlMode::CONSTANT_QUALITY) {
+            snprintf(buf, sizeof(buf), "%s | %s | CQ %d%% (~%d Mbps)", cName.c_str(), rName, cfg.qualityLevel, cfg.getEffectiveBitrateMbps());
+        } else {
+            const char* rcName = (cfg.rateControl == RateControlMode::CONSTANT_CBR) ? "CBR" : "Adaptive VBR";
+            snprintf(buf, sizeof(buf), "%s | %s | %d Mbps (%s)", cName.c_str(), rName, cfg.getEffectiveBitrateMbps(), rcName);
+        }
         m_codecBadgeLabel->setString(buf);
     }
 
@@ -1230,7 +1234,7 @@ void ReplayPopup::refreshUI() {
     }
 
     // Rate Control highlight
-    bool isCBR = (cfg.rateControl == RateControlMode::CONSTANT_CBR);
+    bool isVBR = (cfg.rateControl == RateControlMode::ADAPTIVE_VBR);
     if (m_rateControlMenu) {
         int curRcTag = static_cast<int>(cfg.rateControl);
         for (auto child : CCArrayExt<CCNode*>(m_rateControlMenu->getChildren())) {
@@ -1260,9 +1264,9 @@ void ReplayPopup::refreshUI() {
         m_customBitrateInput->setString(std::to_string(cfg.bitrateMbps));
     }
 
-    // Peak Bitrate node visibility (hide in CBR mode)
+    // Peak Bitrate node visibility (only in Adaptive VBR mode)
     if (m_peakBitrateNode) {
-        m_peakBitrateNode->setVisible(!isCBR);
+        m_peakBitrateNode->setVisible(isVBR);
     }
 
     // Peak Bitrate highlight

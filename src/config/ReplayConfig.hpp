@@ -95,6 +95,11 @@ struct ReplayConfig {
             return std::clamp(bitrateMbps, 2, 250);
         }
         double mult = getResolutionMultiplier() * getFpsMultiplier() * getCodecMultiplier();
+        if (rateControl == RateControlMode::CONSTANT_QUALITY) {
+            double qMult = static_cast<double>(std::clamp(qualityLevel, 20, 100)) / 80.0;
+            int val = static_cast<int>(bitrateMbps * mult * qMult + 0.5);
+            return std::clamp(val, 5, 250);
+        }
         int val = static_cast<int>(bitrateMbps * mult + 0.5);
         return std::clamp(val, 5, 250);
     }
@@ -255,24 +260,18 @@ struct ReplayConfig {
 
         std::string rcStr = mod->getSettingValue<std::string>("rate-control");
         if (rcStr == "constant_cbr") rateControl = RateControlMode::CONSTANT_CBR;
+        else if (rcStr == "constant_quality") rateControl = RateControlMode::CONSTANT_QUALITY;
         else rateControl = RateControlMode::ADAPTIVE_VBR;
 
         bitrateMbps = static_cast<int>(mod->getSettingValue<int64_t>("bitrate"));
         maxBitrateMbps = static_cast<int>(mod->getSettingValue<int64_t>("max-bitrate"));
-        qualityLevel = static_cast<int>(mod->getSettingValue<int64_t>("quality-level"));
+        qualityLevel = std::clamp(static_cast<int>(mod->getSettingValue<int64_t>("quality-level")), 20, 100);
         targetFps = static_cast<int>(mod->getSettingValue<int64_t>("fps"));
 
         sanitizeCodecSettings();
 
         splitAudioTracks = mod->getSettingValue<bool>("split-audio");
         recordMic = mod->getSettingValue<bool>("record-mic");
-
-        if (mod->hasSavedValue("split-audio")) {
-            splitAudioTracks = mod->getSavedValue<bool>("split-audio");
-        }
-        if (mod->hasSavedValue("record-mic")) {
-            recordMic = mod->getSavedValue<bool>("record-mic");
-        }
 
         micDeviceId = mod->getSettingValue<std::string>("mic-device-id");
         micDeviceName = mod->getSettingValue<std::string>("mic-device-name");
@@ -325,11 +324,7 @@ struct ReplayConfig {
         (void)mod->setSettingValue("mic-device-name", micDeviceName);
         (void)mod->setSettingValue("system-volume", static_cast<double>(systemVolume));
         (void)mod->setSettingValue("mic-volume", static_cast<double>(micVolume));
-
-        // Persistent save values
-        mod->setSavedValue("record-mic", recordMic);
-        mod->setSavedValue("split-audio", splitAudioTracks);
-        mod->setSavedValue("hardware-accel", hardwareAcceleration);
+        (void)mod->setSettingValue("show-notification", showNotification);
 
         // Immediate disk flush so settings survive game termination/closing
         (void)mod->saveData();

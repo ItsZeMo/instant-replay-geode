@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 #include <deque>
+#include <set>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -20,6 +21,7 @@ struct SegmentInfo {
     std::wstring filePath;
     std::chrono::steady_clock::time_point startTime;
     double durationSeconds = 0.0;
+    std::string formatKey; // segments can only be merged with segments of the same format
 };
 
 class ReplayManager {
@@ -33,6 +35,8 @@ public:
     void saveReplay();
     void toggleReplay();
     void toggleBuffer() { toggleReplay(); }
+    // Applies the "enabled" state (e.g. from Geode settings) to the running recorder
+    void setReplayEnabled(bool enabled);
     void restartReplay();
     void restartBuffer() { restartReplay(); }
     bool isReplayActive() const { return m_running.load(); }
@@ -61,9 +65,22 @@ private:
     void finalizeCurrentSegment();
     void startNewSegment();
     void rotateSegment();
-    void handleSaveRequest();
+    void handleSaveRequest(bool continueRecording);
     void purgeOldSegments();
     void cleanupTempDir();
+    void joinExportThread();
+
+    // Segment file ownership: files used by a running export are never deleted
+    // directly, deletion is deferred until the export releases them.
+    // Both require m_segmentMutex to be held.
+    void deleteSegmentFileLocked(const std::wstring& path);
+    void flushDeferredDeletesLocked();
+    void releaseExportSegments(const std::vector<std::wstring>& paths);
+
+    // Single-track microphone mixer (recordMic && !splitAudioTracks)
+    void resetMicMixer();
+    void appendMicToMix(const AudioChunk& chunk, int targetRate);
+    void mixMicInto(std::vector<float>& gameSamples, int channels);
 
     std::filesystem::path getTempDir() const;
 
@@ -73,8 +90,9 @@ private:
 
     std::unique_ptr<MediaFoundationEncoder> m_encoder;
     std::wstring m_currentSegmentPath;
+    std::string m_currentFormatKey;
     std::chrono::steady_clock::time_point m_currentSegmentStart;
-    int m_segmentIndex = 0;
+    int m_segmentIndex = 0; // monotonic for the whole session: names never collide with files still being exported
 
     // Encoder video size = size of the frames actually delivered by FrameGrabber
     int m_videoWidth = 0;
@@ -84,7 +102,21 @@ private:
     int64_t m_micAudioSamples = 0;
 
     std::vector<SegmentInfo> m_activeSegments;
+    std::multiset<std::wstring> m_exportLockedSegments;
+    std::vector<std::wstring> m_deferredDeletes;
     mutable std::mutex m_segmentMutex;
+
+    // Export (merge) thread - owned, joined before a new export and on cleanup
+    std::thread m_exportThread;
+    std::mutex m_exportMutex;
+
+    // Microphone mix state (worker thread only)
+    bool m_mixMicIntoGame = false;
+    std::deque<float> m_micMixFifo; // interleaved stereo at m_micMixRate
+    int m_micMixRate = 0;
+    double m_micResamplePos = 0.0;
+    float m_micPrev[2] = {0.0f, 0.0f};
+    bool m_micHasPrev = false;
 
     // Queues for worker thread
     std::deque<std::shared_ptr<CapturedFrame>> m_frameQueue;
