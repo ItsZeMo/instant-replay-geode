@@ -1,4 +1,7 @@
 #include "CodecGuidePopup.hpp"
+
+#ifdef GEODE_IS_WINDOWS
+
 #include <cocos2d.h>
 
 using namespace cocos2d;
@@ -109,3 +112,5 @@ void CodecGuidePopup::setup() {
 }
 
 } // namespace replay
+
+#endif // GEODE_IS_WINDOWS

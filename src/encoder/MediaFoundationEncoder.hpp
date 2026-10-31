@@ -1,5 +1,9 @@
 #pragma once
 
+#include <Geode/Geode.hpp>
+
+#ifdef GEODE_IS_WINDOWS
+
 #include "../config/ReplayConfig.hpp"
 #include <windows.h>
 #include <mfapi.h>
@@ -28,7 +32,6 @@ public:
     ~MediaFoundationEncoder();
 
     static void globalInitialize();
-    static void globalShutdown();
 
     bool start(
         const std::wstring& outputPath,
@@ -87,6 +90,8 @@ private:
     bool tryStartLocked(const std::wstring& outputPath, const GUID& subtype, bool hardware,
                         const StartParams& params, std::string& error);
     bool finishLocked();
+    IMFMediaBuffer* acquireVideoBufferLocked(DWORD bufferSize);
+    void clearVideoBufferPoolLocked();
     bool createVideoSample(const uint8_t* bgraPixels, int width, int height, int64_t timestampHns, IMFSample** ppSample);
     bool createAudioSample(const float* pcmFloat, int numSamples, int channels, int sampleRate, int64_t timestampHns, IMFSample** ppSample);
 
@@ -108,7 +113,13 @@ private:
     int64_t m_lastGameAudioHns = 0;
     int64_t m_lastMicAudioHns = 0;
 
+    // Reusable IMFMediaBuffer pool for video frames
+    std::vector<IMFMediaBuffer*> m_videoBufferPool;
+    DWORD m_pooledBufferSize = 0;
+
     std::mutex m_mutex;
 };
 
 } // namespace replay
+
+#endif // GEODE_IS_WINDOWS

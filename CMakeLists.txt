@@ -1,14 +1,13 @@
 cmake_minimum_required(VERSION 3.21)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-if ("${CMAKE_SYSTEM_NAME}" STREQUAL "iOS" OR IOS)
-    set(CMAKE_OSX_ARCHITECTURES "arm64")
-else()
-    set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64")
-endif()
 set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 
-project(InstantReplay VERSION 1.0.2)
+project(InstantReplay VERSION 1.0.3)
+
+if (NOT WIN32)
+    message(FATAL_ERROR "Instant Replay requires Windows (Media Foundation + WASAPI).")
+endif()
 
 add_library(${PROJECT_NAME} SHARED
     src/main.cpp
@@ -35,15 +34,15 @@ target_include_directories(${PROJECT_NAME} PUBLIC
 
 setup_geode_mod(${PROJECT_NAME})
 
-if (WIN32)
-    target_link_libraries(${PROJECT_NAME}
-        mfplat
-        mfreadwrite
-        mfuuid
-        ole32
-        oleaut32
-        uuid
-        opengl32
-        winmm
-    )
-endif()
+target_link_libraries(${PROJECT_NAME}
+    mfplat
+    mfreadwrite
+    mfuuid
+    ole32
+    oleaut32
+    uuid
+    opengl32
+    winmm
+    shell32
+)
+

@@ -1,6 +1,9 @@
 #pragma once
 
 #include <Geode/Geode.hpp>
+
+#ifdef GEODE_IS_WINDOWS
+
 #include <Geode/ui/Popup.hpp>
 #include <Geode/ui/TextInput.hpp>
 #include "../config/ReplayConfig.hpp"
@@ -25,6 +28,12 @@ protected:
 private:
     inline static ReplayPopup* s_instance = nullptr;
 
+    void setupDashboardTab(cocos2d::CCNode* page, cocos2d::CCSize const& winSize, float centerX);
+    void setupCodecTab(cocos2d::CCNode* page, cocos2d::CCSize const& winSize, float centerX);
+    void setupBitrateTab(cocos2d::CCNode* page, cocos2d::CCSize const& winSize, float centerX);
+    void setupAudioStorageTab(cocos2d::CCNode* page, cocos2d::CCSize const& winSize, float centerX);
+
+    bool guardLocked() const;
     void switchTab(int tabIndex);
     void updateStatusDisplay(float dt = 0.0f);
     void refreshUI();
@@ -35,7 +44,6 @@ private:
     void refreshMicDeviceButton();
     void onGameVolumeChanged(cocos2d::CCObject* sender);
     void onMicVolumeChanged(cocos2d::CCObject* sender);
-    void restartReplayScheduled(float dt);
 
     int m_currentTab = 0;
     cocos2d::CCNode* m_pages[4] = {nullptr, nullptr, nullptr, nullptr};
@@ -86,7 +94,7 @@ private:
     cocos2d::CCLabelBMFont* m_lockWarningBanner = nullptr;
     cocos2d::CCLabelBMFont* m_pageNoticeLabels[4] = {nullptr, nullptr, nullptr, nullptr};
 
-    // Action buttons that need enable/disable state
+    // Action buttons
     CCMenuItemSpriteExtra* m_toggleBtn = nullptr;
     CCMenuItemSpriteExtra* m_quickBrowseBtn = nullptr;
     CCMenuItemSpriteExtra* m_browseFolderBtn = nullptr;
@@ -101,3 +109,5 @@ private:
 };
 
 } // namespace replay
+
+#endif // GEODE_IS_WINDOWS

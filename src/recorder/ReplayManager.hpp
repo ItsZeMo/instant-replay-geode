@@ -1,5 +1,9 @@
 #pragma once
 
+#include <Geode/Geode.hpp>
+
+#ifdef GEODE_IS_WINDOWS
+
 #include "../config/ReplayConfig.hpp"
 #include "../encoder/MediaFoundationEncoder.hpp"
 #include "../capture/FrameGrabber.hpp"
@@ -29,25 +33,18 @@ public:
     static ReplayManager* get();
 
     void initialize();
-    void cleanup();
+    void shutdown();
 
     // User actions
     void saveReplay();
     void toggleReplay();
-    void toggleBuffer() { toggleReplay(); }
     // Applies the "enabled" state (e.g. from Geode settings) to the running recorder
     void setReplayEnabled(bool enabled);
-    void restartReplay();
-    void restartBuffer() { restartReplay(); }
     bool isReplayActive() const { return m_running.load(); }
-    bool isBufferActive() const { return isReplayActive(); }
     bool isSaving() const { return m_saving.load(); }
 
     // Live statistics
     double getCurrentReplaySeconds() const;
-    double getCurrentBufferedSeconds() const { return getCurrentReplaySeconds(); }
-    int getActiveSegmentCount() const;
-    std::string getStatusText() const;
 
     // Direct folder opener
     void openRecordingsFolder();
@@ -58,16 +55,16 @@ private:
 
     void startReplay();
     void stopReplay();
-    void startBuffer() { startReplay(); }
-    void stopBuffer() { stopReplay(); }
 
-    void workerThreadFunc();
-    void finalizeCurrentSegment();
-    void startNewSegment();
-    void rotateSegment();
-    void handleSaveRequest(bool continueRecording);
-    void purgeOldSegments();
+    void workerThreadFunc(ReplayConfig sessionConfig);
+    void finalizeCurrentSegment(bool syncForExport, const ReplayConfig& cfg);
+    bool startNewSegment(const ReplayConfig& cfg);
+    bool rotateSegment(bool syncForExport, const ReplayConfig& cfg);
+    void handleSaveRequest(bool continueRecording, const ReplayConfig& cfg);
+    void handleFatalRecordingError(const std::string& reason);
+    void purgeOldSegments(const ReplayConfig& cfg);
     void cleanupTempDir();
+    void joinFinalizeThread();
     void joinExportThread();
 
     // Segment file ownership: files used by a running export are never deleted
@@ -87,6 +84,7 @@ private:
     std::atomic<bool> m_running{false};
     std::atomic<bool> m_saving{false};
     std::atomic<bool> m_saveRequested{false};
+    std::atomic<bool> m_shuttingDown{false};
 
     std::unique_ptr<MediaFoundationEncoder> m_encoder;
     std::wstring m_currentSegmentPath;
@@ -101,12 +99,21 @@ private:
     int64_t m_gameAudioSamples = 0;
     int64_t m_micAudioSamples = 0;
 
+    // Encoder start backoff & write failure tracking (worker thread only)
+    int m_encoderFailCount = 0;
+    int m_writeErrorCount = 0;
+    std::chrono::steady_clock::time_point m_nextEncoderRetryTime{};
+
     std::vector<SegmentInfo> m_activeSegments;
     std::multiset<std::wstring> m_exportLockedSegments;
     std::vector<std::wstring> m_deferredDeletes;
     mutable std::mutex m_segmentMutex;
 
-    // Export (merge) thread - owned, joined before a new export and on cleanup
+    // Asynchronous segment finalizer thread (prevents 30s rotation from stalling worker thread)
+    std::thread m_finalizeThread;
+    std::mutex m_finalizeMutex;
+
+    // Export (merge) thread - owned, joined before a new export and on shutdown
     std::thread m_exportThread;
     std::mutex m_exportMutex;
 
@@ -118,9 +125,8 @@ private:
     float m_micPrev[2] = {0.0f, 0.0f};
     bool m_micHasPrev = false;
 
-    // Queues for worker thread
+    // Queues for worker thread (game audio uses lock-free SPSC ring buffer in AudioGrabber)
     std::deque<std::shared_ptr<CapturedFrame>> m_frameQueue;
-    std::deque<std::shared_ptr<AudioChunk>> m_gameAudioQueue;
     std::deque<std::shared_ptr<AudioChunk>> m_micAudioQueue;
     std::mutex m_queueMutex;
     std::condition_variable m_cv;
@@ -130,3 +136,5 @@ private:
 };
 
 } // namespace replay
+
+#endif // GEODE_IS_WINDOWS

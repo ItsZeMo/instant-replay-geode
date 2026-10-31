@@ -1,6 +1,9 @@
 #pragma once
 
 #include <Geode/Geode.hpp>
+
+#ifdef GEODE_IS_WINDOWS
+
 #include <Geode/ui/Popup.hpp>
 
 namespace replay {
@@ -15,3 +18,5 @@ protected:
 };
 
 } // namespace replay
+
+#endif // GEODE_IS_WINDOWS

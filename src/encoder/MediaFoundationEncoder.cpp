@@ -1,4 +1,7 @@
 #include "MediaFoundationEncoder.hpp"
+
+#ifdef GEODE_IS_WINDOWS
+
 #include <codecapi.h>
 #include <filesystem>
 #include <algorithm>
@@ -54,24 +57,23 @@ const char* subtypeName(const GUID& subtype) {
     return "H.264";
 }
 
+// Session-wide cache of the working (subtype, hardware) for a given codec request
+// so segment rotation every 30s does not re-probe unsupported codecs (e.g. AV1 on non-AV1 GPUs).
+std::mutex s_codecCacheMutex;
+std::string s_cachedRequestKey;
+GUID s_cachedSubtype = MFVideoFormat_H264;
+bool s_cachedHardware = true;
+bool s_hasCachedCodec = false;
+
 } // namespace
 
-static bool s_mfInitialized = false;
+static std::once_flag s_mfInitOnce;
 
 void MediaFoundationEncoder::globalInitialize() {
-    if (!s_mfInitialized) {
+    std::call_once(s_mfInitOnce, []() {
         CoInitializeEx(NULL, COINIT_MULTITHREADED);
         MFStartup(MF_VERSION);
-        s_mfInitialized = true;
-    }
-}
-
-void MediaFoundationEncoder::globalShutdown() {
-    if (s_mfInitialized) {
-        MFShutdown();
-        CoUninitialize();
-        s_mfInitialized = false;
-    }
+    });
 }
 
 MediaFoundationEncoder::MediaFoundationEncoder() {
@@ -80,6 +82,44 @@ MediaFoundationEncoder::MediaFoundationEncoder() {
 
 MediaFoundationEncoder::~MediaFoundationEncoder() {
     finish();
+}
+
+void MediaFoundationEncoder::clearVideoBufferPoolLocked() {
+    for (IMFMediaBuffer* buf : m_videoBufferPool) {
+        if (buf) buf->Release();
+    }
+    m_videoBufferPool.clear();
+    m_pooledBufferSize = 0;
+}
+
+IMFMediaBuffer* MediaFoundationEncoder::acquireVideoBufferLocked(DWORD bufferSize) {
+    if (m_pooledBufferSize != bufferSize) {
+        clearVideoBufferPoolLocked();
+        m_pooledBufferSize = bufferSize;
+    }
+
+    for (IMFMediaBuffer* buf : m_videoBufferPool) {
+        if (!buf) continue;
+        // Check if our pool holds the only reference (meaning the MFT has finished reading it)
+        buf->AddRef();
+        ULONG refs = buf->Release();
+        if (refs == 1) {
+            buf->AddRef(); // Caller will Release() after adding to IMFSample
+            return buf;
+        }
+    }
+
+    IMFMediaBuffer* newBuf = nullptr;
+    if (FAILED(MFCreateMemoryBuffer(bufferSize, &newBuf)) || !newBuf) {
+        return nullptr;
+    }
+
+    static constexpr size_t kMaxPooledVideoBuffers = 6;
+    if (m_videoBufferPool.size() < kMaxPooledVideoBuffers) {
+        newBuf->AddRef(); // Pool holds 1 reference
+        m_videoBufferPool.push_back(newBuf);
+    }
+    return newBuf;
 }
 
 bool MediaFoundationEncoder::start(
@@ -143,6 +183,11 @@ bool MediaFoundationEncoder::start(
         targetSubtype = MFVideoFormat_H264;
     }
 
+    char reqKeyBuf[200];
+    snprintf(reqKeyBuf, sizeof(reqKeyBuf), "%d|%d|%s|%dx%d@%d",
+             static_cast<int>(codec), enableHardware ? 1 : 0, cname.c_str(), width, height, fps);
+    std::string requestKey = reqKeyBuf;
+
     // Fallback cascade. A missing encoder MFT is usually only detected by
     // SetInputMediaType / BeginWriting, so every candidate gets a full,
     // independent initialisation attempt: AV1 -> HEVC -> H.264 -> H.264 (software).
@@ -154,6 +199,16 @@ bool MediaFoundationEncoder::start(
         }
         attempts.push_back({subtype, hw});
     };
+
+    bool usedCache = false;
+    {
+        std::lock_guard<std::mutex> cacheLock(s_codecCacheMutex);
+        if (s_hasCachedCodec && s_cachedRequestKey == requestKey) {
+            addAttempt(s_cachedSubtype, s_cachedHardware);
+            usedCache = true;
+        }
+    }
+
     addAttempt(targetSubtype, enableHardware);
     if (targetSubtype == MFVideoFormat_AV1) {
         addAttempt(MFVideoFormat_HEVC, enableHardware);
@@ -184,10 +239,21 @@ bool MediaFoundationEncoder::start(
                      params.gameSampleRate, splitAudio ? 1 : 0);
             m_formatKey = key;
             m_recording = true;
-            if (i > 0) {
-                geode::log::warn("Instant Replay: requested codec unavailable, fell back to {}", m_activeCodecName);
-            } else {
-                geode::log::info("Instant Replay: encoder started with {}", m_activeCodecName);
+
+            {
+                std::lock_guard<std::mutex> cacheLock(s_codecCacheMutex);
+                s_cachedRequestKey = requestKey;
+                s_cachedSubtype = attempt.subtype;
+                s_cachedHardware = attempt.hardware;
+                s_hasCachedCodec = true;
+            }
+
+            if (!usedCache) {
+                if (attempt.subtype != targetSubtype || attempt.hardware != enableHardware) {
+                    geode::log::warn("Instant Replay: requested codec unavailable, fell back to {}", m_activeCodecName);
+                } else {
+                    geode::log::info("Instant Replay: encoder started with {}", m_activeCodecName);
+                }
             }
             return true;
         }
@@ -210,7 +276,7 @@ bool MediaFoundationEncoder::start(
 bool MediaFoundationEncoder::tryStartLocked(
     const std::wstring& outputPath,
     const GUID& subtype,
-    bool hardware,
+    const bool hardware,
     const StartParams& p,
     std::string& error
 ) {
@@ -346,13 +412,12 @@ bool MediaFoundationEncoder::createVideoSample(
     int64_t timestampHns,
     IMFSample** ppSample
 ) {
-    DWORD bufferSize = width * height * 4;
-    IMFMediaBuffer* pBuffer = nullptr;
-    HRESULT hr = MFCreateMemoryBuffer(bufferSize, &pBuffer);
-    if (FAILED(hr)) return false;
+    DWORD bufferSize = static_cast<DWORD>(width) * static_cast<DWORD>(height) * 4u;
+    IMFMediaBuffer* pBuffer = acquireVideoBufferLocked(bufferSize);
+    if (!pBuffer) return false;
 
     BYTE* pDst = nullptr;
-    hr = pBuffer->Lock(&pDst, NULL, NULL);
+    HRESULT hr = pBuffer->Lock(&pDst, NULL, NULL);
     if (SUCCEEDED(hr) && pDst) {
         memcpy(pDst, bgraPixels, bufferSize);
         pBuffer->Unlock();
@@ -483,6 +548,7 @@ bool MediaFoundationEncoder::finish() {
 bool MediaFoundationEncoder::finishLocked() {
     if (!m_sinkWriter) {
         m_recording = false;
+        clearVideoBufferPoolLocked();
         return true;
     }
 
@@ -493,6 +559,7 @@ bool MediaFoundationEncoder::finishLocked() {
     m_sinkWriter->Release();
     m_sinkWriter = nullptr;
     m_recording = false;
+    clearVideoBufferPoolLocked();
     return SUCCEEDED(hr);
 }
 
@@ -727,3 +794,5 @@ ConcatResult MediaFoundationEncoder::concatenateSegments(
 }
 
 } // namespace replay
+
+#endif // GEODE_IS_WINDOWS

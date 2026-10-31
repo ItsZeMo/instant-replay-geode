@@ -1,6 +1,9 @@
 #pragma once
 
 #include <Geode/Geode.hpp>
+
+#ifdef GEODE_IS_WINDOWS
+
 #include <string>
 
 namespace replay {
@@ -17,3 +20,5 @@ private:
 };
 
 } // namespace replay
+
+#endif // GEODE_IS_WINDOWS

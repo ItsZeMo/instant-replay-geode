@@ -1,4 +1,7 @@
 #include "ReplayNotification.hpp"
+
+#ifdef GEODE_IS_WINDOWS
+
 #include <cocos2d.h>
 #include <cocos-ext.h>
 #include <filesystem>
@@ -96,3 +99,5 @@ void ReplayNotification::animateOut() {
 }
 
 } // namespace replay
+
+#endif // GEODE_IS_WINDOWS

@@ -1,4 +1,7 @@
 #include "FrameGrabber.hpp"
+
+#ifdef GEODE_IS_WINDOWS
+
 #include "../config/ReplayConfig.hpp"
 #include <cocos2d.h>
 #include <algorithm>
@@ -6,6 +9,8 @@
 using namespace cocos2d;
 
 namespace replay {
+
+static constexpr size_t kMaxPooledFrames = 8;
 
 FrameGrabber* FrameGrabber::get() {
     static FrameGrabber instance;
@@ -15,7 +20,8 @@ FrameGrabber* FrameGrabber::get() {
 FrameGrabber::FrameGrabber() = default;
 
 FrameGrabber::~FrameGrabber() {
-    cleanup();
+    // At static destruction time the OpenGL context is already torn down.
+    cleanup(false);
 }
 
 void FrameGrabber::initialize() {
@@ -34,29 +40,59 @@ void FrameGrabber::initialize() {
     m_initialized = true;
 }
 
-void FrameGrabber::cleanup() {
-    if (!m_initialized) return;
-
-    if (m_pbos[0] != 0) {
-        glDeleteBuffers(2, m_pbos);
-        m_pbos[0] = m_pbos[1] = 0;
+void FrameGrabber::cleanup(bool glContextValid) {
+    if (glContextValid && m_initialized) {
+        if (m_pbos[0] != 0 && glDeleteBuffers) {
+            glDeleteBuffers(2, m_pbos);
+        }
+        if (m_fbo && glDeleteFramebuffers) {
+            glDeleteFramebuffers(1, &m_fbo);
+        }
+        if (m_rbo && glDeleteRenderbuffers) {
+            glDeleteRenderbuffers(1, &m_rbo);
+        }
     }
-    if (m_fbo) {
-        glDeleteFramebuffers(1, &m_fbo);
-        m_fbo = 0;
-    }
-    if (m_rbo) {
-        glDeleteRenderbuffers(1, &m_rbo);
-        m_rbo = 0;
-    }
+    m_pbos[0] = m_pbos[1] = 0;
+    m_fbo = 0;
+    m_rbo = 0;
     m_fboWidth = m_fboHeight = 0;
     m_pboCapacity[0] = m_pboCapacity[1] = 0;
     m_pboPending[0] = m_pboPending[1] = false;
     m_initialized = false;
+
+    std::lock_guard<std::mutex> lock(m_poolMutex);
+    m_framePool.clear();
+    m_syncScratch.clear();
 }
 
 void FrameGrabber::setFrameCallback(FrameCallback callback) {
     m_callback = std::move(callback);
+}
+
+std::shared_ptr<CapturedFrame> FrameGrabber::acquireFrame(size_t requiredBytes) {
+    std::shared_ptr<CapturedFrame> frame;
+    {
+        std::lock_guard<std::mutex> lock(m_poolMutex);
+        if (!m_framePool.empty()) {
+            frame = std::move(m_framePool.back());
+            m_framePool.pop_back();
+        }
+    }
+    if (!frame) {
+        frame = std::make_shared<CapturedFrame>();
+    }
+    if (frame->data.size() != requiredBytes) {
+        frame->data.resize(requiredBytes);
+    }
+    return frame;
+}
+
+void FrameGrabber::recycleFrame(std::shared_ptr<CapturedFrame> frame) {
+    if (!frame || frame.use_count() != 1) return;
+    std::lock_guard<std::mutex> lock(m_poolMutex);
+    if (m_framePool.size() < kMaxPooledFrames) {
+        m_framePool.push_back(std::move(frame));
+    }
 }
 
 bool FrameGrabber::ensureScaleTarget(int width, int height) {
@@ -114,10 +150,13 @@ void FrameGrabber::captureCurrentFrame() {
     if (!m_callback) return;
 
     const auto& config = ReplayConfig::get();
-    if (!config.enabled) return;
+    if (!config.enabled.load()) return;
+
+    // Cache GPU vendor string while we are guaranteed to be on the GL render thread
+    (void)ReplayConfig::getGpuAccelName();
 
     // Throttle capture to target FPS while preserving fractional frame-interval remainders
-    int targetFps = std::max(1, config.targetFps);
+    int targetFps = std::max(1, config.targetFps.load());
     auto interval = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
         std::chrono::duration<double>(1.0 / static_cast<double>(targetFps))
     );
@@ -169,7 +208,6 @@ void FrameGrabber::captureCurrentFrame() {
     // 1. Scale the back buffer to the encoder size on the GPU
     int readW = srcW & ~1;
     int readH = srcH & ~1;
-    bool scaledOnGpu = false;
     if (m_hasBlit && ensureScaleTarget(dstW, dstH)) {
         GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
         if (scissor) glDisable(GL_SCISSOR_TEST);
@@ -186,23 +224,22 @@ void FrameGrabber::captureCurrentFrame() {
         if (scissor) glEnable(GL_SCISSOR_TEST);
         readW = dstW;
         readH = dstH;
-        scaledOnGpu = true;
     } else if (glBindFramebuffer) {
         glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
         glReadBuffer(GL_BACK);
     }
 
     size_t readBytes = static_cast<size_t>(readW) * readH * 4;
+    size_t dstBytes = static_cast<size_t>(dstW) * dstH * 4;
 
     auto deliver = [&](const uint8_t* pixels, int w, int h, std::chrono::steady_clock::time_point ts) {
-        auto frame = std::make_shared<CapturedFrame>();
+        auto frame = acquireFrame(dstBytes);
         frame->width = dstW;
         frame->height = dstH;
         frame->stride = dstW * 4;
         frame->timestamp = ts;
-        frame->data.resize(static_cast<size_t>(dstW) * dstH * 4);
         if (w == dstW && h == dstH) {
-            memcpy(frame->data.data(), pixels, frame->data.size());
+            memcpy(frame->data.data(), pixels, dstBytes);
         } else {
             resizeNearest(pixels, w, h, frame->data.data(), dstW, dstH);
         }
@@ -243,20 +280,23 @@ void FrameGrabber::captureCurrentFrame() {
         glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
         m_pboIndex = prev;
     } else {
-        // 2b. Synchronous fallback
-        std::vector<uint8_t> temp(readBytes);
-        glReadPixels(0, 0, readW, readH, GL_BGRA, GL_UNSIGNED_BYTE, temp.data());
+        // 2b. Synchronous fallback (reuses m_syncScratch buffer)
+        if (m_syncScratch.size() < readBytes) {
+            m_syncScratch.resize(readBytes);
+        }
+        glReadPixels(0, 0, readW, readH, GL_BGRA, GL_UNSIGNED_BYTE, m_syncScratch.data());
         if (glBindFramebuffer) {
             glBindFramebuffer(GL_READ_FRAMEBUFFER, prevRead);
             glBindFramebuffer(GL_DRAW_FRAMEBUFFER, prevDraw);
         }
         glReadBuffer(prevReadBuffer);
         glDrawBuffer(prevDrawBuffer);
-        deliver(temp.data(), readW, readH, now);
+        deliver(m_syncScratch.data(), readW, readH, now);
     }
-    (void)scaledOnGpu;
 
     glPixelStorei(GL_PACK_ALIGNMENT, prevPack);
 }
 
 } // namespace replay
+
+#endif // GEODE_IS_WINDOWS

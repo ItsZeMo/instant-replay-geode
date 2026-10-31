@@ -1,9 +1,13 @@
 #pragma once
 
 #include <Geode/Geode.hpp>
+
+#ifdef GEODE_IS_WINDOWS
+
 #include <vector>
 #include <chrono>
 #include <memory>
+#include <mutex>
 #include <functional>
 
 namespace replay {
@@ -23,10 +27,13 @@ public:
     static FrameGrabber* get();
 
     void initialize();
-    void cleanup();
+    void cleanup(bool glContextValid = true);
 
     // Called on the OpenGL render thread right BEFORE the back buffer is swapped
     void captureCurrentFrame();
+
+    // Return a consumed frame buffer to the pool so the render thread does not allocate
+    void recycleFrame(std::shared_ptr<CapturedFrame> frame);
 
     using FrameCallback = std::function<void(std::shared_ptr<CapturedFrame>)>;
     void setFrameCallback(FrameCallback callback);
@@ -37,6 +44,7 @@ private:
 
     bool ensureScaleTarget(int width, int height);
     void ensurePbo(int index, size_t bytes);
+    std::shared_ptr<CapturedFrame> acquireFrame(size_t requiredBytes);
 
     bool m_initialized = false;
     bool m_hasPbo = false;
@@ -57,9 +65,16 @@ private:
     std::chrono::steady_clock::time_point m_pboTime[2];
     int m_pboIndex = 0;
 
+    // Reusable frame buffer pool (eliminates per-frame 8-33 MB allocation + zero-fill)
+    std::mutex m_poolMutex;
+    std::vector<std::shared_ptr<CapturedFrame>> m_framePool;
+    std::vector<uint8_t> m_syncScratch;
+
     std::chrono::steady_clock::time_point m_nextCaptureTime{};
     int m_lastTargetFps = 0;
     FrameCallback m_callback;
 };
 
 } // namespace replay
+
+#endif // GEODE_IS_WINDOWS

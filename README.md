@@ -13,15 +13,14 @@ Hardware-accelerated, ShadowPlay-style background **Instant Replay** recorder bu
 ## ✨ Key Features
 
 - **1-Click Instant Replay (`F6`):** Saves the last `5` to `3600` seconds of gameplay into a ready-to-share `.mp4` file.
-- **Hardware-Accelerated Encoding:** Uses Windows Media Foundation (`IMFSinkWriter`) with automatic fallback cascade:
+- **Hardware-Accelerated Encoding:** Uses Windows Media Foundation (`IMFSinkWriter`) with automatic fallback cascade and session codec caching:
   `AV1 (HW) → HEVC (HW) → H.264 (HW) → H.264 (Software)` across NVIDIA NVENC, AMD AMF, and Intel QuickSync.
-- **Rate Control Modes:** Adaptive VBR (peak-constrained), Constant Bitrate (CBR), and Constant Quality (CQ).
-- **Zero-Stutter OpenGL Capture:** GPU-side FBO scaling (`glBlitFramebuffer`), double-buffered asynchronous PBO readback (`GL_BGRA`), and phase-preserving frame pacing (`60`, `120`, `240` FPS).
-- **Studio Multi-Track or Mixed Audio:**
-  - **Game Audio:** Captured directly from the FMOD Master `ChannelGroup` DSP.
-  - **Microphone Audio:** Low-latency event-driven WASAPI capture with live device selection.
-  - Supports **2 separate AAC tracks** (for Premiere Pro / DaVinci Resolve / Vegas) or **real-time single-track mixing**.
-- **In-Game Dashboard (`F9`):** 4-tab popup with live Premiere-style file size estimator, low disk space warnings, volume sliders, and folder picker.
+- **Rate Control Modes:** Adaptive VBR (peak-constrained, 5–250 Mbps target / up to 300 Mbps peak), Constant Bitrate (CBR), and Constant Quality (CQ).
+- **Zero-Allocation Real-Time Capture:**
+  - **Video:** GPU-side FBO scaling (`glBlitFramebuffer`), double-buffered asynchronous PBO readback (`GL_BGRA`), reusable `CapturedFrame` & `IMFMediaBuffer` pools, and phase-preserving frame pacing (`60`, `120`, `240` FPS).
+  - **Game Audio:** Lock-free SPSC ring buffer attached to the FMOD Master `ChannelGroup` DSP (zero heap allocations or locks on the audio thread).
+  - **Microphone Audio (Opt-in):** Event-driven WASAPI capture (`eConsole` default with automatic device-loss recovery and stateful 48 kHz resampling). Supports **2 separate AAC tracks** (for Premiere Pro / DaVinci Resolve / Vegas) or **real-time single-track mixing**.
+- **In-Game Dashboard (`F9`):** 4-tab popup with live Premiere-style file size estimator, Save & TEMP drive disk space warnings, volume sliders, and Unicode-safe folder picker.
 
 ---
 
@@ -29,9 +28,9 @@ Hardware-accelerated, ShadowPlay-style background **Instant Replay** recorder bu
 
 ```mermaid
 flowchart LR
-    GL["CCEGLView::swapBuffers<br/>(FrameGrabber: FBO + 2x PBO)"] --> Q["ReplayManager<br/>Worker Queues"]
-    FMOD["FMOD Master DSP<br/>(AudioGrabber: Game PCM)"] --> Q
-    WASAPI["WASAPI Capture Thread<br/>(AudioGrabber: Mic PCM)"] --> Q
+    GL["CCEGLView::swapBuffers<br/>(FrameGrabber: FBO + 2x PBO + Pool)"] --> Q["ReplayManager<br/>Worker Thread"]
+    FMOD["FMOD Master DSP<br/>(Lock-Free SPSC Ring Buffer)"] --> Q
+    WASAPI["WASAPI Capture Thread<br/>(Stateful 48kHz Resampler)"] --> Q
     Q --> ENC["MediaFoundationEncoder<br/>(30s Rolling MP4 Segments)"]
     ENC -->|Press F6| REMUX["concatenateSegments<br/>(Keyframe Trim + Lossless Remux)"]
     REMUX --> MP4["Final Replay .mp4"]
@@ -42,12 +41,14 @@ flowchart LR
 | [`mod.json`](./mod.json) | Geode mod metadata, settings definitions, and default keybinds |
 | [`CMakeLists.txt`](./CMakeLists.txt) | CMake build configuration & Win32 / Media Foundation libraries |
 | [`AGENTS.md`](./AGENTS.md) | Comprehensive architectural & invariant guide for LLMs and developers |
-| [`src/main.cpp`](./src/main.cpp) | Hooks (`CCEGLView`, `CCKeyboardDispatcher`, `FMODAudioEngine`, menus) & setting listeners |
-| [`src/config/ReplayConfig.hpp`](./src/config/ReplayConfig.hpp) | Singleton configuration, bitrate/size estimators, and `mod.json` sync |
-| [`src/capture/FrameGrabber.cpp`](./src/capture/FrameGrabber.cpp) | OpenGL FBO downscaler, async PBO pixel readback, and FPS limiter |
-| [`src/capture/AudioGrabber.cpp`](./src/capture/AudioGrabber.cpp) | FMOD DSP game audio tap & WASAPI microphone capture/resampler |
-| [`src/encoder/MediaFoundationEncoder.cpp`](./src/encoder/MediaFoundationEncoder.cpp) | `IMFSinkWriter` video/audio encoder & `IMFSourceReader` lossless segment combiner |
-| [`src/recorder/ReplayManager.cpp`](./src/recorder/ReplayManager.cpp) | Segment rotation, single-track mic mixer, export file locking, and thread management |
+| [`changelog.md`](./changelog.md) | Release changelog |
+| [`LICENSE`](./LICENSE) | MIT License |
+| [`src/main.cpp`](./src/main.cpp) | Hooks (`AppDelegate`, `CCEGLView`, `FMODAudioEngine`, menus), keybinds & setting listeners |
+| [`src/config/ReplayConfig.hpp`](./src/config/ReplayConfig.hpp) | Thread-safe configuration, snapshots, disk space estimators & `mod.json` sync |
+| [`src/capture/FrameGrabber.cpp`](./src/capture/FrameGrabber.cpp) | OpenGL FBO downscaler, async PBO pixel readback, and reusable frame buffer pool |
+| [`src/capture/AudioGrabber.cpp`](./src/capture/AudioGrabber.cpp) | Lock-free FMOD DSP game audio ring buffer & stateful WASAPI microphone capture |
+| [`src/encoder/MediaFoundationEncoder.cpp`](./src/encoder/MediaFoundationEncoder.cpp) | `IMFSinkWriter` video/audio encoder (with codec cache & buffer pool) & `IMFSourceReader` remuxer |
+| [`src/recorder/ReplayManager.cpp`](./src/recorder/ReplayManager.cpp) | Async segment rotation, single-track mic mixer, export file locking, and error recovery |
 | [`src/ui/ReplayPopup.cpp`](./src/ui/ReplayPopup.cpp) | In-game 4-tab settings and status popup (`F9`) |
 | [`src/ui/CodecGuidePopup.cpp`](./src/ui/CodecGuidePopup.cpp) | In-game GPU codec guide popup |
 | [`src/ui/ReplayNotification.cpp`](./src/ui/ReplayNotification.cpp) | Custom toast notification on replay save |
