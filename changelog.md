@@ -1,22 +1,39 @@
 # Changelog
 
 ## v1.0.3
-- **Settings & UI Fixes:**
-  - Raised `bitrate` max to `250` Mbps and `max-bitrate` max to `300` Mbps in `mod.json`, and clamped settings against `SettingV3` min/max bounds so high custom bitrates never reset to default on restart.
-  - Fixed `Custom Mbps` and `Custom (sec)` text inputs clobbering characters while focused/typing.
-  - Made microphone recording opt-in (`"record-mic": false` by default) and ensured WASAPI capture stops immediately when replay is disabled.
-  - Added dynamic keybind label to the `Save Replay` button in the Dashboard.
-  - Debounced volume slider updates (`saveVolumeSettings()`) so dragging sliders does not trigger synchronous disk flushes on every mouse move tick.
-- **Unicode Paths & Storage:**
-  - Replaced narrow ANSI `path.string()` and `_dupenv_s("USERPROFILE" / "TEMP")` with UTF-8/UTF-16 helpers (`geode::utils::string::pathToString`, `utf8ToWide`, `SHGetKnownFolderPath(FOLDERID_Videos)`, `GetTempPathW`) for full Cyrillic and Kazakh path compatibility.
-  - Added `"temp-folder"` setting and free-space checks for both the save directory and the `%TEMP%` rolling buffer directory.
-- **Architecture & Performance:**
-  - Replaced heap allocations and mutex locking in the real-time FMOD DSP callback with a pre-allocated lock-free SPSC ring buffer.
-  - Added reusable `CapturedFrame` and `IMFMediaBuffer` pools to eliminate per-frame 8–33 MB allocations and zero-fills.
-  - Cached the working `(subtype, hardware)` encoder pair across 30s segment rotations and offloaded `IMFSinkWriter::Finalize()` to a background thread.
-  - Made microphone resampling stateful across packet boundaries, switched default mic endpoint preference to `eConsole`, and added automatic device-loss recovery (`AUDCLNT_E_DEVICE_INVALIDATED`).
-  - Resynchronized audio sample timestamps to real capture timestamps after pauses or gaps, added encoder start backoff, and added write-error detection.
-  - Added explicit clean shutdown on `AppDelegate::trySaveGame` while OpenGL and FMOD are still active.
+- **Stability & Crash Prevention:**
+  - Replaced `AppDelegate::trySaveGame` shutdown hook with `$on_game(Exiting)` to avoid premature teardown during regular in-game saves.
+  - Filtered temporary buffer cleanup to strictly match `seg_<N>.mp4` and isolated user temp folders into a dedicated `GeometryDash_InstantReplay` subfolder to protect user files.
+  - Released FMOD DSP immediately upon failure and added a retry cooldown to prevent resource leaks and log spam.
+  - Ensured background segment finalizer does not discard valid segments when stopping immediately after a replay save.
+  - Handled fatal encoder/disk write errors cleanly on the main thread and resolved `m_saving` thread race conditions.
+  - Replaced WASAPI and Media Foundation manual COM management with RAII `ComRef` smart pointers.
+
+- **Audio Subsystem:**
+  - Fixed audio desync and segment boundary pops by anchoring segment timestamps before encoder start and trimming negative overlaps.
+  - Normalized game audio to 44.1/48 kHz AAC standards using a shared `StereoResampler` across packet boundaries.
+  - Implemented proper stereo downmixing for multi-channel audio setups (3.0, 4.0, 5.0, 5.1, 6.1, 7.1).
+  - Used hardware QPC capture start timestamps for WASAPI microphone audio packets.
+  - Added disconnected/invalidated mic device detection with automatic fallback to default audio endpoint.
+  - Scaled volume sliders to 0–200% matching `mod.json` with debounced in-memory adjustment.
+
+- **Video & Capture Performance:**
+  - Direct PBO readback into pooled `IMFMediaBuffer` instances, eliminating per-frame 8–33 MB heap allocations and enabling zero-copy encoding.
+  - Added frame pacing jitter tolerance (`interval / 6`) to eliminate 5–18% dropped frames on 59.94/60/120/240 Hz displays.
+  - Reset PBO pipeline on stop/start to prevent frozen initial frames.
+  - Differentiated hardware vs. software profiles in `formatKey` and reset transient fallback caches on new sessions.
+  - Enforced keyframe-accurate cuts during MP4 concatenation with GOP size capped to FPS.
+  - Preserved B-frame PTS ordering and clamped DTS to non-negative values during segment remuxing.
+  - Enabled sink writer throttling to prevent unbounded internal memory queues.
+
+- **UI & Configuration:**
+  - Fixed checkbox toggle inversion on Hardware Acceleration, Separate Tracks, and Microphone toggles.
+  - Coalesced Geode Mod Settings apply events to load all configuration updates before starting recording.
+  - Added collision-resistant filenames with milliseconds (`replay_YYYY-MM-DD_HH-MM-SS_mmm.mp4`) and suffix deduplication.
+  - Prevented directory creation while typing and resolved free space against existing parent directories.
+  - Corrected native resolution bitrate scaling based on actual window framebuffer dimensions.
+  - Added `"allow-in-text-inputs": true` for keybinds in `mod.json`.
+  - Throttled locked-settings warning notifications.
 
 ## v1.0.2
 - Added settings lock warning banner when background recording is active.
