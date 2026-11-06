@@ -17,6 +17,43 @@
 
 namespace replay {
 
+// Minimal COM smart pointer (shared across WASAPI, Media Foundation, and frame buffer pooling).
+template <typename T>
+class ComRef {
+public:
+    ComRef() = default;
+    explicit ComRef(T* p) noexcept : m_p(p) {}
+    ~ComRef() { reset(); }
+    ComRef(const ComRef&) = delete;
+    ComRef& operator=(const ComRef&) = delete;
+
+    ComRef(ComRef&& other) noexcept : m_p(other.m_p) {
+        other.m_p = nullptr;
+    }
+    ComRef& operator=(ComRef&& other) noexcept {
+        if (this != &other) {
+            reset();
+            m_p = other.m_p;
+            other.m_p = nullptr;
+        }
+        return *this;
+    }
+
+    void reset() noexcept {
+        if (m_p) {
+            m_p->Release();
+            m_p = nullptr;
+        }
+    }
+    T** put() noexcept { reset(); return &m_p; }
+    T* get() const noexcept { return m_p; }
+    T* operator->() const noexcept { return m_p; }
+    explicit operator bool() const noexcept { return m_p != nullptr; }
+
+private:
+    T* m_p = nullptr;
+};
+
 enum class CodecType {
     AV1,
     HEVC,
@@ -84,6 +121,70 @@ struct ReplayConfig {
     AtomicVal<bool> showNotification{true};
     std::string customSaveFolder = "";
     std::string customTempFolder = "";
+
+    static inline std::atomic<int> s_nativeFrameHeight{1080};
+
+    static const char* codecToString(CodecType c) noexcept {
+        switch (c) {
+            case CodecType::CUSTOM: return "custom";
+            case CodecType::AV1:    return "av1";
+            case CodecType::HEVC:   return "hevc";
+            case CodecType::H264:
+            default:                return "h264";
+        }
+    }
+
+    static CodecType codecFromString(std::string_view s) noexcept {
+        if (s == "av1" || s == "av1_nvenc" || s == "auto_hw") return CodecType::AV1;
+        if (s == "hevc" || s == "hevc_nvenc") return CodecType::HEVC;
+        if (s == "custom") return CodecType::CUSTOM;
+        return CodecType::H264;
+    }
+
+    static const char* resolutionToString(ResolutionType r) noexcept {
+        switch (r) {
+            case ResolutionType::UHD_4K:    return "2160p";
+            case ResolutionType::QHD_1440P: return "1440p";
+            case ResolutionType::FHD_1080P: return "1080p";
+            case ResolutionType::HD_720P:   return "720p";
+            case ResolutionType::NATIVE:
+            default:                        return "native";
+        }
+    }
+
+    static ResolutionType resolutionFromString(std::string_view s) noexcept {
+        if (s == "2160p") return ResolutionType::UHD_4K;
+        if (s == "1440p") return ResolutionType::QHD_1440P;
+        if (s == "1080p") return ResolutionType::FHD_1080P;
+        if (s == "720p")  return ResolutionType::HD_720P;
+        return ResolutionType::NATIVE;
+    }
+
+    static const char* resolutionDisplayName(ResolutionType r) noexcept {
+        switch (r) {
+            case ResolutionType::UHD_4K:    return "4K";
+            case ResolutionType::QHD_1440P: return "1440p";
+            case ResolutionType::FHD_1080P: return "1080p";
+            case ResolutionType::HD_720P:   return "720p";
+            case ResolutionType::NATIVE:
+            default:                        return "Native";
+        }
+    }
+
+    static const char* rateControlToString(RateControlMode rc) noexcept {
+        switch (rc) {
+            case RateControlMode::CONSTANT_CBR:     return "constant_cbr";
+            case RateControlMode::CONSTANT_QUALITY: return "constant_quality";
+            case RateControlMode::ADAPTIVE_VBR:
+            default:                                return "adaptive_vbr";
+        }
+    }
+
+    static RateControlMode rateControlFromString(std::string_view s) noexcept {
+        if (s == "constant_cbr")     return RateControlMode::CONSTANT_CBR;
+        if (s == "constant_quality") return RateControlMode::CONSTANT_QUALITY;
+        return RateControlMode::ADAPTIVE_VBR;
+    }
 
     ReplayConfig() = default;
 
@@ -170,12 +271,20 @@ struct ReplayConfig {
             case ResolutionType::QHD_1440P: return 1.60;
             case ResolutionType::UHD_4K:    return 2.40;
             case ResolutionType::NATIVE: {
-                if (auto director = cocos2d::CCDirector::sharedDirector()) {
-                    auto winSize = director->getWinSizeInPixels();
-                    if (winSize.height > 0.0f) {
-                        double factor = static_cast<double>(winSize.height) / 1080.0;
-                        return std::clamp(factor, 0.50, 2.50);
+                int frameH = 0;
+                if (auto view = cocos2d::CCEGLView::get()) {
+                    auto fs = view->getFrameSize();
+                    if (fs.height > 0.0f) {
+                        frameH = static_cast<int>(fs.height + 0.5f);
+                        s_nativeFrameHeight.store(frameH, std::memory_order_relaxed);
                     }
+                }
+                if (frameH <= 0) {
+                    frameH = s_nativeFrameHeight.load(std::memory_order_relaxed);
+                }
+                if (frameH > 0) {
+                    double factor = static_cast<double>(frameH) / 1080.0;
+                    return std::clamp(factor, 0.50, 2.50);
                 }
                 return 1.00;
             }
@@ -286,9 +395,10 @@ struct ReplayConfig {
         return (totalMbps * dur) / 8.0;
     }
 
-    // Rolling segment buffer in TEMP keeps up to duration + 60s of 30s segments.
+    // Rolling segment buffer in TEMP keeps up to duration + 60s of completed 30s segments
+    // plus the active 30s segment being recorded before the next purge (duration + 90s peak).
     double getEstimatedTempBufferSizeMB() const {
-        double dur = static_cast<double>(durationSeconds.load()) + 60.0;
+        double dur = static_cast<double>(durationSeconds.load()) + 90.0;
         double videoMbps = static_cast<double>(getEffectiveBitrateMbps());
         double audioMbps = 0.192;
         if (splitAudioTracks.load() && recordMic.load()) {
@@ -297,24 +407,24 @@ struct ReplayConfig {
         return ((videoMbps + audioMbps) * dur) / 8.0;
     }
 
-    uint64_t getAvailableSaveDiskSpaceBytes() const {
+    static uint64_t queryAvailableSpaceForPath(std::filesystem::path p) {
         std::error_code ec;
-        auto space = std::filesystem::space(getRecordingsDirectory(), ec);
+        while (!p.empty() && !std::filesystem::exists(p, ec)) {
+            auto parent = p.parent_path();
+            if (parent == p) break;
+            p = std::move(parent);
+        }
+        if (p.empty()) return 0;
+        auto space = std::filesystem::space(p, ec);
         return ec ? 0 : space.available;
+    }
+
+    uint64_t getAvailableSaveDiskSpaceBytes() const {
+        return queryAvailableSpaceForPath(getRecordingsDirectory(false));
     }
 
     uint64_t getAvailableTempDiskSpaceBytes() const {
-        std::error_code ec;
-        auto space = std::filesystem::space(getTempDirectory(), ec);
-        return ec ? 0 : space.available;
-    }
-
-    uint64_t getAvailableDiskSpaceBytes() const {
-        uint64_t saveAvail = getAvailableSaveDiskSpaceBytes();
-        uint64_t tempAvail = getAvailableTempDiskSpaceBytes();
-        if (saveAvail == 0) return tempAvail;
-        if (tempAvail == 0) return saveAvail;
-        return std::min(saveAvail, tempAvail);
+        return queryAvailableSpaceForPath(getTempDirectory(false));
     }
 
     bool isLowDiskSpace(uint64_t* outFreeMB = nullptr, uint64_t* outNeededMB = nullptr, bool* outIsTemp = nullptr) const {
@@ -360,12 +470,7 @@ struct ReplayConfig {
         int m = dur / 60;
         int s = dur % 60;
 
-        ResolutionType res = resolution.load();
-        const char* rName = "Native";
-        if (res == ResolutionType::UHD_4K) rName = "4K";
-        else if (res == ResolutionType::QHD_1440P) rName = "1440p";
-        else if (res == ResolutionType::FHD_1080P) rName = "1080p";
-        else if (res == ResolutionType::HD_720P) rName = "720p";
+        const char* rName = resolutionDisplayName(resolution.load());
 
         char buf[160];
         if (totalMB >= 1024.0) {
@@ -413,22 +518,9 @@ struct ReplayConfig {
             hardwareAcceleration = mod->getSettingValue<bool>("hardware-accel");
         }
 
-        if (codecStr == "av1" || codecStr == "av1_nvenc" || codecStr == "auto_hw") codec = CodecType::AV1;
-        else if (codecStr == "hevc" || codecStr == "hevc_nvenc") codec = CodecType::HEVC;
-        else if (codecStr == "custom") codec = CodecType::CUSTOM;
-        else codec = CodecType::H264;
-
-        std::string resStr = mod->getSettingValue<std::string>("resolution");
-        if (resStr == "2160p") resolution = ResolutionType::UHD_4K;
-        else if (resStr == "1440p") resolution = ResolutionType::QHD_1440P;
-        else if (resStr == "1080p") resolution = ResolutionType::FHD_1080P;
-        else if (resStr == "720p") resolution = ResolutionType::HD_720P;
-        else resolution = ResolutionType::NATIVE;
-
-        std::string rcStr = mod->getSettingValue<std::string>("rate-control");
-        if (rcStr == "constant_cbr") rateControl = RateControlMode::CONSTANT_CBR;
-        else if (rcStr == "constant_quality") rateControl = RateControlMode::CONSTANT_QUALITY;
-        else rateControl = RateControlMode::ADAPTIVE_VBR;
+        codec = codecFromString(codecStr);
+        resolution = resolutionFromString(mod->getSettingValue<std::string>("resolution"));
+        rateControl = rateControlFromString(mod->getSettingValue<std::string>("rate-control"));
 
         bitrateMbps = std::clamp(static_cast<int>(mod->getSettingValue<int64_t>("bitrate")), 5, 250);
         maxBitrateMbps = std::clamp(static_cast<int>(mod->getSettingValue<int64_t>("max-bitrate")), 10, 300);
@@ -512,33 +604,14 @@ struct ReplayConfig {
         (void)mod->setSettingValue("enabled", enabled.load());
         setClampedInt(mod, "duration", static_cast<int64_t>(durationSeconds.load()));
         (void)mod->setSettingValue("hardware-accel", hardwareAcceleration.load());
-
-        std::string codecStr = "av1";
-        CodecType c = codec.load();
-        if (c == CodecType::CUSTOM) codecStr = "custom";
-        else if (c == CodecType::AV1) codecStr = "av1";
-        else if (c == CodecType::HEVC) codecStr = "hevc";
-        else if (c == CodecType::H264) codecStr = "h264";
-        (void)mod->setSettingValue("codec", codecStr);
+        (void)mod->setSettingValue("codec", std::string(codecToString(codec.load())));
         (void)mod->setSettingValue("custom-codec", curCustomCodec);
         (void)mod->setSettingValue("save-folder", curSaveFolder);
         if (mod->hasSetting("temp-folder")) {
             (void)mod->setSettingValue("temp-folder", curTempFolder);
         }
-
-        std::string resStr = "native";
-        ResolutionType res = resolution.load();
-        if (res == ResolutionType::UHD_4K) resStr = "2160p";
-        else if (res == ResolutionType::QHD_1440P) resStr = "1440p";
-        else if (res == ResolutionType::FHD_1080P) resStr = "1080p";
-        else if (res == ResolutionType::HD_720P) resStr = "720p";
-        (void)mod->setSettingValue("resolution", resStr);
-
-        std::string rcStr = "adaptive_vbr";
-        RateControlMode rc = rateControl.load();
-        if (rc == RateControlMode::CONSTANT_CBR) rcStr = "constant_cbr";
-        else if (rc == RateControlMode::CONSTANT_QUALITY) rcStr = "constant_quality";
-        (void)mod->setSettingValue("rate-control", rcStr);
+        (void)mod->setSettingValue("resolution", std::string(resolutionToString(resolution.load())));
+        (void)mod->setSettingValue("rate-control", std::string(rateControlToString(rateControl.load())));
 
         setClampedInt(mod, "bitrate", static_cast<int64_t>(bitrateMbps.load()));
         setClampedInt(mod, "max-bitrate", static_cast<int64_t>(maxBitrateMbps.load()));
@@ -586,16 +659,18 @@ struct ReplayConfig {
         return {std::max(64, w), std::max(64, h)};
     }
 
-    std::filesystem::path getRecordingsDirectory() const {
+    std::filesystem::path getRecordingsDirectory(bool createIfMissing = false) const {
         std::string saveFolderStr = getCustomSaveFolder();
         if (!saveFolderStr.empty()) {
             std::error_code ec;
             std::filesystem::path customPath(geode::utils::string::utf8ToWide(saveFolderStr));
-            if (!std::filesystem::exists(customPath, ec)) {
-                std::filesystem::create_directories(customPath, ec);
-            }
-            if (std::filesystem::exists(customPath, ec)) {
-                return customPath;
+            if (customPath.is_absolute()) {
+                if (createIfMissing && !std::filesystem::exists(customPath, ec)) {
+                    std::filesystem::create_directories(customPath, ec);
+                }
+                if (!createIfMissing || std::filesystem::exists(customPath, ec)) {
+                    return customPath;
+                }
             }
         }
 
@@ -605,8 +680,10 @@ struct ReplayConfig {
             std::filesystem::path dir = std::filesystem::path(pszVideos) / L"Geometry Dash";
             CoTaskMemFree(pszVideos);
             std::error_code ec;
-            std::filesystem::create_directories(dir, ec);
-            if (!ec && std::filesystem::exists(dir, ec)) {
+            if (createIfMissing) {
+                std::filesystem::create_directories(dir, ec);
+            }
+            if (!createIfMissing || (!ec && std::filesystem::exists(dir, ec))) {
                 return dir;
             }
         } else if (pszVideos) {
@@ -614,21 +691,29 @@ struct ReplayConfig {
         }
 
         std::filesystem::path dir = geode::dirs::getGameDir() / L"Replays";
-        std::error_code ec;
-        std::filesystem::create_directories(dir, ec);
+        if (createIfMissing) {
+            std::error_code ec;
+            std::filesystem::create_directories(dir, ec);
+        }
         return dir;
     }
 
-    std::filesystem::path getTempDirectory() const {
+    std::filesystem::path getTempDirectory(bool createIfMissing = false) const {
         std::string tempFolderStr = getCustomTempFolder();
         if (!tempFolderStr.empty()) {
             std::error_code ec;
             std::filesystem::path customPath(geode::utils::string::utf8ToWide(tempFolderStr));
-            if (!std::filesystem::exists(customPath, ec)) {
-                std::filesystem::create_directories(customPath, ec);
-            }
-            if (std::filesystem::exists(customPath, ec)) {
-                return customPath;
+            if (customPath.is_absolute()) {
+                auto fname = customPath.filename().wstring();
+                if (fname != L"GeometryDash_InstantReplay" && fname != L"InstantReplay") {
+                    customPath /= L"GeometryDash_InstantReplay";
+                }
+                if (createIfMissing && !std::filesystem::exists(customPath, ec)) {
+                    std::filesystem::create_directories(customPath, ec);
+                }
+                if (!createIfMissing || std::filesystem::exists(customPath, ec)) {
+                    return customPath;
+                }
             }
         }
 
@@ -636,14 +721,18 @@ struct ReplayConfig {
         DWORD len = GetTempPathW(MAX_PATH, tempBuf);
         if (len > 0 && len <= MAX_PATH) {
             std::filesystem::path dir = std::filesystem::path(tempBuf) / L"GeometryDash_InstantReplay";
-            std::error_code ec;
-            std::filesystem::create_directories(dir, ec);
+            if (createIfMissing) {
+                std::error_code ec;
+                std::filesystem::create_directories(dir, ec);
+            }
             return dir;
         }
 
         std::filesystem::path fallback = geode::dirs::getTempDir() / L"InstantReplay";
-        std::error_code ec;
-        std::filesystem::create_directories(fallback, ec);
+        if (createIfMissing) {
+            std::error_code ec;
+            std::filesystem::create_directories(fallback, ec);
+        }
         return fallback;
     }
 

@@ -3,6 +3,8 @@
 #ifdef GEODE_IS_WINDOWS
 
 #include "../config/ReplayConfig.hpp"
+#include "../recorder/ReplayManager.hpp"
+#include "../encoder/MediaFoundationEncoder.hpp"
 #include <cocos2d.h>
 #include <algorithm>
 
@@ -10,7 +12,15 @@ using namespace cocos2d;
 
 namespace replay {
 
-static constexpr size_t kMaxPooledFrames = 8;
+static constexpr size_t kMaxPooledFrames = 64;
+static constexpr size_t kMaxPooledBytes = 288ull * 1024 * 1024;
+
+static bool isMediaBufferUnique(IMFMediaBuffer* buf) noexcept {
+    if (!buf) return false;
+    buf->AddRef();
+    ULONG refs = buf->Release();
+    return refs == 1;
+}
 
 FrameGrabber* FrameGrabber::get() {
     static FrameGrabber instance;
@@ -27,6 +37,8 @@ FrameGrabber::~FrameGrabber() {
 void FrameGrabber::initialize() {
     if (m_initialized) return;
 
+    MediaFoundationEncoder::globalInitialize();
+
     m_hasPbo = glGenBuffers && glBindBuffer && glBufferData && glMapBuffer && glUnmapBuffer;
     if (m_hasPbo) {
         glGenBuffers(2, m_pbos);
@@ -37,10 +49,20 @@ void FrameGrabber::initialize() {
                 glFramebufferRenderbuffer && glCheckFramebufferStatus;
 
     m_pboIndex = 0;
+    m_pboPending[0] = m_pboPending[1] = false;
     m_initialized = true;
 }
 
+void FrameGrabber::setCapturing(bool active) {
+    m_pboPending[0] = m_pboPending[1] = false;
+    m_pboIndex = 0;
+    m_nextCaptureTime = {};
+    m_lastTargetFps = 0;
+    m_capturing.store(active, std::memory_order_release);
+}
+
 void FrameGrabber::cleanup(bool glContextValid) {
+    m_capturing.store(false, std::memory_order_release);
     if (glContextValid && m_initialized) {
         if (m_pbos[0] != 0 && glDeleteBuffers) {
             glDeleteBuffers(2, m_pbos);
@@ -58,6 +80,9 @@ void FrameGrabber::cleanup(bool glContextValid) {
     m_fboWidth = m_fboHeight = 0;
     m_pboCapacity[0] = m_pboCapacity[1] = 0;
     m_pboPending[0] = m_pboPending[1] = false;
+    m_pboIndex = 0;
+    m_nextCaptureTime = {};
+    m_lastTargetFps = 0;
     m_initialized = false;
 
     std::lock_guard<std::mutex> lock(m_poolMutex);
@@ -73,24 +98,44 @@ std::shared_ptr<CapturedFrame> FrameGrabber::acquireFrame(size_t requiredBytes) 
     std::shared_ptr<CapturedFrame> frame;
     {
         std::lock_guard<std::mutex> lock(m_poolMutex);
-        if (!m_framePool.empty()) {
-            frame = std::move(m_framePool.back());
-            m_framePool.pop_back();
+        for (size_t i = m_framePool.size(); i > 0; --i) {
+            auto& candidate = m_framePool[i - 1];
+            if (candidate && candidate->byteSize == requiredBytes && isMediaBufferUnique(candidate->buffer.get())) {
+                frame = std::move(candidate);
+                m_framePool.erase(m_framePool.begin() + static_cast<std::ptrdiff_t>(i - 1));
+                break;
+            }
+        }
+        if (!frame) {
+            for (size_t i = m_framePool.size(); i > 0; --i) {
+                auto& candidate = m_framePool[i - 1];
+                if (candidate && isMediaBufferUnique(candidate->buffer.get())) {
+                    frame = std::move(candidate);
+                    m_framePool.erase(m_framePool.begin() + static_cast<std::ptrdiff_t>(i - 1));
+                    break;
+                }
+            }
         }
     }
     if (!frame) {
         frame = std::make_shared<CapturedFrame>();
     }
-    if (frame->data.size() != requiredBytes) {
-        frame->data.resize(requiredBytes);
+    if (!frame->buffer || frame->byteSize != requiredBytes) {
+        frame->buffer.reset();
+        frame->byteSize = 0;
+        if (FAILED(MFCreateMemoryBuffer(static_cast<DWORD>(requiredBytes), frame->buffer.put())) || !frame->buffer) {
+            return nullptr;
+        }
+        frame->byteSize = requiredBytes;
     }
     return frame;
 }
 
 void FrameGrabber::recycleFrame(std::shared_ptr<CapturedFrame> frame) {
-    if (!frame || frame.use_count() != 1) return;
+    if (!frame || !frame->buffer || frame.use_count() != 1) return;
     std::lock_guard<std::mutex> lock(m_poolMutex);
-    if (m_framePool.size() < kMaxPooledFrames) {
+    size_t maxFrames = std::clamp<size_t>(kMaxPooledBytes / std::max<size_t>(1, frame->byteSize), 8, kMaxPooledFrames);
+    if (m_framePool.size() < maxFrames) {
         m_framePool.push_back(std::move(frame));
     }
 }
@@ -147,25 +192,27 @@ static void resizeNearest(const uint8_t* src, int sw, int sh, uint8_t* dst, int 
 }
 
 void FrameGrabber::captureCurrentFrame() {
-    if (!m_callback) return;
+    if (!m_callback || !m_capturing.load(std::memory_order_relaxed)) return;
 
-    const auto& config = ReplayConfig::get();
-    if (!config.enabled.load()) return;
+    const auto& config = ReplayManager::get()->getSessionConfig();
+    if (!ReplayManager::get()->isReplayActive()) return;
 
     // Cache GPU vendor string while we are guaranteed to be on the GL render thread
     (void)ReplayConfig::getGpuAccelName();
 
     // Throttle capture to target FPS while preserving fractional frame-interval remainders
+    // and allowing jitter tolerance (~1/6 frame interval) for 59.94/60/120/240 Hz VSync (#4)
     int targetFps = std::max(1, config.targetFps.load());
     auto interval = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
         std::chrono::duration<double>(1.0 / static_cast<double>(targetFps))
     );
+    auto tolerance = interval / 6;
     auto now = std::chrono::steady_clock::now();
     if (m_lastTargetFps != targetFps) {
         m_lastTargetFps = targetFps;
         m_nextCaptureTime = now;
     }
-    if (now < m_nextCaptureTime) {
+    if (now + tolerance < m_nextCaptureTime) {
         return;
     }
     m_nextCaptureTime += interval;
@@ -183,6 +230,9 @@ void FrameGrabber::captureCurrentFrame() {
         auto fs = view->getFrameSize();
         srcW = static_cast<int>(fs.width);
         srcH = static_cast<int>(fs.height);
+        if (srcH > 0) {
+            ReplayConfig::s_nativeFrameHeight.store(srcH, std::memory_order_relaxed);
+        }
     }
     if (srcW <= 0 || srcH <= 0) {
         GLint viewport[4] = {0, 0, 0, 0};
@@ -234,15 +284,23 @@ void FrameGrabber::captureCurrentFrame() {
 
     auto deliver = [&](const uint8_t* pixels, int w, int h, std::chrono::steady_clock::time_point ts) {
         auto frame = acquireFrame(dstBytes);
+        if (!frame || !frame->buffer) return;
+        BYTE* dst = nullptr;
+        if (FAILED(frame->buffer->Lock(&dst, nullptr, nullptr)) || !dst) {
+            recycleFrame(std::move(frame));
+            return;
+        }
+        if (w == dstW && h == dstH) {
+            memcpy(dst, pixels, dstBytes);
+        } else {
+            resizeNearest(pixels, w, h, dst, dstW, dstH);
+        }
+        frame->buffer->Unlock();
+        frame->buffer->SetCurrentLength(static_cast<DWORD>(dstBytes));
         frame->width = dstW;
         frame->height = dstH;
         frame->stride = dstW * 4;
         frame->timestamp = ts;
-        if (w == dstW && h == dstH) {
-            memcpy(frame->data.data(), pixels, dstBytes);
-        } else {
-            resizeNearest(pixels, w, h, frame->data.data(), dstW, dstH);
-        }
         m_callback(std::move(frame));
     };
 

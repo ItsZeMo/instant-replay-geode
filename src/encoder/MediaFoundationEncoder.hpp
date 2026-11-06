@@ -32,6 +32,7 @@ public:
     ~MediaFoundationEncoder();
 
     static void globalInitialize();
+    static void resetCodecCache();
 
     bool start(
         const std::wstring& outputPath,
@@ -49,24 +50,20 @@ public:
         int gameSampleRate = 44100
     );
 
-    bool writeVideoFrame(const uint8_t* bgraPixels, int width, int height, int64_t timestampHns);
+    bool writeVideoFrame(IMFMediaBuffer* videoBuffer, int width, int height, int64_t timestampHns);
     bool writeGameAudio(const float* pcmFloat, int numSamples, int channels, int sampleRate, int64_t timestampHns);
     bool writeMicAudio(const float* pcmFloat, int numSamples, int channels, int sampleRate, int64_t timestampHns);
 
     bool finish();
     bool isRecording() const { return m_recording; }
-    int width() const { return m_width; }
-    int height() const { return m_height; }
 
-    // Name of the codec that was actually initialised (after any fallback), e.g. "HEVC (HW)".
-    const std::string& activeCodecName() const { return m_activeCodecName; }
     // Identifies the stream layout of the current segment. Segments with different keys
     // cannot be remuxed into one file without re-encoding.
     const std::string& formatKey() const { return m_formatKey; }
 
     // Remuxes the segments (oldest first) into finalOutputPath without re-encoding.
     // trimStartSeconds drops that much from the beginning of the first segment
-    // (cut is aligned to the preceding video keyframe). Any read/write/finalize
+    // (cut is aligned to the nearest video keyframe). Any read/write/finalize
     // failure is reported and the partial output file is deleted.
     static ConcatResult concatenateSegments(
         const std::vector<std::wstring>& segmentPaths,
@@ -90,9 +87,7 @@ private:
     bool tryStartLocked(const std::wstring& outputPath, const GUID& subtype, bool hardware,
                         const StartParams& params, std::string& error);
     bool finishLocked();
-    IMFMediaBuffer* acquireVideoBufferLocked(DWORD bufferSize);
-    void clearVideoBufferPoolLocked();
-    bool createVideoSample(const uint8_t* bgraPixels, int width, int height, int64_t timestampHns, IMFSample** ppSample);
+    bool createVideoSample(IMFMediaBuffer* videoBuffer, int64_t timestampHns, IMFSample** ppSample);
     bool createAudioSample(const float* pcmFloat, int numSamples, int channels, int sampleRate, int64_t timestampHns, IMFSample** ppSample);
 
     IMFSinkWriter* m_sinkWriter = nullptr;
@@ -105,17 +100,9 @@ private:
     int m_fps = 60;
     bool m_splitAudio = true;
     bool m_recording = false;
-    std::string m_activeCodecName;
     std::string m_formatKey;
 
     int64_t m_videoFrameDurationHns = 0;
-    int64_t m_lastVideoHns = 0;
-    int64_t m_lastGameAudioHns = 0;
-    int64_t m_lastMicAudioHns = 0;
-
-    // Reusable IMFMediaBuffer pool for video frames
-    std::vector<IMFMediaBuffer*> m_videoBufferPool;
-    DWORD m_pooledBufferSize = 0;
 
     std::mutex m_mutex;
 };

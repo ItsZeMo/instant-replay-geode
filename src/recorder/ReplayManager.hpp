@@ -43,11 +43,11 @@ public:
     bool isReplayActive() const { return m_running.load(); }
     bool isSaving() const { return m_saving.load(); }
 
-    // Live statistics
-    double getCurrentReplaySeconds() const;
-
     // Direct folder opener
     void openRecordingsFolder();
+
+    // Active recording session configuration snapshot (read by capture threads)
+    const ReplayConfig& getSessionConfig() const noexcept { return m_sessionConfig; }
 
 private:
     ReplayManager();
@@ -58,8 +58,9 @@ private:
 
     void workerThreadFunc(ReplayConfig sessionConfig);
     void finalizeCurrentSegment(bool syncForExport, const ReplayConfig& cfg);
-    bool startNewSegment(const ReplayConfig& cfg);
-    bool rotateSegment(bool syncForExport, const ReplayConfig& cfg);
+    bool startNewSegment(const ReplayConfig& cfg, std::chrono::steady_clock::time_point segStart);
+    bool rotateSegment(bool syncForExport, const ReplayConfig& cfg,
+                       std::chrono::steady_clock::time_point nextSegStart = std::chrono::steady_clock::now());
     void handleSaveRequest(bool continueRecording, const ReplayConfig& cfg);
     void handleFatalRecordingError(const std::string& reason);
     void purgeOldSegments(const ReplayConfig& cfg);
@@ -76,10 +77,18 @@ private:
 
     // Single-track microphone mixer (recordMic && !splitAudioTracks)
     void resetMicMixer();
-    void appendMicToMix(const AudioChunk& chunk, int targetRate);
-    void mixMicInto(std::vector<float>& gameSamples, int channels);
+    void appendMicToMix(const AudioChunk& chunk, int targetRate, size_t startFrameOffset = 0);
+    void mixMicInto(float* gameSamples, size_t numFrames, int channels);
+    bool flushMicMixFifo(int rate, bool checkErrors);
 
-    std::filesystem::path getTempDir() const;
+    // Shared timestamp resync + encoder write for game and mic audio streams
+    bool writeAudioWithResync(bool isGameAudio, float* samples, int numSamples, int channels,
+                              int rate, std::chrono::steady_clock::time_point timestamp,
+                              std::vector<float>& silenceScratch);
+
+    std::filesystem::path getTempDir(bool createIfMissing = false) const;
+
+    ReplayConfig m_sessionConfig{};
 
     std::atomic<bool> m_running{false};
     std::atomic<bool> m_saving{false};
@@ -117,13 +126,13 @@ private:
     std::thread m_exportThread;
     std::mutex m_exportMutex;
 
-    // Microphone mix state (worker thread only)
+    // Microphone mix & game audio resampler state (worker thread only)
     bool m_mixMicIntoGame = false;
-    std::deque<float> m_micMixFifo; // interleaved stereo at m_micMixRate
+    std::vector<float> m_micMixFifo; // interleaved stereo at m_micMixRate
+    size_t m_micMixReadPos = 0;
     int m_micMixRate = 0;
-    double m_micResamplePos = 0.0;
-    float m_micPrev[2] = {0.0f, 0.0f};
-    bool m_micHasPrev = false;
+    StereoResampler m_micMixResampler{};
+    StereoResampler m_gameResampler{};
 
     // Queues for worker thread (game audio uses lock-free SPSC ring buffer in AudioGrabber)
     std::deque<std::shared_ptr<CapturedFrame>> m_frameQueue;
@@ -132,7 +141,6 @@ private:
     std::condition_variable m_cv;
 
     std::thread m_workerThread;
-    std::chrono::steady_clock::time_point m_replayStartTime;
 };
 
 } // namespace replay

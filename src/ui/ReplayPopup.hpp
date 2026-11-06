@@ -20,6 +20,9 @@ public:
 
     ~ReplayPopup() override;
 
+    void updateStatusDisplay(float dt = 0.0f);
+    void refreshUI(bool syncTogglers = true);
+
 protected:
     bool init(float width, float height);
     void setup();
@@ -35,17 +38,15 @@ private:
 
     bool guardLocked() const;
     void switchTab(int tabIndex);
-    void updateStatusDisplay(float dt = 0.0f);
-    void refreshUI();
     void updateFolderDisplay();
     void onBrowseFolder();
     void onResetFolder();
     void cycleMicDevice(int direction);
     void refreshMicDeviceButton();
+    void handleVolumeSlider(Slider* slider, cocos2d::CCLabelBMFont* label, std::atomic<float>& targetVol);
     void onGameVolumeChanged(cocos2d::CCObject* sender);
     void onMicVolumeChanged(cocos2d::CCObject* sender);
 
-    int m_currentTab = 0;
     cocos2d::CCNode* m_pages[4] = {nullptr, nullptr, nullptr, nullptr};
     CCMenuItemSpriteExtra* m_tabButtons[4] = {nullptr, nullptr, nullptr, nullptr};
 
@@ -90,17 +91,11 @@ private:
     CCMenuItemToggler* m_hwAccelToggle = nullptr;
     cocos2d::CCLabelBMFont* m_hwAccelLabel = nullptr;
 
-    // Warning banner and page lock notices
+    // Warning banner
     cocos2d::CCLabelBMFont* m_lockWarningBanner = nullptr;
-    cocos2d::CCLabelBMFont* m_pageNoticeLabels[4] = {nullptr, nullptr, nullptr, nullptr};
 
     // Action buttons
     CCMenuItemSpriteExtra* m_toggleBtn = nullptr;
-    CCMenuItemSpriteExtra* m_quickBrowseBtn = nullptr;
-    CCMenuItemSpriteExtra* m_browseFolderBtn = nullptr;
-    CCMenuItemSpriteExtra* m_resetFolderBtn = nullptr;
-    CCMenuItemSpriteExtra* m_micPrevBtn = nullptr;
-    CCMenuItemSpriteExtra* m_micNextBtn = nullptr;
 
     // Microphone device selection
     CCMenuItemSpriteExtra* m_micDeviceBtn = nullptr;

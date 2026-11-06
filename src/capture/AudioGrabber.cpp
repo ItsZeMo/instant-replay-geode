@@ -3,6 +3,7 @@
 #ifdef GEODE_IS_WINDOWS
 
 #include "../config/ReplayConfig.hpp"
+#include "../recorder/ReplayManager.hpp"
 #include <Geode/binding/FMODAudioEngine.hpp>
 #include <Geode/utils/string.hpp>
 #include <windows.h>
@@ -19,6 +20,58 @@ namespace replay {
 static const PROPERTYKEY kPKEY_Device_FriendlyName = {
     { 0xa45c254e, 0xdf1c, 0x4efd, { 0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0 } }, 14
 };
+
+// Proper multichannel-to-stereo downmix supporting 1.0, 2.0, 3.0 (L/R/C), 4.0 Quad (FL/FR/BL/BR),
+// 5.0 (FL/FR/FC/BL/BR), 5.1 (FL/FR/FC/LFE/BL/BR), 6.1, and 7.1 (FL/FR/FC/LFE/BL/BR/SL/SR) (#22).
+static inline void downmixFrameToStereo(const float* frame, int channels, float vol, float& outL, float& outR) noexcept {
+    float l = 0.0f;
+    float r = 0.0f;
+    switch (channels) {
+        case 1:
+            l = r = frame[0];
+            break;
+        case 2:
+            l = frame[0];
+            r = frame[1];
+            break;
+        case 3: { // 3.0: FL, FR, FC
+            float c = frame[2] * 0.7071f;
+            l = frame[0] + c;
+            r = frame[1] + c;
+            break;
+        }
+        case 4: // 4.0 Quad: FL, FR, BL, BR
+            l = frame[0] + frame[2] * 0.7071f;
+            r = frame[1] + frame[3] * 0.7071f;
+            break;
+        case 5: { // 5.0: FL, FR, FC, BL, BR
+            float c = frame[2] * 0.7071f;
+            l = frame[0] + c + frame[3] * 0.7071f;
+            r = frame[1] + c + frame[4] * 0.7071f;
+            break;
+        }
+        case 6: { // 5.1: FL, FR, FC, LFE, BL, BR
+            float centerLfe = frame[2] * 0.7071f + frame[3] * 0.5f;
+            l = frame[0] + centerLfe + frame[4] * 0.7071f;
+            r = frame[1] + centerLfe + frame[5] * 0.7071f;
+            break;
+        }
+        case 7: { // 6.1: FL, FR, FC, LFE, BC, SL, SR
+            float mid = frame[2] * 0.7071f + frame[3] * 0.5f + frame[4] * 0.5f;
+            l = frame[0] + mid + frame[5] * 0.7071f;
+            r = frame[1] + mid + frame[6] * 0.7071f;
+            break;
+        }
+        default: { // >= 8 (7.1: FL, FR, FC, LFE, BL, BR, SL, SR)
+            float centerLfe = frame[2] * 0.7071f + frame[3] * 0.5f;
+            l = frame[0] + centerLfe + (frame[4] + frame[6]) * 0.7071f;
+            r = frame[1] + centerLfe + (frame[5] + frame[7]) * 0.7071f;
+            break;
+        }
+    }
+    outL = std::clamp(l * vol, -1.0f, 1.0f);
+    outR = std::clamp(r * vol, -1.0f, 1.0f);
+}
 
 static std::string sanitizeDeviceName(const std::wstring& wname) {
     std::wstring converted = wname;
@@ -117,20 +170,19 @@ AudioGrabber::~AudioGrabber() {
 void AudioGrabber::initialize() {
     if (m_initialized) return;
 
+    m_initialized = true;
+    m_nextDspRetryTime = {};
     setupFmodDSP();
     // Note: Microphone capture is started by ReplayManager::startReplay() only when
     // both replay is enabled AND recordMic is enabled.
-
-    m_initialized = true;
 }
 
 void AudioGrabber::cleanup() {
     if (!m_initialized) return;
 
+    m_initialized = false;
     removeFmodDSP();
     stopMicCapture();
-
-    m_initialized = false;
 }
 
 void AudioGrabber::setMicAudioCallback(AudioCallback cb) {
@@ -138,12 +190,14 @@ void AudioGrabber::setMicAudioCallback(AudioCallback cb) {
 }
 
 void AudioGrabber::ensureDSPAttached() {
-    if (m_fmodDSP) return;
+    if (!m_initialized || m_fmodDSP) return;
+    auto now = std::chrono::steady_clock::now();
+    if (now < m_nextDspRetryTime) return;
     setupFmodDSP();
 }
 
 void AudioGrabber::setupFmodDSP() {
-    if (m_fmodDSP) return;
+    if (!m_initialized || m_fmodDSP) return;
 
     auto engine = FMODAudioEngine::sharedEngine();
     if (!engine || !engine->m_system) return;
@@ -157,6 +211,7 @@ void AudioGrabber::setupFmodDSP() {
 
     FMOD::ChannelGroup* masterGroup = nullptr;
     if (engine->m_system->getMasterChannelGroup(&masterGroup) != FMOD_OK || !masterGroup) {
+        m_nextDspRetryTime = std::chrono::steady_clock::now() + std::chrono::seconds(2);
         return;
     }
 
@@ -178,9 +233,14 @@ void AudioGrabber::setupFmodDSP() {
                              m_gameSampleRate.load(std::memory_order_relaxed));
         } else {
             geode::log::warn("Instant Replay: masterGroup->addDSP failed with {}", static_cast<int>(addRes));
+            m_fmodDSP->release();
+            m_fmodDSP = nullptr;
+            m_nextDspRetryTime = std::chrono::steady_clock::now() + std::chrono::seconds(2);
         }
     } else {
+        m_fmodDSP = nullptr;
         geode::log::warn("Instant Replay: createDSP failed with {}", static_cast<int>(res));
+        m_nextDspRetryTime = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     }
 }
 
@@ -212,8 +272,8 @@ bool AudioGrabber::hasPendingGameAudio() const noexcept {
 void AudioGrabber::pushGameAudio(const float* inbuffer, unsigned int length, int channels, int sampleRate) {
     if (!inbuffer || length == 0 || channels <= 0) return;
 
-    const auto& config = ReplayConfig::get();
-    if (!config.enabled.load()) return;
+    if (!ReplayManager::get()->isReplayActive()) return;
+    const auto& config = ReplayManager::get()->getSessionConfig();
 
     if (sampleRate > 0) {
         m_gameSampleRate.store(sampleRate, std::memory_order_relaxed);
@@ -233,35 +293,7 @@ void AudioGrabber::pushGameAudio(const float* inbuffer, unsigned int length, int
     for (size_t i = 0; i < framesToWrite; ++i) {
         float l = 0.0f;
         float r = 0.0f;
-        if (channels == 2) {
-            l = inbuffer[i * 2] * vol;
-            r = inbuffer[i * 2 + 1] * vol;
-        } else if (channels == 1) {
-            l = r = inbuffer[i] * vol;
-        } else if (channels >= 4) {
-            const float* frame = &inbuffer[i * channels];
-            l = frame[0];
-            r = frame[1];
-            if (channels > 2) {
-                float c = frame[2] * 0.7071f;
-                l += c;
-                r += c;
-            }
-            if (channels > 3) {
-                float lfe = frame[3] * 0.5f;
-                l += lfe;
-                r += lfe;
-            }
-            if (channels > 5) {
-                l += frame[4] * 0.7071f;
-                r += frame[5] * 0.7071f;
-            }
-            l = std::clamp(l * vol, -1.0f, 1.0f);
-            r = std::clamp(r * vol, -1.0f, 1.0f);
-        } else {
-            l = inbuffer[i * channels] * vol;
-            r = inbuffer[i * channels + 1] * vol;
-        }
+        downmixFrameToStereo(&inbuffer[i * static_cast<size_t>(channels)], channels, vol, l, r);
 
         size_t slot = (writePos + i) & kGameRingMask;
         m_gameRingBuffer[slot * 2] = l;
@@ -314,111 +346,45 @@ size_t AudioGrabber::drainGameAudio(
     return frames;
 }
 
-void AudioGrabber::resetMicResampler() {
-    m_micResamplePos = 0.0;
-    m_micPrevSample[0] = 0.0f;
-    m_micPrevSample[1] = 0.0f;
-    m_micHasPrev = false;
-    m_micLastInputRate = 0;
-}
-
-void AudioGrabber::pushMicAudio(const float* inbuffer, unsigned int length, int channels, int sampleRate) {
+void AudioGrabber::pushMicAudio(
+    const float* inbuffer,
+    unsigned int length,
+    int channels,
+    int sampleRate,
+    std::chrono::steady_clock::time_point captureTime
+) {
     if (!m_micCallback || length == 0 || channels <= 0 || !inbuffer) return;
 
-    const auto& config = ReplayConfig::get();
-    if (!config.enabled.load() || !config.recordMic.load()) return;
+    if (!ReplayManager::get()->isReplayActive()) return;
+    const auto& config = ReplayManager::get()->getSessionConfig();
+    if (!config.recordMic.load()) return;
 
     float vol = config.micVolume.load();
 
-    // 1. Channel conversion to stereo (2 channels) using reusable thread-local scratch
+    // 1. Channel conversion to stereo (2 channels) using reusable scratch
     m_micStereoScratch.resize(static_cast<size_t>(length) * 2);
-    if (channels == 1) {
-        for (unsigned int i = 0; i < length; ++i) {
-            float s = std::clamp(inbuffer[i] * vol, -1.0f, 1.0f);
-            m_micStereoScratch[i * 2] = s;
-            m_micStereoScratch[i * 2 + 1] = s;
-        }
-    } else if (channels == 2) {
-        for (unsigned int i = 0; i < length * 2; ++i) {
-            m_micStereoScratch[i] = std::clamp(inbuffer[i] * vol, -1.0f, 1.0f);
-        }
-    } else {
-        for (unsigned int i = 0; i < length; ++i) {
-            const float* frame = &inbuffer[i * channels];
-            float l = frame[0];
-            float r = frame[1];
-            if (channels > 2) {
-                float c = frame[2] * 0.7071f;
-                l += c;
-                r += c;
-            }
-            m_micStereoScratch[i * 2] = std::clamp(l * vol, -1.0f, 1.0f);
-            m_micStereoScratch[i * 2 + 1] = std::clamp(r * vol, -1.0f, 1.0f);
-        }
+    for (unsigned int i = 0; i < length; ++i) {
+        downmixFrameToStereo(
+            &inbuffer[static_cast<size_t>(i) * channels],
+            channels,
+            vol,
+            m_micStereoScratch[static_cast<size_t>(i) * 2],
+            m_micStereoScratch[static_cast<size_t>(i) * 2 + 1]
+        );
     }
 
-    auto chunk = std::make_shared<AudioChunk>();
-    chunk->channels = 2;
-    chunk->timestamp = std::chrono::steady_clock::now();
-
-    // 2. Stateful linear resampler to 48000 Hz (preserves fractional phase across packet boundaries)
     constexpr int TARGET_RATE = 48000;
     if (sampleRate <= 0) sampleRate = TARGET_RATE;
 
-    if (m_micLastInputRate != sampleRate) {
-        resetMicResampler();
-        m_micLastInputRate = sampleRate;
-    }
+    auto chunk = std::make_shared<AudioChunk>();
+    chunk->channels = 2;
+    chunk->sampleRate = TARGET_RATE;
+    chunk->timestamp = captureTime;
 
-    if (sampleRate == TARGET_RATE) {
-        chunk->sampleRate = TARGET_RATE;
-        chunk->samples.assign(m_micStereoScratch.begin(), m_micStereoScratch.end());
-    } else {
-        chunk->sampleRate = TARGET_RATE;
-        double step = static_cast<double>(sampleRate) / static_cast<double>(TARGET_RATE);
-        size_t estOutFrames = static_cast<size_t>(static_cast<double>(length) / step) + 2;
-        chunk->samples.reserve(estOutFrames * 2);
+    // 2. Stateful linear resampler to 48000 Hz (preserves fractional phase across packet boundaries)
+    m_micResampler.process(m_micStereoScratch.data(), length, sampleRate, TARGET_RATE, chunk->samples);
+    if (chunk->samples.empty()) return;
 
-        if (!m_micHasPrev) {
-            m_micPrevSample[0] = m_micStereoScratch[0];
-            m_micPrevSample[1] = m_micStereoScratch[1];
-            m_micHasPrev = true;
-            m_micResamplePos = 0.0;
-        }
-
-        // Position -1.0 corresponds to m_micPrevSample; positions [0, length - 1] are in m_micStereoScratch
-        double limit = static_cast<double>(length) - 1.0;
-        while (m_micResamplePos < limit) {
-            float l0 = 0.0f, r0 = 0.0f, l1 = 0.0f, r1 = 0.0f;
-            float frac = 0.0f;
-            if (m_micResamplePos < 0.0) {
-                frac = static_cast<float>(m_micResamplePos + 1.0);
-                l0 = m_micPrevSample[0];
-                r0 = m_micPrevSample[1];
-                l1 = m_micStereoScratch[0];
-                r1 = m_micStereoScratch[1];
-            } else {
-                size_t idx0 = static_cast<size_t>(m_micResamplePos);
-                size_t idx1 = std::min<size_t>(idx0 + 1, length - 1);
-                frac = static_cast<float>(m_micResamplePos - static_cast<double>(idx0));
-                l0 = m_micStereoScratch[idx0 * 2];
-                r0 = m_micStereoScratch[idx0 * 2 + 1];
-                l1 = m_micStereoScratch[idx1 * 2];
-                r1 = m_micStereoScratch[idx1 * 2 + 1];
-            }
-            chunk->samples.push_back(l0 + frac * (l1 - l0));
-            chunk->samples.push_back(r0 + frac * (r1 - r0));
-            m_micResamplePos += step;
-        }
-
-        m_micPrevSample[0] = m_micStereoScratch[(length - 1) * 2];
-        m_micPrevSample[1] = m_micStereoScratch[(length - 1) * 2 + 1];
-        m_micResamplePos -= static_cast<double>(length);
-
-        if (chunk->samples.empty()) return;
-    }
-
-    m_micSampleRate.store(TARGET_RATE, std::memory_order_relaxed);
     m_micCallback(std::move(chunk));
 }
 
@@ -428,17 +394,18 @@ std::vector<AudioDeviceInfo> AudioGrabber::getAvailableMicrophones() {
 
     HRESULT hrCo = CoInitializeEx(NULL, COINIT_MULTITHREADED);
 
-    IMMDeviceEnumerator* enumerator = nullptr;
-    HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), (void**)&enumerator);
+    ComRef<IMMDeviceEnumerator> enumerator;
+    HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_ALL,
+                                  __uuidof(IMMDeviceEnumerator), (void**)enumerator.put());
     if (SUCCEEDED(hr) && enumerator) {
-        IMMDeviceCollection* collection = nullptr;
-        hr = enumerator->EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE, &collection);
+        ComRef<IMMDeviceCollection> collection;
+        hr = enumerator->EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE, collection.put());
         if (SUCCEEDED(hr) && collection) {
             UINT count = 0;
             collection->GetCount(&count);
             for (UINT i = 0; i < count; ++i) {
-                IMMDevice* device = nullptr;
-                if (SUCCEEDED(collection->Item(i, &device)) && device) {
+                ComRef<IMMDevice> device;
+                if (SUCCEEDED(collection->Item(i, device.put())) && device) {
                     LPWSTR devId = nullptr;
                     device->GetId(&devId);
 
@@ -449,15 +416,14 @@ std::vector<AudioDeviceInfo> AudioGrabber::getAvailableMicrophones() {
                     }
 
                     std::string friendlyName;
-                    IPropertyStore* props = nullptr;
-                    if (SUCCEEDED(device->OpenPropertyStore(STGM_READ, &props)) && props) {
+                    ComRef<IPropertyStore> props;
+                    if (SUCCEEDED(device->OpenPropertyStore(STGM_READ, props.put())) && props) {
                         PROPVARIANT pv;
                         PropVariantInit(&pv);
                         if (SUCCEEDED(props->GetValue(kPKEY_Device_FriendlyName, &pv)) && pv.vt == VT_LPWSTR && pv.pwszVal) {
                             friendlyName = sanitizeDeviceName(pv.pwszVal);
                         }
                         PropVariantClear(&pv);
-                        props->Release();
                     }
 
                     if (!idStr.empty()) {
@@ -466,25 +432,15 @@ std::vector<AudioDeviceInfo> AudioGrabber::getAvailableMicrophones() {
                         }
                         list.push_back({idStr, friendlyName});
                     }
-                    device->Release();
                 }
             }
-            collection->Release();
         }
-        enumerator->Release();
     }
 
     if (SUCCEEDED(hrCo)) {
         CoUninitialize();
     }
     return list;
-}
-
-void AudioGrabber::restartMicCapture() {
-    stopMicCapture();
-    if (ReplayConfig::get().enabled.load() && ReplayConfig::get().recordMic.load()) {
-        startMicCapture();
-    }
 }
 
 void AudioGrabber::startMicCapture() {
@@ -503,7 +459,10 @@ void AudioGrabber::stopMicCapture() {
 
 void AudioGrabber::micCaptureThreadFunc() {
     HRESULT coHr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
-    resetMicResampler();
+    m_micResampler.reset();
+
+    LARGE_INTEGER qpcFreq{};
+    QueryPerformanceFrequency(&qpcFreq);
 
     auto sleepInterruptible = [this](int totalMs) {
         int elapsed = 0;
@@ -514,45 +473,48 @@ void AudioGrabber::micCaptureThreadFunc() {
     };
 
     while (m_micRunning.load()) {
-        IMMDeviceEnumerator* enumerator = nullptr;
+        ComRef<IMMDeviceEnumerator> enumerator;
         HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_ALL,
-                                      __uuidof(IMMDeviceEnumerator), (void**)&enumerator);
+                                      __uuidof(IMMDeviceEnumerator), (void**)enumerator.put());
         if (FAILED(hr) || !enumerator) {
             sleepInterruptible(1000);
             continue;
         }
 
-        IMMDevice* device = nullptr;
-        std::string targetId = ReplayConfig::get().getMicDeviceId();
+        ComRef<IMMDevice> device;
+        std::string targetId = ReplayManager::get()->getSessionConfig().getMicDeviceId();
 
         if (!targetId.empty() && targetId != "default") {
             std::wstring wideId = geode::utils::string::utf8ToWide(targetId);
             if (!wideId.empty()) {
-                if (FAILED(enumerator->GetDevice(wideId.c_str(), &device))) {
-                    device = nullptr;
+                if (SUCCEEDED(enumerator->GetDevice(wideId.c_str(), device.put())) && device) {
+                    // GetDevice succeeds even for unplugged/disabled endpoints; verify DEVICE_STATE_ACTIVE (#13)
+                    DWORD state = 0;
+                    if (FAILED(device->GetState(&state)) || state != DEVICE_STATE_ACTIVE) {
+                        device.reset();
+                    }
+                } else {
+                    device.reset();
                 }
             }
         }
 
         if (!device) {
             // Prefer eConsole first so Bluetooth headsets are not forced into low-quality HFP communication profile
-            hr = enumerator->GetDefaultAudioEndpoint(eCapture, eConsole, &device);
+            hr = enumerator->GetDefaultAudioEndpoint(eCapture, eConsole, device.put());
             if (FAILED(hr)) {
-                hr = enumerator->GetDefaultAudioEndpoint(eCapture, eCommunications, &device);
+                hr = enumerator->GetDefaultAudioEndpoint(eCapture, eCommunications, device.put());
             }
         }
 
         if (FAILED(hr) || !device) {
-            enumerator->Release();
             sleepInterruptible(1000);
             continue;
         }
 
-        IAudioClient* audioClient = nullptr;
-        hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, NULL, (void**)&audioClient);
+        ComRef<IAudioClient> audioClient;
+        hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, NULL, (void**)audioClient.put());
         if (FAILED(hr) || !audioClient) {
-            device->Release();
-            enumerator->Release();
             sleepInterruptible(1000);
             continue;
         }
@@ -560,9 +522,6 @@ void AudioGrabber::micCaptureThreadFunc() {
         WAVEFORMATEX* pwfx = nullptr;
         hr = audioClient->GetMixFormat(&pwfx);
         if (FAILED(hr) || !pwfx) {
-            audioClient->Release();
-            device->Release();
-            enumerator->Release();
             sleepInterruptible(1000);
             continue;
         }
@@ -577,17 +536,16 @@ void AudioGrabber::micCaptureThreadFunc() {
         if (SUCCEEDED(hr) && hWakeEvent && SUCCEEDED(audioClient->SetEventHandle(hWakeEvent))) {
             eventDriven = true;
         } else {
-            audioClient->Release();
-            audioClient = nullptr;
-            if (SUCCEEDED(device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, NULL, (void**)&audioClient))) {
+            audioClient.reset();
+            if (SUCCEEDED(device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, NULL, (void**)audioClient.put()))) {
                 hr = audioClient->Initialize(AUDCLNT_SHAREMODE_SHARED, 0, hnsBuffer, 0, pwfx, NULL);
             }
         }
 
         bool deviceLost = false;
         if (SUCCEEDED(hr) && audioClient) {
-            IAudioCaptureClient* captureClient = nullptr;
-            hr = audioClient->GetService(__uuidof(IAudioCaptureClient), (void**)&captureClient);
+            ComRef<IAudioCaptureClient> captureClient;
+            hr = audioClient->GetService(__uuidof(IAudioCaptureClient), (void**)captureClient.put());
             if (SUCCEEDED(hr) && captureClient) {
                 audioClient->Start();
 
@@ -623,7 +581,8 @@ void AudioGrabber::micCaptureThreadFunc() {
                         BYTE* pData = nullptr;
                         UINT32 numFrames = 0;
                         DWORD flags = 0;
-                        hr = captureClient->GetBuffer(&pData, &numFrames, &flags, NULL, NULL);
+                        UINT64 qpcPositionHns = 0;
+                        hr = captureClient->GetBuffer(&pData, &numFrames, &flags, NULL, &qpcPositionHns);
                         if (FAILED(hr)) {
                             deviceLost = true;
                             break;
@@ -633,12 +592,30 @@ void AudioGrabber::micCaptureThreadFunc() {
                             int sampleRate = pwfx->nSamplesPerSec;
                             size_t totalSamples = static_cast<size_t>(numFrames) * channels;
 
+                            // Compute packet start timestamp from hardware QPC position or packet duration (#23)
+                            auto now = std::chrono::steady_clock::now();
+                            int64_t packetDurationNs = (sampleRate > 0)
+                                ? (static_cast<int64_t>(numFrames) * 1000000000LL) / sampleRate
+                                : 0;
+                            auto captureTime = now - std::chrono::nanoseconds(packetDurationNs);
+                            if (qpcPositionHns > 0 && qpcFreq.QuadPart > 0) {
+                                LARGE_INTEGER qpcNow{};
+                                QueryPerformanceCounter(&qpcNow);
+                                uint64_t nowHns = static_cast<uint64_t>((qpcNow.QuadPart * 10000000LL) / qpcFreq.QuadPart);
+                                if (nowHns >= qpcPositionHns) {
+                                    uint64_t ageHns = nowHns - qpcPositionHns;
+                                    if (ageHns < 5000000ULL) { // < 500ms
+                                        captureTime = now - std::chrono::nanoseconds(static_cast<int64_t>(ageHns) * 100LL);
+                                    }
+                                }
+                            }
+
                             if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
                                 m_micConvertScratch.assign(totalSamples, 0.0f);
-                                pushMicAudio(m_micConvertScratch.data(), numFrames, channels, sampleRate);
+                                pushMicAudio(m_micConvertScratch.data(), numFrames, channels, sampleRate, captureTime);
                             } else if (pData) {
                                 if (isFloat) {
-                                    pushMicAudio(reinterpret_cast<const float*>(pData), numFrames, channels, sampleRate);
+                                    pushMicAudio(reinterpret_cast<const float*>(pData), numFrames, channels, sampleRate, captureTime);
                                 } else {
                                     int bits = pwfx->wBitsPerSample;
                                     m_micConvertScratch.resize(totalSamples);
@@ -647,7 +624,7 @@ void AudioGrabber::micCaptureThreadFunc() {
                                         for (size_t i = 0; i < totalSamples; ++i) {
                                             m_micConvertScratch[i] = src[i] / 32768.0f;
                                         }
-                                        pushMicAudio(m_micConvertScratch.data(), numFrames, channels, sampleRate);
+                                        pushMicAudio(m_micConvertScratch.data(), numFrames, channels, sampleRate, captureTime);
                                     } else if (bits == 24) {
                                         const uint8_t* src = reinterpret_cast<const uint8_t*>(pData);
                                         for (size_t i = 0; i < totalSamples; ++i) {
@@ -655,13 +632,13 @@ void AudioGrabber::micCaptureThreadFunc() {
                                             if (val & 0x800000) val |= 0xFF000000;
                                             m_micConvertScratch[i] = static_cast<float>(val) / 8388608.0f;
                                         }
-                                        pushMicAudio(m_micConvertScratch.data(), numFrames, channels, sampleRate);
+                                        pushMicAudio(m_micConvertScratch.data(), numFrames, channels, sampleRate, captureTime);
                                     } else if (bits == 32) {
                                         const int32_t* src = reinterpret_cast<const int32_t*>(pData);
                                         for (size_t i = 0; i < totalSamples; ++i) {
                                             m_micConvertScratch[i] = static_cast<float>(src[i]) / 2147483648.0f;
                                         }
-                                        pushMicAudio(m_micConvertScratch.data(), numFrames, channels, sampleRate);
+                                        pushMicAudio(m_micConvertScratch.data(), numFrames, channels, sampleRate, captureTime);
                                     }
                                 }
                             }
@@ -681,18 +658,14 @@ void AudioGrabber::micCaptureThreadFunc() {
                     timeEndPeriod(1);
                 }
                 audioClient->Stop();
-                captureClient->Release();
             }
         }
 
         if (hWakeEvent) CloseHandle(hWakeEvent);
         if (pwfx) CoTaskMemFree(pwfx);
-        if (audioClient) audioClient->Release();
-        device->Release();
-        enumerator->Release();
 
         if (m_micRunning.load()) {
-            resetMicResampler();
+            m_micResampler.reset();
             sleepInterruptible(deviceLost ? 500 : 1000);
         }
     }

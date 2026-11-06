@@ -16,6 +16,8 @@ namespace replay {
 
 namespace {
 
+static constexpr float kMaxVolume = 2.0f; // 0% - 200% (matches mod.json max: 200)
+
 void setBtnScale(CCMenuItemSpriteExtra* btn, float scale) {
     if (!btn) return;
     btn->setScale(scale);
@@ -24,6 +26,39 @@ void setBtnScale(CCMenuItemSpriteExtra* btn, float scale) {
 
 bool isInputFocused(TextInput* input) {
     return input && input->getInputNode() && input->getInputNode()->m_selected;
+}
+
+void updateMenuHighlight(CCMenu* menu, int activeTag, bool allowActive = true, int disabledTag = -1) {
+    if (!menu) return;
+    for (auto child : CCArrayExt<CCNode*>(menu->getChildren())) {
+        if (auto btn = typeinfo_cast<CCMenuItemSpriteExtra*>(child)) {
+            int tag = btn->getTag();
+            bool active = allowActive && (tag == activeTag);
+            bool disabled = (disabledTag != -1 && tag == disabledTag);
+            btn->setEnabled(!disabled);
+            if (auto spr = typeinfo_cast<ButtonSprite*>(btn->getNormalImage())) {
+                if (disabled) {
+                    spr->setColor(ccc3(110, 110, 110));
+                    spr->setOpacity(130);
+                    spr->updateBGImage("GJ_button_04.png");
+                } else {
+                    spr->setColor(ccc3(255, 255, 255));
+                    spr->setOpacity(255);
+                    spr->updateBGImage(active ? "GJ_button_01.png" : "GJ_button_04.png");
+                }
+            }
+        }
+    }
+}
+
+void syncVolumeControls(Slider* slider, CCLabelBMFont* label, float vol) {
+    if (slider) {
+        slider->setValue(std::clamp(vol / kMaxVolume, 0.0f, 1.0f));
+    }
+    if (label) {
+        int pct = static_cast<int>(vol * 100.0f + 0.5f);
+        label->setString((std::to_string(pct) + "%").c_str());
+    }
 }
 
 std::string getSaveKeybindLabel() {
@@ -100,7 +135,12 @@ bool ReplayPopup::init(float width, float height) {
 
 bool ReplayPopup::guardLocked() const {
     if (ReplayManager::get()->isReplayActive()) {
-        Notification::create("Recording settings can only be changed when recording is OFF!", NotificationIcon::Warning, 1.2f)->show();
+        static std::chrono::steady_clock::time_point s_lastWarnTime{};
+        auto now = std::chrono::steady_clock::now();
+        if (now - s_lastWarnTime >= std::chrono::milliseconds(1500)) {
+            s_lastWarnTime = now;
+            Notification::create("Recording settings can only be changed when recording is OFF!", NotificationIcon::Warning, 1.2f)->show();
+        }
         return true;
     }
     return false;
@@ -273,7 +313,6 @@ void ReplayPopup::setupDashboardTab(CCNode* page, CCSize const& winSize, float c
             try {
                 int sec = std::clamp(std::stoi(str), 5, 3600);
                 ReplayConfig::get().durationSeconds = sec;
-                ReplayConfig::get().saveToSettings();
                 this->refreshUI();
                 this->updateStatusDisplay(0.0f);
             } catch (...) {}
@@ -321,7 +360,6 @@ void ReplayPopup::setupDashboardTab(CCNode* page, CCSize const& winSize, float c
     });
     setBtnScale(browseBtn, 0.62f);
     folderQuickMenu->addChild(browseBtn);
-    m_quickBrowseBtn = browseBtn;
 }
 
 void ReplayPopup::setupCodecTab(CCNode* page, CCSize const& winSize, float centerX) {
@@ -370,17 +408,19 @@ void ReplayPopup::setupCodecTab(CCNode* page, CCSize const& winSize, float cente
     float hwX = 35.0f;
     float hwY = winSize.height - 105.0f;
 
+    // Note: CCMenuItemToggler::activate() flips the visual state AFTER invoking this callback.
+    // Do NOT call toggler->toggle(newHw) on normal clicks; on blocked clicks, pre-flip so
+    // activate() restores the current state.
     m_hwAccelToggle = CCMenuItemExt::createTogglerWithStandardSprites(0.65f, [this](auto* toggler) {
+        bool curHw = ReplayConfig::get().hardwareAcceleration.load();
         if (this->guardLocked()) {
-            toggler->toggle(ReplayConfig::get().hardwareAcceleration.load());
+            toggler->toggle(!curHw);
             return;
         }
         auto& cfg = ReplayConfig::get();
-        bool newHw = !cfg.hardwareAcceleration.load();
-        cfg.hardwareAcceleration = newHw;
+        cfg.hardwareAcceleration = !curHw;
         cfg.saveToSettings();
-        toggler->toggle(newHw);
-        this->refreshUI();
+        this->refreshUI(false);
         this->updateStatusDisplay(0.0f);
     });
     m_hwAccelToggle->toggle(ReplayConfig::get().hardwareAcceleration.load());
@@ -415,7 +455,6 @@ void ReplayPopup::setupCodecTab(CCNode* page, CCSize const& winSize, float cente
         if (!str.empty()) {
             c.codec = CodecType::CUSTOM;
         }
-        c.saveToSettings();
         this->refreshUI();
         this->updateStatusDisplay(0.0f);
     });
@@ -514,11 +553,11 @@ void ReplayPopup::setupCodecTab(CCNode* page, CCSize const& winSize, float cente
     m_codecConflictLabel->setVisible(false);
     page->addChild(m_codecConflictLabel);
 
-    m_pageNoticeLabels[1] = CCLabelBMFont::create("Select your preferred codec, GPU acceleration, resolution & FPS.", "chatFont.fnt");
-    m_pageNoticeLabels[1]->setScale(0.36f);
-    m_pageNoticeLabels[1]->setColor(ccc3(130, 240, 190));
-    m_pageNoticeLabels[1]->setPosition(ccp(centerX, winSize.height - 264.0f));
-    page->addChild(m_pageNoticeLabels[1]);
+    auto codecNotice = CCLabelBMFont::create("Select your preferred codec, GPU acceleration, resolution & FPS.", "chatFont.fnt");
+    codecNotice->setScale(0.36f);
+    codecNotice->setColor(ccc3(130, 240, 190));
+    codecNotice->setPosition(ccp(centerX, winSize.height - 264.0f));
+    page->addChild(codecNotice);
 }
 
 void ReplayPopup::setupBitrateTab(CCNode* page, CCSize const& winSize, float centerX) {
@@ -613,7 +652,6 @@ void ReplayPopup::setupBitrateTab(CCNode* page, CCSize const& winSize, float cen
                 if (cfg.maxBitrateMbps.load() < b) {
                     cfg.maxBitrateMbps = b;
                 }
-                cfg.saveToSettings();
                 this->refreshUI();
                 this->updateStatusDisplay(0.0f);
             } catch (...) {}
@@ -668,11 +706,11 @@ void ReplayPopup::setupBitrateTab(CCNode* page, CCSize const& winSize, float cen
     m_estSizeBitrateLabel->setPosition(ccp(centerX, winSize.height - 226.0f));
     page->addChild(m_estSizeBitrateLabel);
 
-    m_pageNoticeLabels[2] = CCLabelBMFont::create("Adaptive VBR dynamically allocates bitrate: saves space in menus, peaks in fast gameplay.", "chatFont.fnt");
-    m_pageNoticeLabels[2]->setScale(0.38f);
-    m_pageNoticeLabels[2]->setColor(ccc3(220, 220, 160));
-    m_pageNoticeLabels[2]->setPosition(ccp(centerX, winSize.height - 252.0f));
-    page->addChild(m_pageNoticeLabels[2]);
+    auto bitrateNotice = CCLabelBMFont::create("Adaptive VBR dynamically allocates bitrate: saves space in menus, peaks in fast gameplay.", "chatFont.fnt");
+    bitrateNotice->setScale(0.38f);
+    bitrateNotice->setColor(ccc3(220, 220, 160));
+    bitrateNotice->setPosition(ccp(centerX, winSize.height - 252.0f));
+    page->addChild(bitrateNotice);
 }
 
 void ReplayPopup::setupAudioStorageTab(CCNode* page, CCSize const& winSize, float centerX) {
@@ -684,16 +722,17 @@ void ReplayPopup::setupAudioStorageTab(CCNode* page, CCSize const& winSize, floa
     float row1Y = winSize.height - 82.0f;
     float row2Y = winSize.height - 110.0f;
 
+    // Do NOT call toggler->toggle(newState) on normal clicks; CCMenuItemToggler::activate()
+    // toggles the state right after invoking this callback.
     m_splitAudioToggle = CCMenuItemExt::createTogglerWithStandardSprites(0.68f, [this](auto* toggler) {
+        bool curSplit = ReplayConfig::get().splitAudioTracks.load();
         if (this->guardLocked()) {
-            toggler->toggle(ReplayConfig::get().splitAudioTracks.load());
+            toggler->toggle(!curSplit);
             return;
         }
         auto& cfg = ReplayConfig::get();
-        bool newSplit = !cfg.splitAudioTracks.load();
-        cfg.splitAudioTracks = newSplit;
+        cfg.splitAudioTracks = !curSplit;
         cfg.saveToSettings();
-        toggler->toggle(newSplit);
         this->updateStatusDisplay(0.0f);
     });
     m_splitAudioToggle->toggle(ReplayConfig::get().splitAudioTracks.load());
@@ -707,15 +746,14 @@ void ReplayPopup::setupAudioStorageTab(CCNode* page, CCSize const& winSize, floa
     page->addChild(splitLabel);
 
     m_micToggle = CCMenuItemExt::createTogglerWithStandardSprites(0.68f, [this](auto* toggler) {
+        bool curMic = ReplayConfig::get().recordMic.load();
         if (this->guardLocked()) {
-            toggler->toggle(ReplayConfig::get().recordMic.load());
+            toggler->toggle(!curMic);
             return;
         }
         auto& cfg = ReplayConfig::get();
-        bool newMic = !cfg.recordMic.load();
-        cfg.recordMic = newMic;
+        cfg.recordMic = !curMic;
         cfg.saveToSettings();
-        toggler->toggle(newMic);
         this->updateStatusDisplay(0.0f);
     });
     m_micToggle->toggle(ReplayConfig::get().recordMic.load());
@@ -755,12 +793,8 @@ void ReplayPopup::setupAudioStorageTab(CCNode* page, CCSize const& winSize, floa
     });
     setBtnScale(prevBtn, 0.65f);
     m_micDevMenu->addChild(prevBtn);
-    m_micPrevBtn = prevBtn;
 
     std::string initialName = m_availableMics.empty() ? "Default Device" : m_availableMics[m_currentMicIndex].name;
-    if (initialName.length() > 24) {
-        initialName = initialName.substr(0, 21) + "...";
-    }
     auto devSpr = ButtonSprite::create(initialName.c_str(), "goldFont.fnt", "GJ_button_01.png", 0.75f);
     m_micDeviceBtn = CCMenuItemExt::createSpriteExtra(devSpr, [this](auto*) {
         this->cycleMicDevice(1);
@@ -775,11 +809,10 @@ void ReplayPopup::setupAudioStorageTab(CCNode* page, CCSize const& winSize, floa
     });
     setBtnScale(nextBtn, 0.65f);
     m_micDevMenu->addChild(nextBtn);
-    m_micNextBtn = nextBtn;
 
     m_micDevMenu->alignItemsHorizontallyWithPadding(6.0f);
 
-    // Volume Sliders (with lightweight in-memory update while dragging; disk flush on popup close)
+    // Volume Sliders (0% - 200% range; lightweight in-memory update while dragging; disk flush on popup close)
     auto gVolTitle = CCLabelBMFont::create("Game Vol:", "goldFont.fnt");
     gVolTitle->setScale(0.44f);
     gVolTitle->setAnchorPoint(ccp(0.0f, 0.5f));
@@ -788,7 +821,7 @@ void ReplayPopup::setupAudioStorageTab(CCNode* page, CCSize const& winSize, floa
 
     m_gameVolSlider = Slider::create(this, menu_selector(ReplayPopup::onGameVolumeChanged), 0.38f);
     m_gameVolSlider->setPosition(ccp(118.0f, winSize.height - 168.0f));
-    m_gameVolSlider->setValue(std::clamp(ReplayConfig::get().systemVolume.load() / 1.5f, 0.0f, 1.0f));
+    m_gameVolSlider->setValue(std::clamp(ReplayConfig::get().systemVolume.load() / kMaxVolume, 0.0f, 1.0f));
     m_gameVolSlider->setLiveDragging(true);
     page->addChild(m_gameVolSlider);
 
@@ -807,7 +840,7 @@ void ReplayPopup::setupAudioStorageTab(CCNode* page, CCSize const& winSize, floa
 
     m_micVolSlider = Slider::create(this, menu_selector(ReplayPopup::onMicVolumeChanged), 0.38f);
     m_micVolSlider->setPosition(ccp(370.0f, winSize.height - 168.0f));
-    m_micVolSlider->setValue(std::clamp(ReplayConfig::get().micVolume.load() / 1.5f, 0.0f, 1.0f));
+    m_micVolSlider->setValue(std::clamp(ReplayConfig::get().micVolume.load() / kMaxVolume, 0.0f, 1.0f));
     m_micVolSlider->setLiveDragging(true);
     page->addChild(m_micVolSlider);
 
@@ -835,8 +868,8 @@ void ReplayPopup::setupAudioStorageTab(CCNode* page, CCSize const& winSize, floa
             return;
         }
         ReplayConfig::get().setCustomSaveFolder(str);
-        ReplayConfig::get().saveToSettings();
         this->updateFolderDisplay();
+        this->updateStatusDisplay(0.0f);
     });
     page->addChild(m_saveFolderInput);
 
@@ -851,7 +884,6 @@ void ReplayPopup::setupAudioStorageTab(CCNode* page, CCSize const& winSize, floa
     });
     setBtnScale(bBtn, 0.65f);
     storageActionMenu->addChild(bBtn);
-    m_browseFolderBtn = bBtn;
 
     auto oSpr = ButtonSprite::create("Open Folder", "goldFont.fnt", "GJ_button_05.png", 0.75f);
     auto oBtn = CCMenuItemExt::createSpriteExtra(oSpr, [](auto*) {
@@ -866,13 +898,11 @@ void ReplayPopup::setupAudioStorageTab(CCNode* page, CCSize const& winSize, floa
     });
     setBtnScale(rBtn, 0.65f);
     storageActionMenu->addChild(rBtn);
-    m_resetFolderBtn = rBtn;
 
     storageActionMenu->alignItemsHorizontallyWithPadding(8.0f);
 }
 
 void ReplayPopup::switchTab(int tabIndex) {
-    m_currentTab = tabIndex;
     for (int i = 0; i < 4; ++i) {
         if (m_pages[i]) {
             m_pages[i]->setVisible(i == tabIndex);
@@ -886,7 +916,7 @@ void ReplayPopup::switchTab(int tabIndex) {
 }
 
 void ReplayPopup::updateFolderDisplay() {
-    std::string dir = geode::utils::string::pathToString(ReplayConfig::get().getRecordingsDirectory());
+    std::string dir = geode::utils::string::pathToString(ReplayConfig::get().getRecordingsDirectory(false));
     if (m_folderPathLabel) {
         std::string displayStr = dir;
         if (displayStr.length() > 32) {
@@ -901,7 +931,7 @@ void ReplayPopup::updateFolderDisplay() {
 
 void ReplayPopup::onBrowseFolder() {
     if (guardLocked()) return;
-    auto defaultDir = ReplayConfig::get().getRecordingsDirectory();
+    auto defaultDir = ReplayConfig::get().getRecordingsDirectory(true);
 
     file::FilePickOptions options;
     options.defaultPath = defaultDir;
@@ -915,6 +945,7 @@ void ReplayPopup::onBrowseFolder() {
                 ReplayConfig::get().setCustomSaveFolder(geode::utils::string::pathToString(path));
                 ReplayConfig::get().saveToSettings();
                 self->updateFolderDisplay();
+                self->updateStatusDisplay(0.0f);
                 Notification::create("Save folder updated", NotificationIcon::Success, 1.0f)->show();
             }
         }
@@ -926,40 +957,30 @@ void ReplayPopup::onResetFolder() {
     ReplayConfig::get().setCustomSaveFolder("");
     ReplayConfig::get().saveToSettings();
     updateFolderDisplay();
+    updateStatusDisplay(0.0f);
+}
+
+void ReplayPopup::handleVolumeSlider(Slider* slider, CCLabelBMFont* label, std::atomic<float>& targetVol) {
+    if (!slider) return;
+    if (guardLocked()) {
+        slider->setValue(std::clamp(targetVol.load() / kMaxVolume, 0.0f, 1.0f));
+        return;
+    }
+    float vol = std::clamp(slider->getValue(), 0.0f, 1.0f) * kMaxVolume;
+    targetVol.store(vol);
+    ReplayConfig::get().saveVolumeSettings();
+    if (label) {
+        int pct = static_cast<int>(vol * 100.0f + 0.5f);
+        label->setString((std::to_string(pct) + "%").c_str());
+    }
 }
 
 void ReplayPopup::onGameVolumeChanged(CCObject*) {
-    if (!m_gameVolSlider) return;
-    if (guardLocked()) {
-        m_gameVolSlider->setValue(std::clamp(ReplayConfig::get().systemVolume.load() / 1.5f, 0.0f, 1.0f));
-        return;
-    }
-    float val = m_gameVolSlider->getValue();
-    float vol = val * 1.5f;
-    auto& cfg = ReplayConfig::get();
-    cfg.systemVolume = vol;
-    cfg.saveVolumeSettings();
-    if (m_gameVolLabel) {
-        int pct = static_cast<int>(vol * 100.0f + 0.5f);
-        m_gameVolLabel->setString((std::to_string(pct) + "%").c_str());
-    }
+    handleVolumeSlider(m_gameVolSlider, m_gameVolLabel, ReplayConfig::get().systemVolume);
 }
 
 void ReplayPopup::onMicVolumeChanged(CCObject*) {
-    if (!m_micVolSlider) return;
-    if (guardLocked()) {
-        m_micVolSlider->setValue(std::clamp(ReplayConfig::get().micVolume.load() / 1.5f, 0.0f, 1.0f));
-        return;
-    }
-    float val = m_micVolSlider->getValue();
-    float vol = val * 1.5f;
-    auto& cfg = ReplayConfig::get();
-    cfg.micVolume = vol;
-    cfg.saveVolumeSettings();
-    if (m_micVolLabel) {
-        int pct = static_cast<int>(vol * 100.0f + 0.5f);
-        m_micVolLabel->setString((std::to_string(pct) + "%").c_str());
-    }
+    handleVolumeSlider(m_micVolSlider, m_micVolLabel, ReplayConfig::get().micVolume);
 }
 
 void ReplayPopup::updateStatusDisplay(float) {
@@ -1023,13 +1044,7 @@ void ReplayPopup::updateStatusDisplay(float) {
 
     if (m_codecBadgeLabel) {
         std::string cName = cfg.getCodecDisplayName();
-
-        ResolutionType res = cfg.resolution.load();
-        const char* rName = "Native";
-        if (res == ResolutionType::UHD_4K) rName = "4K";
-        else if (res == ResolutionType::QHD_1440P) rName = "1440p";
-        else if (res == ResolutionType::FHD_1080P) rName = "1080p";
-        else if (res == ResolutionType::HD_720P) rName = "720p";
+        const char* rName = ReplayConfig::resolutionDisplayName(cfg.resolution.load());
 
         RateControlMode rc = cfg.rateControl.load();
         char buf[160];
@@ -1047,49 +1062,34 @@ void ReplayPopup::updateStatusDisplay(float) {
     if (m_estSizeLabel) {
         m_estSizeLabel->setString(cfg.getEstimatedFileSizeText().c_str());
     }
+    std::string detailedSizeText = cfg.getEstimatedFileSizeDetailedText();
     if (m_estSizeBitrateLabel) {
-        m_estSizeBitrateLabel->setString(cfg.getEstimatedFileSizeDetailedText().c_str());
+        m_estSizeBitrateLabel->setString(detailedSizeText.c_str());
     }
     if (m_estSizeResLabel) {
-        m_estSizeResLabel->setString(cfg.getEstimatedFileSizeDetailedText().c_str());
+        m_estSizeResLabel->setString(detailedSizeText.c_str());
     }
 }
 
-void ReplayPopup::refreshUI() {
+void ReplayPopup::refreshUI(bool syncTogglers) {
     const auto& cfg = ReplayConfig::get();
 
     // Duration menu highlight
     int curDur = cfg.durationSeconds.load();
-    if (m_durationMenu) {
-        for (auto child : CCArrayExt<CCNode*>(m_durationMenu->getChildren())) {
-            if (auto btn = typeinfo_cast<CCMenuItemSpriteExtra*>(child)) {
-                bool active = (btn->getTag() == curDur);
-                if (auto spr = typeinfo_cast<ButtonSprite*>(btn->getNormalImage())) {
-                    spr->updateBGImage(active ? "GJ_button_01.png" : "GJ_button_04.png");
-                }
-            }
-        }
-    }
+    updateMenuHighlight(m_durationMenu, curDur);
     if (m_durationInput && !isInputFocused(m_durationInput)) {
         m_durationInput->setString(std::to_string(curDur));
     }
 
     // Codec menu highlight
     CodecType curCodec = cfg.codec.load();
-    if (m_codecMenu) {
-        int curCodecTag = static_cast<int>(curCodec);
-        for (auto child : CCArrayExt<CCNode*>(m_codecMenu->getChildren())) {
-            if (auto btn = typeinfo_cast<CCMenuItemSpriteExtra*>(child)) {
-                bool active = (btn->getTag() == curCodecTag && curCodec != CodecType::CUSTOM);
-                if (auto spr = typeinfo_cast<ButtonSprite*>(btn->getNormalImage())) {
-                    spr->updateBGImage(active ? "GJ_button_01.png" : "GJ_button_04.png");
-                }
-            }
-        }
+    updateMenuHighlight(m_codecMenu, static_cast<int>(curCodec), curCodec != CodecType::CUSTOM);
+    if (m_customCodecInput && !isInputFocused(m_customCodecInput)) {
+        m_customCodecInput->setString(cfg.getCustomCodec());
     }
 
     bool hwAccel = cfg.hardwareAcceleration.load();
-    if (m_hwAccelToggle) {
+    if (syncTogglers && m_hwAccelToggle) {
         m_hwAccelToggle->toggle(hwAccel);
     }
     if (m_hwAccelLabel) {
@@ -1107,50 +1107,12 @@ void ReplayPopup::refreshUI() {
     ResolutionType curRes = cfg.resolution.load();
     int curFps = cfg.targetFps.load();
 
-    // Resolution menu highlight & H.264 4K limit
-    if (m_resMenu) {
-        int curResTag = static_cast<int>(curRes);
-        for (auto child : CCArrayExt<CCNode*>(m_resMenu->getChildren())) {
-            if (auto btn = typeinfo_cast<CCMenuItemSpriteExtra*>(child)) {
-                bool active = (btn->getTag() == curResTag);
-                bool disabled = (isH264 && btn->getTag() == 1 && curFps >= 240);
-                btn->setEnabled(!disabled);
-                if (auto spr = typeinfo_cast<ButtonSprite*>(btn->getNormalImage())) {
-                    if (disabled) {
-                        spr->setColor(ccc3(110, 110, 110));
-                        spr->setOpacity(130);
-                        spr->updateBGImage("GJ_button_04.png");
-                    } else {
-                        spr->setColor(ccc3(255, 255, 255));
-                        spr->setOpacity(255);
-                        spr->updateBGImage(active ? "GJ_button_01.png" : "GJ_button_04.png");
-                    }
-                }
-            }
-        }
-    }
+    // Resolution & FPS menu highlights + H.264 4K @ 240 FPS limit
+    int disabledResTag = (isH264 && curFps >= 240) ? static_cast<int>(ResolutionType::UHD_4K) : -1;
+    updateMenuHighlight(m_resMenu, static_cast<int>(curRes), true, disabledResTag);
 
-    // FPS menu highlight & H.264 240 FPS limit
-    if (m_fpsMenu) {
-        for (auto child : CCArrayExt<CCNode*>(m_fpsMenu->getChildren())) {
-            if (auto btn = typeinfo_cast<CCMenuItemSpriteExtra*>(child)) {
-                bool active = (btn->getTag() == curFps);
-                bool disabled = (isH264 && btn->getTag() == 240 && curRes == ResolutionType::UHD_4K);
-                btn->setEnabled(!disabled);
-                if (auto spr = typeinfo_cast<ButtonSprite*>(btn->getNormalImage())) {
-                    if (disabled) {
-                        spr->setColor(ccc3(110, 110, 110));
-                        spr->setOpacity(130);
-                        spr->updateBGImage("GJ_button_04.png");
-                    } else {
-                        spr->setColor(ccc3(255, 255, 255));
-                        spr->setOpacity(255);
-                        spr->updateBGImage(active ? "GJ_button_01.png" : "GJ_button_04.png");
-                    }
-                }
-            }
-        }
-    }
+    int disabledFpsTag = (isH264 && curRes == ResolutionType::UHD_4K) ? 240 : -1;
+    updateMenuHighlight(m_fpsMenu, curFps, true, disabledFpsTag);
 
     if (m_codecConflictLabel) {
         bool conflictPossible = isH264 && (curRes == ResolutionType::UHD_4K || curFps >= 240);
@@ -1160,30 +1122,11 @@ void ReplayPopup::refreshUI() {
     // Rate Control highlight
     RateControlMode curRc = cfg.rateControl.load();
     bool isVBR = (curRc == RateControlMode::ADAPTIVE_VBR);
-    if (m_rateControlMenu) {
-        int curRcTag = static_cast<int>(curRc);
-        for (auto child : CCArrayExt<CCNode*>(m_rateControlMenu->getChildren())) {
-            if (auto btn = typeinfo_cast<CCMenuItemSpriteExtra*>(child)) {
-                bool active = (btn->getTag() == curRcTag);
-                if (auto spr = typeinfo_cast<ButtonSprite*>(btn->getNormalImage())) {
-                    spr->updateBGImage(active ? "GJ_button_01.png" : "GJ_button_04.png");
-                }
-            }
-        }
-    }
+    updateMenuHighlight(m_rateControlMenu, static_cast<int>(curRc));
 
     // Target Bitrate highlight
     int curBitrate = cfg.bitrateMbps.load();
-    if (m_bitrateMenu) {
-        for (auto child : CCArrayExt<CCNode*>(m_bitrateMenu->getChildren())) {
-            if (auto btn = typeinfo_cast<CCMenuItemSpriteExtra*>(child)) {
-                bool active = (btn->getTag() == curBitrate);
-                if (auto spr = typeinfo_cast<ButtonSprite*>(btn->getNormalImage())) {
-                    spr->updateBGImage(active ? "GJ_button_01.png" : "GJ_button_04.png");
-                }
-            }
-        }
-    }
+    updateMenuHighlight(m_bitrateMenu, curBitrate);
 
     // Never clobber m_customBitrateInput while the user is actively typing in it!
     if (m_customBitrateInput && !isInputFocused(m_customBitrateInput)) {
@@ -1196,39 +1139,16 @@ void ReplayPopup::refreshUI() {
     }
 
     // Peak Bitrate highlight
-    int curMaxBitrate = cfg.maxBitrateMbps.load();
-    if (m_maxBitrateMenu) {
-        for (auto child : CCArrayExt<CCNode*>(m_maxBitrateMenu->getChildren())) {
-            if (auto btn = typeinfo_cast<CCMenuItemSpriteExtra*>(child)) {
-                bool active = (btn->getTag() == curMaxBitrate);
-                if (auto spr = typeinfo_cast<ButtonSprite*>(btn->getNormalImage())) {
-                    spr->updateBGImage(active ? "GJ_button_01.png" : "GJ_button_04.png");
-                }
-            }
-        }
-    }
+    updateMenuHighlight(m_maxBitrateMenu, cfg.maxBitrateMbps.load());
 
     // Volume sliders and percentage update
-    float sysVol = cfg.systemVolume.load();
-    if (m_gameVolSlider) {
-        m_gameVolSlider->setValue(std::clamp(sysVol / 1.5f, 0.0f, 1.0f));
-    }
-    if (m_gameVolLabel) {
-        int gPercent = static_cast<int>(sysVol * 100.0f + 0.5f);
-        m_gameVolLabel->setString((std::to_string(gPercent) + "%").c_str());
-    }
+    syncVolumeControls(m_gameVolSlider, m_gameVolLabel, cfg.systemVolume.load());
+    syncVolumeControls(m_micVolSlider, m_micVolLabel, cfg.micVolume.load());
 
-    float mVol = cfg.micVolume.load();
-    if (m_micVolSlider) {
-        m_micVolSlider->setValue(std::clamp(mVol / 1.5f, 0.0f, 1.0f));
+    if (syncTogglers) {
+        if (m_splitAudioToggle) m_splitAudioToggle->toggle(cfg.splitAudioTracks.load());
+        if (m_micToggle) m_micToggle->toggle(cfg.recordMic.load());
     }
-    if (m_micVolLabel) {
-        int mPercent = static_cast<int>(mVol * 100.0f + 0.5f);
-        m_micVolLabel->setString((std::to_string(mPercent) + "%").c_str());
-    }
-
-    if (m_splitAudioToggle) m_splitAudioToggle->toggle(cfg.splitAudioTracks.load());
-    if (m_micToggle) m_micToggle->toggle(cfg.recordMic.load());
     refreshMicDeviceButton();
 }
 
@@ -1255,9 +1175,6 @@ void ReplayPopup::refreshMicDeviceButton() {
         m_currentMicIndex = 0;
     }
     std::string name = m_availableMics[m_currentMicIndex].name;
-    if (name.length() > 24) {
-        name = name.substr(0, 21) + "...";
-    }
     auto spr = ButtonSprite::create(name.c_str(), "goldFont.fnt", "GJ_button_01.png", 0.75f);
     m_micDeviceBtn->setNormalImage(spr);
     m_micDeviceBtn->setContentSize(spr->getContentSize());

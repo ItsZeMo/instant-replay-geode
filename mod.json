@@ -229,21 +229,24 @@
             "description": "Save the last minutes of gameplay to an MP4 video file (F6 default)",
             "type": "keybind",
             "category": "universal",
-            "default": "F6"
+            "default": "F6",
+            "allow-in-text-inputs": true
         },
         "toggle-replay": {
             "name": "Toggle Instant Replay",
             "description": "Turn background replay on or off (Ctrl+F6 default)",
             "type": "keybind",
             "category": "universal",
-            "default": "Ctrl+F6"
+            "default": "Ctrl+F6",
+            "allow-in-text-inputs": true
         },
         "open-menu": {
             "name": "Open Instant Replay Menu",
             "description": "Open Instant Replay management and settings popup (F9 default)",
             "type": "keybind",
             "category": "universal",
-            "default": "F9"
+            "default": "F9",
+            "allow-in-text-inputs": true
         }
     }
 }

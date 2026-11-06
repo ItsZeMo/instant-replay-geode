@@ -4,18 +4,24 @@
 
 #ifdef GEODE_IS_WINDOWS
 
+#include "../config/ReplayConfig.hpp"
+#include <mfapi.h>
+#include <mfidl.h>
 #include <vector>
 #include <chrono>
 #include <memory>
 #include <mutex>
+#include <atomic>
 #include <functional>
 
 namespace replay {
 
 // Frames are delivered BOTTOM-UP (native OpenGL row order), tightly packed BGRA,
 // already scaled to the encoder output size (width/height are always even).
+// Pixels are stored directly in a reusable IMFMediaBuffer to avoid a second copy in the encoder.
 struct CapturedFrame {
-    std::vector<uint8_t> data;
+    ComRef<IMFMediaBuffer> buffer;
+    size_t byteSize = 0;
     int width = 0;
     int height = 0;
     int stride = 0;
@@ -28,6 +34,9 @@ public:
 
     void initialize();
     void cleanup(bool glContextValid = true);
+
+    // Enables/disables capture and discards any stale pending PBO readback (#6)
+    void setCapturing(bool active);
 
     // Called on the OpenGL render thread right BEFORE the back buffer is swapped
     void captureCurrentFrame();
@@ -46,6 +55,7 @@ private:
     void ensurePbo(int index, size_t bytes);
     std::shared_ptr<CapturedFrame> acquireFrame(size_t requiredBytes);
 
+    std::atomic<bool> m_capturing{false};
     bool m_initialized = false;
     bool m_hasPbo = false;
     bool m_hasBlit = false;
@@ -65,7 +75,7 @@ private:
     std::chrono::steady_clock::time_point m_pboTime[2];
     int m_pboIndex = 0;
 
-    // Reusable frame buffer pool (eliminates per-frame 8-33 MB allocation + zero-fill)
+    // Reusable IMFMediaBuffer frame pool (eliminates per-frame 8-33 MB allocation & double copy)
     std::mutex m_poolMutex;
     std::vector<std::shared_ptr<CapturedFrame>> m_framePool;
     std::vector<uint8_t> m_syncScratch;

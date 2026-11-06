@@ -2,7 +2,6 @@
 
 #ifdef GEODE_IS_WINDOWS
 
-#include <Geode/modify/AppDelegate.hpp>
 #include <Geode/modify/CCEGLView.hpp>
 #include <Geode/modify/FMODAudioEngine.hpp>
 #include <Geode/modify/MenuLayer.hpp>
@@ -80,7 +79,9 @@ $on_mod(Loaded) {
         }
     });
 
-    // 3. Handle replay parameter changes via Geode Mod Settings (only allowed when recording is OFF)
+    // 3. Handle replay parameter changes via Geode Mod Settings.
+    //    Geode fires setting listeners one-by-one in mod.json order ("enabled" is first),
+    //    so we coalesce a synchronous Apply batch onto the next main-thread tick.
     listenForAllSettingChanges([](std::string_view key, std::shared_ptr<SettingV3>) {
         if (ReplayConfig::s_isSavingSettings.load()) {
             return;
@@ -94,35 +95,74 @@ $on_mod(Loaded) {
             }
             return;
         }
+
+        static bool s_batchPending = false;
+        static bool s_wasActiveBeforeBatch = false;
+        static bool s_enabledChanged = false;
+        static bool s_recordingParamChanged = false;
+
+        if (!s_batchPending) {
+            s_batchPending = true;
+            s_wasActiveBeforeBatch = ReplayManager::get()->isReplayActive();
+            s_enabledChanged = false;
+            s_recordingParamChanged = false;
+
+            geode::Loader::get()->queueInMainThread([]() {
+                bool wasActive = s_wasActiveBeforeBatch;
+                bool enabledChanged = s_enabledChanged;
+                bool paramChanged = s_recordingParamChanged;
+                s_batchPending = false;
+                s_enabledChanged = false;
+                s_recordingParamChanged = false;
+
+                auto mod = geode::Mod::get();
+                if (!mod) return;
+
+                bool targetEnabled = enabledChanged
+                    ? mod->getSettingValue<bool>("enabled")
+                    : ReplayConfig::get().enabled.load();
+
+                if (wasActive && targetEnabled && paramChanged) {
+                    geode::Notification::create(
+                        "Recording settings can only be changed when recording is OFF!",
+                        geode::NotificationIcon::Warning,
+                        1.5f
+                    )->show();
+                    ReplayConfig::get().saveToSettings();
+                    return;
+                }
+
+                if (wasActive && !targetEnabled) {
+                    ReplayManager::get()->setReplayEnabled(false);
+                }
+
+                if (paramChanged) {
+                    ReplayConfig::get().loadFromSettings();
+                }
+
+                if (enabledChanged && targetEnabled != ReplayManager::get()->isReplayActive()) {
+                    ReplayManager::get()->setReplayEnabled(targetEnabled);
+                }
+
+                if (auto* popup = ReplayPopup::get()) {
+                    popup->refreshUI();
+                    popup->updateStatusDisplay(0.0f);
+                }
+            });
+        }
+
         if (key == "enabled") {
-            if (auto mod = geode::Mod::get()) {
-                bool newEnabled = mod->getSettingValue<bool>("enabled");
-                ReplayManager::get()->setReplayEnabled(newEnabled);
-            }
-            return;
+            s_enabledChanged = true;
+        } else {
+            s_recordingParamChanged = true;
         }
-
-        if (ReplayManager::get()->isReplayActive()) {
-            geode::Notification::create(
-                "Recording settings can only be changed when recording is OFF!",
-                geode::NotificationIcon::Warning,
-                1.5f
-            )->show();
-            ReplayConfig::get().saveToSettings();
-            return;
-        }
-
-        ReplayConfig::get().loadFromSettings();
     });
 }
 
 // Perform clean shutdown on game exit while OpenGL context and FMOD are still alive
-class $modify(ReplayAppDelegate, AppDelegate) {
-    void trySaveGame(bool p0) {
-        ReplayManager::get()->shutdown();
-        AppDelegate::trySaveGame(p0);
-    }
-};
+$on_game(Exiting) {
+    ReplayManager::get()->shutdown();
+}
 
 // Capture the finished frame right BEFORE it is presented, after all overlay/ImGui mods (like Mega Hack) have finished drawing
 class $modify(ReplayEGLView, CCEGLView) {
