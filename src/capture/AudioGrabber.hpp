@@ -44,11 +44,17 @@ struct StereoResampler {
         lastOutRate = 0;
     }
 
-    // Resamples `inFrames` of interleaved stereo float PCM (`inStereo`) from `inRate` to `outRate` into `outStereo`.
-    void process(const float* inStereo, size_t inFrames, int inRate, int outRate, std::vector<float>& outStereo) {
-        outStereo.clear();
-        if (!inStereo || inFrames == 0 || outRate <= 0) return;
+    // Appends resampled stereo float PCM from `inSamples` (`inFrames` frames with `inChannels` channels at `inRate`)
+    // converted to `outRate` into `outStereo`. Caller should clear `outStereo` beforehand if replacing rather than appending.
+    void process(const float* inSamples, size_t inFrames, int inChannels, int inRate, int outRate, std::vector<float>& outStereo) {
+        if (!inSamples || inFrames == 0 || inChannels <= 0 || outRate <= 0) return;
         if (inRate <= 0) inRate = outRate;
+
+        auto readStereo = [&](size_t frameIdx, float& outL, float& outR) {
+            size_t base = frameIdx * static_cast<size_t>(inChannels);
+            outL = inSamples[base];
+            outR = (inChannels >= 2) ? inSamples[base + 1] : outL;
+        };
 
         if (lastInRate != inRate || lastOutRate != outRate) {
             reset();
@@ -57,22 +63,31 @@ struct StereoResampler {
         }
 
         if (inRate == outRate) {
-            outStereo.assign(inStereo, inStereo + inFrames * 2);
+            outStereo.reserve(outStereo.size() + inFrames * 2);
+            if (inChannels == 2) {
+                outStereo.insert(outStereo.end(), inSamples, inSamples + inFrames * 2);
+            } else {
+                for (size_t i = 0; i < inFrames; ++i) {
+                    float l = 0.0f, r = 0.0f;
+                    readStereo(i, l, r);
+                    outStereo.push_back(l);
+                    outStereo.push_back(r);
+                }
+            }
             return;
         }
 
         double step = static_cast<double>(inRate) / static_cast<double>(outRate);
         size_t estOutFrames = static_cast<size_t>(static_cast<double>(inFrames) / step) + 2;
-        outStereo.reserve(estOutFrames * 2);
+        outStereo.reserve(outStereo.size() + estOutFrames * 2);
 
         if (!hasPrev) {
-            prev[0] = inStereo[0];
-            prev[1] = inStereo[1];
+            readStereo(0, prev[0], prev[1]);
             hasPrev = true;
             pos = 0.0;
         }
 
-        // Position -1.0 corresponds to `prev`; positions [0, inFrames - 1] are in `inStereo`.
+        // Position -1.0 corresponds to `prev`; positions [0, inFrames - 1] are in `inSamples`.
         double limit = static_cast<double>(inFrames) - 1.0;
         while (pos < limit) {
             float l0 = 0.0f, r0 = 0.0f, l1 = 0.0f, r1 = 0.0f;
@@ -81,25 +96,25 @@ struct StereoResampler {
                 frac = static_cast<float>(pos + 1.0);
                 l0 = prev[0];
                 r0 = prev[1];
-                l1 = inStereo[0];
-                r1 = inStereo[1];
+                readStereo(0, l1, r1);
             } else {
                 size_t idx0 = static_cast<size_t>(pos);
                 size_t idx1 = std::min<size_t>(idx0 + 1, inFrames - 1);
                 frac = static_cast<float>(pos - static_cast<double>(idx0));
-                l0 = inStereo[idx0 * 2];
-                r0 = inStereo[idx0 * 2 + 1];
-                l1 = inStereo[idx1 * 2];
-                r1 = inStereo[idx1 * 2 + 1];
+                readStereo(idx0, l0, r0);
+                readStereo(idx1, l1, r1);
             }
             outStereo.push_back(l0 + frac * (l1 - l0));
             outStereo.push_back(r0 + frac * (r1 - r0));
             pos += step;
         }
 
-        prev[0] = inStereo[(inFrames - 1) * 2];
-        prev[1] = inStereo[(inFrames - 1) * 2 + 1];
+        readStereo(inFrames - 1, prev[0], prev[1]);
         pos -= static_cast<double>(inFrames);
+    }
+
+    void process(const float* inStereo, size_t inFrames, int inRate, int outRate, std::vector<float>& outStereo) {
+        process(inStereo, inFrames, 2, inRate, outRate, outStereo);
     }
 };
 

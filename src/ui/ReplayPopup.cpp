@@ -960,7 +960,7 @@ void ReplayPopup::onResetFolder() {
     updateStatusDisplay(0.0f);
 }
 
-void ReplayPopup::handleVolumeSlider(Slider* slider, CCLabelBMFont* label, std::atomic<float>& targetVol) {
+void ReplayPopup::handleVolumeSlider(Slider* slider, CCLabelBMFont* label, AtomicVal<float>& targetVol) {
     if (!slider) return;
     if (guardLocked()) {
         slider->setValue(std::clamp(targetVol.load() / kMaxVolume, 0.0f, 1.0f));

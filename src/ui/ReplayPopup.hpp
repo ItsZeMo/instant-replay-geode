@@ -43,7 +43,7 @@ private:
     void onResetFolder();
     void cycleMicDevice(int direction);
     void refreshMicDeviceButton();
-    void handleVolumeSlider(Slider* slider, cocos2d::CCLabelBMFont* label, std::atomic<float>& targetVol);
+    void handleVolumeSlider(Slider* slider, cocos2d::CCLabelBMFont* label, AtomicVal<float>& targetVol);
     void onGameVolumeChanged(cocos2d::CCObject* sender);
     void onMicVolumeChanged(cocos2d::CCObject* sender);
 
