@@ -25,18 +25,27 @@ std::string hrToString(HRESULT hr) {
     return buf;
 }
 
-const char* subtypeName(const GUID& subtype) {
+const char* subtypeName(const GUID& subtype) noexcept {
     if (subtype == MFVideoFormat_AV1) return "AV1";
     if (subtype == MFVideoFormat_HEVC) return "HEVC";
     if (subtype == MFVideoFormat_VP90) return "VP9";
     return "H.264";
 }
 
-// Session-wide cache of the working subtype for a given codec request so segment
-// rotation every 30s does not re-probe unsupported codecs (e.g. AV1 on non-AV1 GPUs).
-// Software fallback from a transient hardware failure is intentionally NOT cached (#8).
+bool isPermanentCodecUnsupported(HRESULT hr) noexcept {
+    return hr == MF_E_TOPO_CODEC_NOT_FOUND ||
+           hr == MF_E_INVALIDMEDIATYPE ||
+           hr == MF_E_UNSUPPORTED_RATE ||
+           hr == REGDB_E_CLASSNOTREG ||
+           hr == E_NOTIMPL;
+}
+
+// Session-wide codec cache: avoids re-probing missing hardware codecs every 30s,
+// while never pinning transient HW/session-limit failures to a lower codec or SW (#9, #10).
 std::mutex s_codecCacheMutex;
 std::string s_cachedRequestKey;
+std::string s_confirmedPrimaryKey;
+std::string s_lastLoggedCodecKey;
 GUID s_cachedSubtype = MFVideoFormat_H264;
 bool s_cachedHardware = true;
 bool s_hasCachedCodec = false;
@@ -47,7 +56,6 @@ static std::once_flag s_mfInitOnce;
 
 void MediaFoundationEncoder::globalInitialize() {
     std::call_once(s_mfInitOnce, []() {
-        CoInitializeEx(NULL, COINIT_MULTITHREADED);
         MFStartup(MF_VERSION);
     });
 }
@@ -55,6 +63,8 @@ void MediaFoundationEncoder::globalInitialize() {
 void MediaFoundationEncoder::resetCodecCache() {
     std::lock_guard<std::mutex> cacheLock(s_codecCacheMutex);
     s_cachedRequestKey.clear();
+    s_confirmedPrimaryKey.clear();
+    s_lastLoggedCodecKey.clear();
     s_hasCachedCodec = false;
 }
 
@@ -79,15 +89,19 @@ bool MediaFoundationEncoder::start(
     CodecType codec,
     bool hardwareAcceleration,
     const std::string& customCodec,
-    int gameSampleRate
+    int gameSampleRate,
+    const std::function<void()>& onBeforeFallback
 ) {
     std::lock_guard<std::mutex> lock(m_mutex);
     finishLocked();
 
     fps = std::max(1, fps);
+    int aacGameSampleRate = (gameSampleRate == 44100) ? 44100 : 48000;
+
     m_width = width;
     m_height = height;
     m_fps = fps;
+    m_gameSampleRate = aacGameSampleRate;
     m_splitAudio = splitAudio;
     m_videoFrameDurationHns = 10000000LL / fps;
     m_formatKey.clear();
@@ -103,8 +117,8 @@ bool MediaFoundationEncoder::start(
             cname.find("software") != std::string::npos ||
             cname.find("sw") != std::string::npos) {
             enableHardware = false;
-            targetSubtype = MFVideoFormat_H264;
-        } else if (cname.find("av1") != std::string::npos) {
+        }
+        if (cname.find("av1") != std::string::npos) {
             targetSubtype = MFVideoFormat_AV1;
         } else if (cname.find("hevc") != std::string::npos ||
                    cname.find("h265") != std::string::npos ||
@@ -128,9 +142,6 @@ bool MediaFoundationEncoder::start(
              static_cast<int>(codec), enableHardware ? 1 : 0, cname.c_str(), width, height, fps);
     std::string requestKey = reqKeyBuf;
 
-    // Fallback cascade. A missing encoder MFT is usually only detected by
-    // SetInputMediaType / BeginWriting, so every candidate gets a full,
-    // independent initialisation attempt: AV1 -> HEVC -> H.264 -> H.264 (software).
     struct Attempt { GUID subtype; bool hardware; };
     std::vector<Attempt> attempts;
     auto addAttempt = [&attempts](const GUID& subtype, bool hw) {
@@ -140,12 +151,10 @@ bool MediaFoundationEncoder::start(
         attempts.push_back({subtype, hw});
     };
 
-    bool usedCache = false;
     {
         std::lock_guard<std::mutex> cacheLock(s_codecCacheMutex);
         if (s_hasCachedCodec && s_cachedRequestKey == requestKey && s_cachedHardware == enableHardware) {
             addAttempt(s_cachedSubtype, s_cachedHardware);
-            usedCache = true;
         }
     }
 
@@ -158,9 +167,6 @@ bool MediaFoundationEncoder::start(
         addAttempt(MFVideoFormat_H264, false);
     }
 
-    // Microsoft's AAC MFT only accepts 44100 or 48000 Hz (#18).
-    int aacGameSampleRate = (gameSampleRate == 44100) ? 44100 : 48000;
-
     StartParams params;
     params.width = width;
     params.height = height;
@@ -172,10 +178,38 @@ bool MediaFoundationEncoder::start(
     params.splitAudio = splitAudio;
     params.gameSampleRate = aacGameSampleRate;
 
+    auto cleanupFailedAttempt = [this, &outputPath]() {
+        if (m_sinkWriter) {
+            m_sinkWriter->Release();
+            m_sinkWriter = nullptr;
+        }
+        DeleteFileW(outputPath.c_str());
+    };
+
+    bool primaryFailedPermanently = false;
+    bool syncedBeforeFallback = false;
+
     for (size_t i = 0; i < attempts.size(); ++i) {
         const auto& attempt = attempts[i];
+        bool isPrimary = (attempt.subtype == targetSubtype && attempt.hardware == enableHardware);
+
+        HRESULT failHr = S_OK;
         std::string error;
-        if (tryStartLocked(outputPath, attempt.subtype, attempt.hardware, params, error)) {
+        bool started = tryStartLocked(outputPath, attempt.subtype, attempt.hardware, params, failHr, error);
+
+        // If the primary hardware codec fails transiently (e.g. concurrent NVENC session limit while
+        // the previous segment is still finalizing in the background), wait for background finalization
+        // to release the old encoder session and retry the primary codec before falling back (#9, #10).
+        if (!started && isPrimary && !isPermanentCodecUnsupported(failHr) && onBeforeFallback && !syncedBeforeFallback) {
+            syncedBeforeFallback = true;
+            cleanupFailedAttempt();
+            onBeforeFallback();
+            failHr = S_OK;
+            error.clear();
+            started = tryStartLocked(outputPath, attempt.subtype, attempt.hardware, params, failHr, error);
+        }
+
+        if (started) {
             std::string activeCodecName = std::string(subtypeName(attempt.subtype)) + (attempt.hardware ? " (HW)" : " (SW)");
             char key[180];
             snprintf(key, sizeof(key), "%s|%s|%dx%d|%d|a%d|s%d",
@@ -184,33 +218,44 @@ bool MediaFoundationEncoder::start(
             m_formatKey = key;
             m_recording = true;
 
-            // Only cache when hardware mode matches requested mode so a transient HW failure
-            // (e.g. NVENC session limit during segment rotation) never pins the session to SW (#8).
-            if (attempt.hardware == enableHardware) {
+            {
                 std::lock_guard<std::mutex> cacheLock(s_codecCacheMutex);
-                s_cachedRequestKey = requestKey;
-                s_cachedSubtype = attempt.subtype;
-                s_cachedHardware = attempt.hardware;
-                s_hasCachedCodec = true;
-            }
+                if (isPrimary) {
+                    s_cachedRequestKey = requestKey;
+                    s_confirmedPrimaryKey = requestKey;
+                    s_cachedSubtype = attempt.subtype;
+                    s_cachedHardware = attempt.hardware;
+                    s_hasCachedCodec = true;
+                } else if (attempt.hardware == enableHardware &&
+                           primaryFailedPermanently &&
+                           s_confirmedPrimaryKey != requestKey) {
+                    // Only cache a fallback codec (e.g. AV1 -> HEVC) when the primary codec is
+                    // genuinely unsupported on this GPU and has never succeeded in this session (#9).
+                    s_cachedRequestKey = requestKey;
+                    s_cachedSubtype = attempt.subtype;
+                    s_cachedHardware = attempt.hardware;
+                    s_hasCachedCodec = true;
+                }
 
-            if (!usedCache) {
-                if (attempt.subtype != targetSubtype || attempt.hardware != enableHardware) {
-                    geode::log::warn("Instant Replay: requested codec unavailable, fell back to {}", activeCodecName);
-                } else {
-                    geode::log::info("Instant Replay: encoder started with {}", activeCodecName);
+                std::string logKey = requestKey + "->" + activeCodecName;
+                if (s_lastLoggedCodecKey != logKey) {
+                    s_lastLoggedCodecKey = logKey;
+                    if (!isPrimary) {
+                        geode::log::warn("Instant Replay: requested codec unavailable, fell back to {}", activeCodecName);
+                    } else {
+                        geode::log::info("Instant Replay: encoder started with {}", activeCodecName);
+                    }
                 }
             }
             return true;
         }
 
+        if (isPrimary && isPermanentCodecUnsupported(failHr)) {
+            primaryFailedPermanently = true;
+        }
         geode::log::warn("Instant Replay: {} encoder ({}) failed: {}",
                          subtypeName(attempt.subtype), attempt.hardware ? "HW" : "SW", error);
-        if (m_sinkWriter) {
-            m_sinkWriter->Release();
-            m_sinkWriter = nullptr;
-        }
-        DeleteFileW(outputPath.c_str()); // remove the partially created file before retrying
+        cleanupFailedAttempt();
     }
 
     geode::log::error("Instant Replay: no usable video encoder found");
@@ -224,27 +269,36 @@ bool MediaFoundationEncoder::tryStartLocked(
     const GUID& subtype,
     const bool hardware,
     const StartParams& p,
+    HRESULT& outHr,
     std::string& error
 ) {
+    auto recordFail = [&outHr, &error](HRESULT hr, std::string msg) -> bool {
+        outHr = hr;
+        error = std::move(msg);
+        return false;
+    };
+
     ComRef<IMFAttributes> attr;
     HRESULT hr = MFCreateAttributes(attr.put(), 3);
-    if (FAILED(hr)) { error = "MFCreateAttributes: " + hrToString(hr); return false; }
+    if (FAILED(hr)) return recordFail(hr, "MFCreateAttributes: " + hrToString(hr));
     attr->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, hardware ? TRUE : FALSE);
-    // Note: MF_SINK_WRITER_DISABLE_THROTTLING is intentionally NOT set here so IMFSinkWriter
-    // throttles the worker thread instead of growing an unbounded internal queue when overloaded (#14).
+    // Disable Sink Writer internal sleep throttling so WriteSample can NEVER deadlock on shutdown
+    // or when an audio stream temporarily lacks packets; ReplayManager bounds in-flight video frames
+    // and synthesizes silence on idle audio streams (#1).
+    attr->SetUINT32(MF_SINK_WRITER_DISABLE_THROTTLING, TRUE);
     attr->SetUINT32(MF_LOW_LATENCY, TRUE);
 
     hr = MFCreateSinkWriterFromURL(outputPath.c_str(), NULL, attr.get(), &m_sinkWriter);
-    if (FAILED(hr) || !m_sinkWriter) { error = "MFCreateSinkWriterFromURL: " + hrToString(hr); return false; }
+    if (FAILED(hr) || !m_sinkWriter) return recordFail(hr, "MFCreateSinkWriterFromURL: " + hrToString(hr));
 
-    // Bound GOP size to at most 60 frames so keyframes stay frequent even if the game renders slower than p.fps (#17)
-    const UINT32 gopFrames = static_cast<UINT32>(std::clamp(p.fps, 15, 60));
+    // 1-second GOP at the target frame rate (up to 240 FPS) instead of clamping 120/240 FPS to 60 (#8)
+    const UINT32 gopFrames = static_cast<UINT32>(std::clamp(p.fps, 30, 240));
 
     // 1. Video output stream
     {
         ComRef<IMFMediaType> videoOut;
         hr = MFCreateMediaType(videoOut.put());
-        if (FAILED(hr)) { error = "MFCreateMediaType: " + hrToString(hr); return false; }
+        if (FAILED(hr)) return recordFail(hr, "MFCreateMediaType: " + hrToString(hr));
         videoOut->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
         videoOut->SetGUID(MF_MT_SUBTYPE, subtype);
         videoOut->SetUINT32(MF_MT_AVG_BITRATE, static_cast<UINT32>(p.bitrateMbps) * 1000000u);
@@ -254,14 +308,14 @@ bool MediaFoundationEncoder::tryStartLocked(
         MFSetAttributeRatio(videoOut.get(), MF_MT_FRAME_RATE, p.fps, 1);
         MFSetAttributeRatio(videoOut.get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
         hr = m_sinkWriter->AddStream(videoOut.get(), &m_videoStreamIndex);
-        if (FAILED(hr)) { error = "AddStream(video): " + hrToString(hr); return false; }
+        if (FAILED(hr)) return recordFail(hr, "AddStream(video): " + hrToString(hr));
     }
 
     // 2. Video input format (RGB32 / BGRA uncompressed) - this is where a missing encoder is detected
     {
         ComRef<IMFMediaType> videoIn;
         hr = MFCreateMediaType(videoIn.put());
-        if (FAILED(hr)) { error = "MFCreateMediaType: " + hrToString(hr); return false; }
+        if (FAILED(hr)) return recordFail(hr, "MFCreateMediaType: " + hrToString(hr));
         videoIn->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
         videoIn->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
         videoIn->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
@@ -274,7 +328,7 @@ bool MediaFoundationEncoder::tryStartLocked(
         videoIn->SetUINT32(MF_MT_FIXED_SIZE_SAMPLES, TRUE);
         videoIn->SetUINT32(MF_MT_SAMPLE_SIZE, static_cast<UINT32>(p.width) * p.height * 4);
         hr = m_sinkWriter->SetInputMediaType(m_videoStreamIndex, videoIn.get(), NULL);
-        if (FAILED(hr)) { error = "SetInputMediaType(video): " + hrToString(hr); return false; }
+        if (FAILED(hr)) return recordFail(hr, "SetInputMediaType(video): " + hrToString(hr));
     }
 
     // 3. Rate control + keyframe interval via ICodecAPI (best effort: not every MFT supports every property)
@@ -308,11 +362,11 @@ bool MediaFoundationEncoder::tryStartLocked(
         }
     }
 
-    auto addAudioStream = [this, &error](int sampleRate, UINT32 avgBytesPerSec, DWORD* streamIndex, const char* label) -> bool {
+    auto addAudioStream = [this, &recordFail](int sampleRate, UINT32 avgBytesPerSec, DWORD* streamIndex, const char* label) -> bool {
         int validRate = (sampleRate == 44100) ? 44100 : 48000;
         ComRef<IMFMediaType> audioOut;
         HRESULT h = MFCreateMediaType(audioOut.put());
-        if (FAILED(h)) { error = "MFCreateMediaType: " + hrToString(h); return false; }
+        if (FAILED(h)) return recordFail(h, "MFCreateMediaType: " + hrToString(h));
         audioOut->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
         audioOut->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_AAC);
         audioOut->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
@@ -320,11 +374,11 @@ bool MediaFoundationEncoder::tryStartLocked(
         audioOut->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, 2);
         audioOut->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, avgBytesPerSec);
         h = m_sinkWriter->AddStream(audioOut.get(), streamIndex);
-        if (FAILED(h)) { error = std::string("AddStream(") + label + "): " + hrToString(h); return false; }
+        if (FAILED(h)) return recordFail(h, std::string("AddStream(") + label + "): " + hrToString(h));
 
         ComRef<IMFMediaType> audioIn;
         h = MFCreateMediaType(audioIn.put());
-        if (FAILED(h)) { error = "MFCreateMediaType: " + hrToString(h); return false; }
+        if (FAILED(h)) return recordFail(h, "MFCreateMediaType: " + hrToString(h));
         audioIn->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
         audioIn->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM);
         audioIn->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
@@ -333,7 +387,7 @@ bool MediaFoundationEncoder::tryStartLocked(
         audioIn->SetUINT32(MF_MT_AUDIO_BLOCK_ALIGNMENT, 4);
         audioIn->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, validRate * 4);
         h = m_sinkWriter->SetInputMediaType(*streamIndex, audioIn.get(), NULL);
-        if (FAILED(h)) { error = std::string("SetInputMediaType(") + label + "): " + hrToString(h); return false; }
+        if (FAILED(h)) return recordFail(h, std::string("SetInputMediaType(") + label + "): " + hrToString(h));
         return true;
     };
 
@@ -350,7 +404,8 @@ bool MediaFoundationEncoder::tryStartLocked(
     }
 
     hr = m_sinkWriter->BeginWriting();
-    if (FAILED(hr)) { error = "BeginWriting: " + hrToString(hr); return false; }
+    if (FAILED(hr)) return recordFail(hr, "BeginWriting: " + hrToString(hr));
+    outHr = S_OK;
     return true;
 }
 
@@ -381,7 +436,7 @@ bool MediaFoundationEncoder::createAudioSample(
 ) {
     if (numSamples <= 0 || channels <= 0) return false;
 
-    DWORD bufferSize = numSamples * channels * sizeof(int16_t);
+    DWORD bufferSize = static_cast<DWORD>(numSamples) * channels * sizeof(int16_t);
     ComRef<IMFMediaBuffer> buffer;
     HRESULT hr = MFCreateMemoryBuffer(bufferSize, buffer.put());
     if (FAILED(hr) || !buffer) return false;
@@ -402,7 +457,7 @@ bool MediaFoundationEncoder::createAudioSample(
         if (SUCCEEDED(hr) && *ppSample) {
             (*ppSample)->AddBuffer(buffer.get());
             (*ppSample)->SetSampleTime(timestampHns);
-            int rate = (sampleRate > 0) ? sampleRate : 44100;
+            int rate = (sampleRate > 0) ? sampleRate : 48000;
             int64_t durationHns = (static_cast<int64_t>(numSamples) * 10000000LL) / rate;
             (*ppSample)->SetSampleDuration(durationHns);
             return true;
@@ -455,7 +510,6 @@ bool MediaFoundationEncoder::writeMicAudio(
     int64_t timestampHns
 ) {
     std::lock_guard<std::mutex> lock(m_mutex);
-    // Without split tracks the microphone is mixed into the game track by ReplayManager
     if (!m_recording || !m_sinkWriter || !m_splitAudio) return false;
 
     ComRef<IMFSample> sample;
@@ -553,20 +607,28 @@ ConcatResult concatenateImpl(
         if (FAILED(hr)) return fail("BeginWriting: " + hrToString(hr));
     }
 
-    // 2. Find the cut point inside the first segment: always cut on a video keyframe
-    //    so the output begins with a decodable IDR/keyframe (#17).
+    // 2. Scan first segment's video stream for keyframe cut point AND initial B-frame DTS lead (#21).
     LONGLONG cutHns = 0;
+    LONGLONG firstVideoDts = 0;
+    bool hasFirstVideoDts = false;
     const LONGLONG trimHns = static_cast<LONGLONG>(std::max(0.0, trimStartSeconds) * 1e7);
     auto videoIt = std::find_if(streams.begin(), streams.end(), [](const StreamInfo& s) { return s.isVideo; });
-    if (trimHns > 0 && videoIt != streams.end()) {
+
+    if (videoIt != streams.end()) {
         ComRef<IMFSourceReader> scan;
         hr = MFCreateSourceReaderFromURL(segmentPaths[0].c_str(), readerAttr.get(), scan.put());
         if (FAILED(hr) || !scan) return fail("cannot open first segment: " + hrToString(hr));
         scan->SetStreamSelection(static_cast<DWORD>(MF_SOURCE_READER_ALL_STREAMS), FALSE);
         scan->SetStreamSelection(videoIt->readerIndex, TRUE);
-        LONGLONG lastKeyBefore = -1;
-        LONGLONG firstKeyAfter = -1;
+
+        struct KeyCandidate {
+            LONGLONG pts = -1;
+            LONGLONG dts = 0;
+            bool hasDts = false;
+        };
+        KeyCandidate initialSample, lastKeyBefore, firstKeyAfter;
         int emptyScans = 0;
+
         while (true) {
             DWORD flags = 0;
             LONGLONG ts = 0;
@@ -574,13 +636,22 @@ ConcatResult concatenateImpl(
             hr = scan->ReadSample(videoIt->readerIndex, 0, nullptr, &flags, &ts, sample.put());
             if (FAILED(hr) || (flags & MF_SOURCE_READERF_ERROR)) return fail("cannot scan first segment: " + hrToString(hr));
             if (sample) {
+                UINT64 rawDts = 0;
+                bool sampleHasDts = SUCCEEDED(sample->GetUINT64(MFSampleExtension_DecodeTimestamp, &rawDts));
+                LONGLONG sampleDts = static_cast<LONGLONG>(rawDts);
+
+                if (initialSample.pts < 0) {
+                    initialSample = {ts, sampleDts, sampleHasDts};
+                    if (trimHns <= 0) break;
+                }
+
                 UINT32 clean = 0;
                 bool isKey = SUCCEEDED(sample->GetUINT32(MFSampleExtension_CleanPoint, &clean)) && clean != 0;
                 if (ts <= trimHns) {
-                    if (isKey) lastKeyBefore = ts;
+                    if (isKey) lastKeyBefore = {ts, sampleDts, sampleHasDts};
                 } else {
-                    if (isKey && firstKeyAfter < 0) {
-                        firstKeyAfter = ts;
+                    if (isKey && firstKeyAfter.pts < 0) {
+                        firstKeyAfter = {ts, sampleDts, sampleHasDts};
                         break;
                     }
                     if (ts - trimHns > 50000000LL) break; // scan up to 5s past trimHns
@@ -592,25 +663,40 @@ ConcatResult concatenateImpl(
             if (flags & MF_SOURCE_READERF_ENDOFSTREAM) break;
         }
 
-        constexpr LONGLONG kMaxKeyframeDriftHns = 20000000LL; // 2s
-        if (lastKeyBefore >= 0 && (trimHns - lastKeyBefore) <= kMaxKeyframeDriftHns) {
-            cutHns = lastKeyBefore;
-        } else if (firstKeyAfter >= 0 && (firstKeyAfter - trimHns) <= kMaxKeyframeDriftHns) {
-            cutHns = firstKeyAfter;
-        } else if (lastKeyBefore >= 0) {
-            cutHns = lastKeyBefore;
-        } else if (firstKeyAfter >= 0) {
-            cutHns = firstKeyAfter;
+        if (trimHns <= 0) {
+            cutHns = 0;
+            hasFirstVideoDts = initialSample.hasDts;
+            firstVideoDts = initialSample.dts;
         } else {
-            cutHns = trimHns;
+            constexpr LONGLONG kMaxKeyframeDriftHns = 20000000LL; // 2s
+            KeyCandidate chosen = {0, initialSample.dts, initialSample.hasDts};
+            if (lastKeyBefore.pts >= 0 && (trimHns - lastKeyBefore.pts) <= kMaxKeyframeDriftHns) {
+                chosen = lastKeyBefore;
+            } else if (firstKeyAfter.pts >= 0 && (firstKeyAfter.pts - trimHns) <= kMaxKeyframeDriftHns) {
+                chosen = firstKeyAfter;
+            } else if (lastKeyBefore.pts >= 0) {
+                chosen = lastKeyBefore;
+            } else if (firstKeyAfter.pts >= 0) {
+                chosen = firstKeyAfter;
+            }
+            cutHns = chosen.pts;
+            hasFirstVideoDts = chosen.hasDts;
+            firstVideoDts = chosen.dts;
         }
     } else if (trimHns > 0) {
         cutHns = trimHns;
     }
 
+    // Shift all streams equally by any initial B-frame decode lead (cutHns - firstVideoDts)
+    // so rebased DTS starts at >= 0 without clamping multiple initial packets to DTS == 0 (#21).
+    const LONGLONG initialPtsShift = (hasFirstVideoDts && firstVideoDts < cutHns)
+        ? (cutHns - firstVideoDts)
+        : 0;
+
     // 3. Remux every segment, rebasing timestamps so they continue seamlessly
     std::map<DWORD, LONGLONG> lastAudioTimes;
-    LONGLONG outputBase = 0;
+    LONGLONG lastVideoDts = -1;
+    LONGLONG outputBase = initialPtsShift;
     size_t samplesWritten = 0;
 
     for (size_t segIdx = 0; segIdx < segmentPaths.size(); ++segIdx) {
@@ -629,7 +715,6 @@ ConcatResult concatenateImpl(
             ComRef<IMFMediaType> native;
             hr = reader->GetNativeMediaType(st.readerIndex, 0, native.put());
             if (FAILED(hr) || !native) return fail(segLabel + " is missing a stream: " + hrToString(hr));
-            reader->SetCurrentMediaType(st.readerIndex, NULL, native.get());
             hr = reader->SetStreamSelection(st.readerIndex, TRUE);
             if (FAILED(hr)) return fail("cannot select stream in " + segLabel + ": " + hrToString(hr));
             streamMap[st.readerIndex] = {st.writerIndex, st.isVideo};
@@ -637,7 +722,9 @@ ConcatResult concatenateImpl(
         }
 
         const LONGLONG segCut = (segIdx == 0) ? cutHns : 0;
-        LONGLONG segEnd = 0;
+        bool seenFirstVideoKey = (segCut <= 0);
+        LONGLONG videoSegEnd = 0;
+        LONGLONG audioSegEnd = 0;
         int emptyReads = 0;
 
         while (!remaining.empty()) {
@@ -663,11 +750,19 @@ ConcatResult concatenateImpl(
             if (mapIt == streamMap.end()) continue;
             if (timestamp < segCut) continue; // trimmed away (before the replay start)
 
+            if (mapIt->second.isVideo && !seenFirstVideoKey) {
+                UINT32 clean = 0;
+                if (FAILED(sample->GetUINT32(MFSampleExtension_CleanPoint, &clean)) || clean == 0) {
+                    continue;
+                }
+                seenFirstVideoKey = true;
+            }
+
             LONGLONG sampleDuration = 0;
             sample->GetSampleDuration(&sampleDuration);
 
-            // Preserve relative presentation timestamps on video streams so B-frame decode order
-            // is never clobbered; only enforce strict monotonicity on audio streams (#19).
+            // Preserve relative presentation timestamps on video streams so B-frame display order
+            // is never clobbered; enforce strict monotonicity on audio streams.
             LONGLONG sampleTime = std::max<LONGLONG>(0, timestamp - segCut + outputBase);
             if (!mapIt->second.isVideo) {
                 auto lastIt = lastAudioTimes.find(actualStream);
@@ -678,10 +773,20 @@ ConcatResult concatenateImpl(
             }
             sample->SetSampleTime(sampleTime);
 
-            UINT64 dts = 0;
-            if (SUCCEEDED(sample->GetUINT64(MFSampleExtension_DecodeTimestamp, &dts))) {
-                LONGLONG newDts = std::max<LONGLONG>(0, static_cast<LONGLONG>(dts) - segCut + outputBase);
-                sample->SetUINT64(MFSampleExtension_DecodeTimestamp, static_cast<UINT64>(newDts));
+            if (mapIt->second.isVideo) {
+                UINT64 dts = 0;
+                if (SUCCEEDED(sample->GetUINT64(MFSampleExtension_DecodeTimestamp, &dts))) {
+                    LONGLONG newDts = std::max<LONGLONG>(0, static_cast<LONGLONG>(dts) - segCut + outputBase);
+                    if (lastVideoDts >= 0 && newDts <= lastVideoDts) {
+                        newDts = lastVideoDts + 1000LL;
+                    }
+                    if (sampleTime < newDts) {
+                        sampleTime = newDts;
+                        sample->SetSampleTime(sampleTime);
+                    }
+                    lastVideoDts = newDts;
+                    sample->SetUINT64(MFSampleExtension_DecodeTimestamp, static_cast<UINT64>(newDts));
+                }
             }
 
             hr = writer->WriteSample(mapIt->second.writerIndex, sample.get());
@@ -689,9 +794,21 @@ ConcatResult concatenateImpl(
                 return fail("write failed (" + segLabel + "): " + hrToString(hr));
             }
             ++samplesWritten;
-            segEnd = std::max(segEnd, timestamp - segCut + std::max<LONGLONG>(sampleDuration, 1000LL));
+
+            LONGLONG endRel = timestamp - segCut + std::max<LONGLONG>(sampleDuration, 1000LL);
+            if (mapIt->second.isVideo) {
+                videoSegEnd = std::max(videoSegEnd, endRel);
+            } else {
+                audioSegEnd = std::max(audioSegEnd, endRel);
+            }
         }
 
+        // Advance outputBase past all streams written in this segment so subsequent audio/video
+        // packets never collide with flushed AAC frames at segment boundaries (#4).
+        LONGLONG segEnd = std::max(videoSegEnd, audioSegEnd);
+        if (videoSegEnd > 0 && segEnd > videoSegEnd + 500000LL) {
+            segEnd = videoSegEnd + 500000LL;
+        }
         outputBase += segEnd;
     }
 
@@ -701,7 +818,7 @@ ConcatResult concatenateImpl(
     if (FAILED(hr)) return fail("finalizing MP4 failed: " + hrToString(hr));
 
     res.success = true;
-    res.durationSeconds = static_cast<double>(outputBase) / 1e7;
+    res.durationSeconds = static_cast<double>(std::max<LONGLONG>(0, outputBase - initialPtsShift)) / 1e7;
     return res;
 }
 
@@ -720,7 +837,6 @@ ConcatResult MediaFoundationEncoder::concatenateSegments(
         res.error = std::string("exception: ") + e.what();
     }
     if (!res.success) {
-        // Never leave a broken/partial MP4 behind
         DeleteFileW(finalOutputPath.c_str());
     }
     return res;

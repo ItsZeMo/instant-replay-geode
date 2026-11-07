@@ -12,10 +12,12 @@ using namespace cocos2d;
 
 namespace replay {
 
-static constexpr size_t kMaxPooledFrames = 64;
-static constexpr size_t kMaxPooledBytes = 288ull * 1024 * 1024;
+// Steady-state pool holds just enough frames for 2x PBO + worker + encoder (~4-6 frames),
+// releasing any temporary burst allocations immediately instead of hoarding ~270 MB (#7).
+static constexpr size_t kMaxPooledFrames = 6;
+static constexpr size_t kMaxPooledBytes = 50ull * 1024 * 1024;
 
-static bool isMediaBufferUnique(IMFMediaBuffer* buf) noexcept {
+bool FrameGrabber::isMediaBufferUnique(IMFMediaBuffer* buf) noexcept {
     if (!buf) return false;
     buf->AddRef();
     ULONG refs = buf->Release();
@@ -34,10 +36,21 @@ FrameGrabber::~FrameGrabber() {
     cleanup(false);
 }
 
+void FrameGrabber::resetRenderThreadState() noexcept {
+    m_pboPending[0] = m_pboPending[1] = false;
+    m_pboIndex = 0;
+    m_nextCaptureTime = {};
+    m_lastSwapTime = {};
+    m_lastCapturedTime = {};
+    m_avgSwapIntervalNs = 0.0;
+    m_lastTargetFps = 0;
+}
+
 void FrameGrabber::initialize() {
     if (m_initialized) return;
 
     MediaFoundationEncoder::globalInitialize();
+    (void)ReplayConfig::getGpuAccelName();
 
     m_hasPbo = glGenBuffers && glBindBuffer && glBufferData && glMapBuffer && glUnmapBuffer;
     if (m_hasPbo) {
@@ -48,21 +61,27 @@ void FrameGrabber::initialize() {
                 glGenRenderbuffers && glBindRenderbuffer && glRenderbufferStorage &&
                 glFramebufferRenderbuffer && glCheckFramebufferStatus;
 
-    m_pboIndex = 0;
-    m_pboPending[0] = m_pboPending[1] = false;
+    resetRenderThreadState();
     m_initialized = true;
 }
 
+void FrameGrabber::clearPool() {
+    std::lock_guard<std::mutex> lock(m_poolMutex);
+    m_framePool.clear();
+}
+
 void FrameGrabber::setCapturing(bool active) {
-    m_pboPending[0] = m_pboPending[1] = false;
-    m_pboIndex = 0;
-    m_nextCaptureTime = {};
-    m_lastTargetFps = 0;
+    // Only touch atomics and mutex-guarded pool here; render-thread fields reset via m_captureEpoch (#12).
+    m_captureEpoch.fetch_add(1, std::memory_order_acq_rel);
     m_capturing.store(active, std::memory_order_release);
+    if (!active) {
+        clearPool();
+    }
 }
 
 void FrameGrabber::cleanup(bool glContextValid) {
     m_capturing.store(false, std::memory_order_release);
+    m_captureEpoch.fetch_add(1, std::memory_order_acq_rel);
     if (glContextValid && m_initialized) {
         if (m_pbos[0] != 0 && glDeleteBuffers) {
             glDeleteBuffers(2, m_pbos);
@@ -79,15 +98,13 @@ void FrameGrabber::cleanup(bool glContextValid) {
     m_rbo = 0;
     m_fboWidth = m_fboHeight = 0;
     m_pboCapacity[0] = m_pboCapacity[1] = 0;
-    m_pboPending[0] = m_pboPending[1] = false;
-    m_pboIndex = 0;
-    m_nextCaptureTime = {};
-    m_lastTargetFps = 0;
+    resetRenderThreadState();
     m_initialized = false;
 
     std::lock_guard<std::mutex> lock(m_poolMutex);
     m_framePool.clear();
     m_syncScratch.clear();
+    m_syncScratch.shrink_to_fit();
 }
 
 void FrameGrabber::setFrameCallback(FrameCallback callback) {
@@ -100,29 +117,26 @@ std::shared_ptr<CapturedFrame> FrameGrabber::acquireFrame(size_t requiredBytes) 
         std::lock_guard<std::mutex> lock(m_poolMutex);
         for (size_t i = m_framePool.size(); i > 0; --i) {
             auto& candidate = m_framePool[i - 1];
-            if (candidate && candidate->byteSize == requiredBytes && isMediaBufferUnique(candidate->buffer.get())) {
+            if (!candidate || !candidate->buffer) {
+                m_framePool.erase(m_framePool.begin() + static_cast<std::ptrdiff_t>(i - 1));
+                continue;
+            }
+            if (candidate->byteSize != requiredBytes) {
+                // Evict stale buffers from a previous resolution so they don't linger
+                if (isMediaBufferUnique(candidate->buffer.get())) {
+                    m_framePool.erase(m_framePool.begin() + static_cast<std::ptrdiff_t>(i - 1));
+                }
+                continue;
+            }
+            if (isMediaBufferUnique(candidate->buffer.get())) {
                 frame = std::move(candidate);
                 m_framePool.erase(m_framePool.begin() + static_cast<std::ptrdiff_t>(i - 1));
                 break;
             }
         }
-        if (!frame) {
-            for (size_t i = m_framePool.size(); i > 0; --i) {
-                auto& candidate = m_framePool[i - 1];
-                if (candidate && isMediaBufferUnique(candidate->buffer.get())) {
-                    frame = std::move(candidate);
-                    m_framePool.erase(m_framePool.begin() + static_cast<std::ptrdiff_t>(i - 1));
-                    break;
-                }
-            }
-        }
     }
     if (!frame) {
         frame = std::make_shared<CapturedFrame>();
-    }
-    if (!frame->buffer || frame->byteSize != requiredBytes) {
-        frame->buffer.reset();
-        frame->byteSize = 0;
         if (FAILED(MFCreateMemoryBuffer(static_cast<DWORD>(requiredBytes), frame->buffer.put())) || !frame->buffer) {
             return nullptr;
         }
@@ -133,8 +147,11 @@ std::shared_ptr<CapturedFrame> FrameGrabber::acquireFrame(size_t requiredBytes) 
 
 void FrameGrabber::recycleFrame(std::shared_ptr<CapturedFrame> frame) {
     if (!frame || !frame->buffer || frame.use_count() != 1) return;
+    if (!m_capturing.load(std::memory_order_acquire)) return;
+    if (!isMediaBufferUnique(frame->buffer.get())) return;
+
     std::lock_guard<std::mutex> lock(m_poolMutex);
-    size_t maxFrames = std::clamp<size_t>(kMaxPooledBytes / std::max<size_t>(1, frame->byteSize), 8, kMaxPooledFrames);
+    size_t maxFrames = std::clamp<size_t>(kMaxPooledBytes / std::max<size_t>(1, frame->byteSize), 4, kMaxPooledFrames);
     if (m_framePool.size() < maxFrames) {
         m_framePool.push_back(std::move(frame));
     }
@@ -192,32 +209,62 @@ static void resizeNearest(const uint8_t* src, int sw, int sh, uint8_t* dst, int 
 }
 
 void FrameGrabber::captureCurrentFrame() {
-    if (!m_callback || !m_capturing.load(std::memory_order_relaxed)) return;
+    if (!m_callback || !m_capturing.load(std::memory_order_acquire)) return;
+
+    uint64_t epoch = m_captureEpoch.load(std::memory_order_acquire);
+    if (m_seenEpoch != epoch) {
+        m_seenEpoch = epoch;
+        resetRenderThreadState();
+    }
 
     const auto& config = ReplayManager::get()->getSessionConfig();
     if (!ReplayManager::get()->isReplayActive()) return;
 
-    // Cache GPU vendor string while we are guaranteed to be on the GL render thread
-    (void)ReplayConfig::getGpuAccelName();
+    auto now = std::chrono::steady_clock::now();
 
-    // Throttle capture to target FPS while preserving fractional frame-interval remainders
-    // and allowing jitter tolerance (~1/6 frame interval) for 59.94/60/120/240 Hz VSync (#4)
+    // Track actual swap interval EMA so 1:1 VSync capture (e.g. 120 Hz -> 120 FPS, 240 Hz -> 240 FPS)
+    // never drops frames when an earlier swap had a large jitter spike (#5).
+    if (m_lastSwapTime != std::chrono::steady_clock::time_point{}) {
+        double swapNs = static_cast<double>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(now - m_lastSwapTime).count());
+        if (swapNs > 0.0 && swapNs < 250000000.0) {
+            m_avgSwapIntervalNs = (m_avgSwapIntervalNs <= 0.0)
+                ? swapNs
+                : (m_avgSwapIntervalNs * 0.85 + swapNs * 0.15);
+        }
+    }
+    m_lastSwapTime = now;
+
     int targetFps = std::max(1, config.targetFps.load());
     auto interval = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
         std::chrono::duration<double>(1.0 / static_cast<double>(targetFps))
     );
-    auto tolerance = interval / 6;
-    auto now = std::chrono::steady_clock::now();
-    if (m_lastTargetFps != targetFps) {
+    double intervalNs = 1e9 / static_cast<double>(targetFps);
+    // 3/8 interval tolerance gives wide jitter immunity while staying clear of the 1/2 sub-harmonic
+    auto tolerance = (interval * 3) / 8;
+
+    if (m_lastTargetFps != targetFps || m_nextCaptureTime == std::chrono::steady_clock::time_point{}) {
         m_lastTargetFps = targetFps;
         m_nextCaptureTime = now;
     }
+
     if (now + tolerance < m_nextCaptureTime) {
-        return;
+        bool isOneToOneOrSlower = (m_avgSwapIntervalNs >= intervalNs * 0.92) &&
+                                  (m_lastCapturedTime == std::chrono::steady_clock::time_point{} ||
+                                   (now - m_lastCapturedTime) >= (interval / 2));
+        if (!isOneToOneOrSlower) {
+            return;
+        }
+        // Re-center phase onto real VSync cadence after an unusually late initial/prior frame
+        m_nextCaptureTime = now;
     }
+
+    m_lastCapturedTime = now;
     m_nextCaptureTime += interval;
-    if (m_nextCaptureTime <= now) {
-        m_nextCaptureTime = now + interval;
+    // Allow up to 2 intervals of temporary render lag so catch-up frames are still captured;
+    // never snap forward to `now + interval` on jitter (#5).
+    if (m_nextCaptureTime + 2 * interval <= now) {
+        m_nextCaptureTime = now;
     }
 
     if (!m_initialized) {
@@ -328,8 +375,6 @@ void FrameGrabber::captureCurrentFrame() {
             glBindBuffer(GL_PIXEL_PACK_BUFFER, m_pbos[prev]);
             auto src = static_cast<const uint8_t*>(glMapBuffer(GL_PIXEL_PACK_BUFFER, GL_READ_ONLY));
             if (src) {
-                // Previous frame may have been captured at a different size;
-                // deliver() rescales so the encoder always gets dstW x dstH.
                 deliver(src, m_pboWidth[prev], m_pboHeight[prev], m_pboTime[prev]);
                 glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
             }

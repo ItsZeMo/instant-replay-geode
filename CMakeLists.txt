@@ -3,7 +3,7 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 
-project(InstantReplay VERSION 1.0.3)
+project(InstantReplay VERSION 1.0.4)
 
 if (NOT WIN32)
     message(FATAL_ERROR "Instant Replay requires Windows (Media Foundation + WASAPI).")

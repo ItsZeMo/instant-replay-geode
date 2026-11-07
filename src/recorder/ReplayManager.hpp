@@ -40,8 +40,8 @@ public:
     void toggleReplay();
     // Applies the "enabled" state (e.g. from Geode settings) to the running recorder
     void setReplayEnabled(bool enabled);
-    bool isReplayActive() const { return m_running.load(); }
-    bool isSaving() const { return m_saving.load(); }
+    bool isReplayActive() const noexcept { return m_running.load(); }
+    bool isSaving() const noexcept { return m_saving.load(); }
 
     // Direct folder opener
     void openRecordingsFolder();
@@ -57,11 +57,25 @@ private:
     void stopReplay();
 
     void workerThreadFunc(ReplayConfig sessionConfig);
+    void reclaimInFlightFrames(bool forceClear = false);
+    bool processPendingAudio(
+        const ReplayConfig& sessionConfig,
+        std::vector<float>& gameAudioScratch,
+        std::vector<float>& resampledGameAudioScratch,
+        std::vector<float>& silenceScratch,
+        std::string& outFatalError
+    );
     void finalizeCurrentSegment(bool syncForExport, const ReplayConfig& cfg);
-    bool startNewSegment(const ReplayConfig& cfg, std::chrono::steady_clock::time_point segStart);
+    bool startNewSegment(const ReplayConfig& cfg, std::chrono::steady_clock::time_point segStart, bool isContinuation);
     bool rotateSegment(bool syncForExport, const ReplayConfig& cfg,
                        std::chrono::steady_clock::time_point nextSegStart = std::chrono::steady_clock::now());
-    void handleSaveRequest(bool continueRecording, const ReplayConfig& cfg);
+    void handleSaveRequest(
+        bool continueRecording,
+        const ReplayConfig& cfg,
+        std::vector<float>& gameAudioScratch,
+        std::vector<float>& resampledGameAudioScratch,
+        std::vector<float>& silenceScratch
+    );
     void handleFatalRecordingError(const std::string& reason);
     void purgeOldSegments(const ReplayConfig& cfg);
     void cleanupTempDir();
@@ -78,12 +92,12 @@ private:
     // Single-track microphone mixer (recordMic && !splitAudioTracks)
     void resetMicMixer();
     void appendMicToMix(const AudioChunk& chunk, int targetRate, size_t startFrameOffset = 0);
-    void mixMicInto(float* gameSamples, size_t numFrames, int channels);
+    void mixMicInto(float* stereoSamples, size_t numFrames);
     bool flushMicMixFifo(int rate, bool checkErrors);
 
     // Shared timestamp resync + encoder write for game and mic audio streams
-    bool writeAudioWithResync(bool isGameAudio, float* samples, int numSamples, int channels,
-                              int rate, std::chrono::steady_clock::time_point timestamp,
+    bool writeAudioWithResync(bool isGameAudio, float* samples, int numSamples, int rate,
+                              std::chrono::steady_clock::time_point timestamp,
                               std::vector<float>& silenceScratch);
 
     std::filesystem::path getTempDir(bool createIfMissing = false) const;
@@ -94,12 +108,16 @@ private:
     std::atomic<bool> m_saving{false};
     std::atomic<bool> m_saveRequested{false};
     std::atomic<bool> m_shuttingDown{false};
+    uint64_t m_sessionId = 0; // guarded by m_queueMutex (#12, #13)
 
     std::unique_ptr<MediaFoundationEncoder> m_encoder;
+    std::deque<std::shared_ptr<CapturedFrame>> m_inFlightFrames; // worker thread only (#1, #7)
     std::wstring m_currentSegmentPath;
     std::string m_currentFormatKey;
-    std::chrono::steady_clock::time_point m_currentSegmentStart;
-    int m_segmentIndex = 0; // monotonic for the whole session: names never collide with files still being exported
+    std::chrono::steady_clock::time_point m_currentSegmentStart{};
+    bool m_isContinuationSegment = false;
+    int m_segmentGameSampleRate = 48000;
+    int m_segmentIndex = 0; // monotonic across sessions so names never collide with in-flight exports
 
     // Encoder video size = size of the frames actually delivered by FrameGrabber
     int m_videoWidth = 0;
@@ -108,14 +126,17 @@ private:
     int64_t m_gameAudioSamples = 0;
     int64_t m_micAudioSamples = 0;
 
-    // Encoder start backoff & write failure tracking (worker thread only)
+    // Encoder start backoff & per-stream write failure tracking (worker thread only, #3)
     int m_encoderFailCount = 0;
-    int m_writeErrorCount = 0;
+    int m_videoWriteErrors = 0;
+    int m_gameAudioWriteErrors = 0;
+    int m_micAudioWriteErrors = 0;
     std::chrono::steady_clock::time_point m_nextEncoderRetryTime{};
 
     std::vector<SegmentInfo> m_activeSegments;
     std::multiset<std::wstring> m_exportLockedSegments;
     std::vector<std::wstring> m_deferredDeletes;
+    std::filesystem::path m_lastTempDir;
     mutable std::mutex m_segmentMutex;
 
     // Asynchronous segment finalizer thread (prevents 30s rotation from stalling worker thread)

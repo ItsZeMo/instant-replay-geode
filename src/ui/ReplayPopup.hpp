@@ -6,9 +6,12 @@
 
 #include <Geode/ui/Popup.hpp>
 #include <Geode/ui/TextInput.hpp>
+#include <Geode/utils/async.hpp>
 #include "../config/ReplayConfig.hpp"
 #include "../recorder/ReplayManager.hpp"
 #include "../capture/AudioGrabber.hpp"
+#include <memory>
+#include <vector>
 
 namespace replay {
 
@@ -16,7 +19,7 @@ class ReplayPopup : public geode::Popup {
 public:
     static ReplayPopup* create();
     static void toggle();
-    static ReplayPopup* get() { return s_instance; }
+    static ReplayPopup* get() noexcept { return s_instance; }
 
     ~ReplayPopup() override;
 
@@ -29,6 +32,13 @@ protected:
     void onClose(cocos2d::CCObject* sender) override;
 
 private:
+    struct DiskSpaceResult {
+        bool low = false;
+        bool isTempLow = false;
+        uint64_t freeMB = 0;
+        uint64_t neededMB = 0;
+    };
+
     inline static ReplayPopup* s_instance = nullptr;
 
     void setupDashboardTab(cocos2d::CCNode* page, cocos2d::CCSize const& winSize, float centerX);
@@ -37,6 +47,15 @@ private:
     void setupAudioStorageTab(cocos2d::CCNode* page, cocos2d::CCSize const& winSize, float centerX);
 
     bool guardLocked() const;
+    void applyLockState(bool locked);
+    void markSettingsDirty(bool flushToDisk = false);
+    void finalizePendingBitrateClamp();
+
+    void scheduleDiskSpaceCheck(bool immediate);
+    void triggerAsyncDiskCheck();
+    void applyDiskSpaceResult(bool low, uint64_t freeMB, uint64_t neededMB, bool isTempLow);
+    void refreshDiskWarnLabel();
+
     void switchTab(int tabIndex);
     void updateFolderDisplay();
     void onBrowseFolder();
@@ -67,7 +86,7 @@ private:
     geode::TextInput* m_saveFolderInput = nullptr;
     geode::TextInput* m_customBitrateInput = nullptr;
 
-    // Menus to update active state
+    // Menus to update active/locked state
     cocos2d::CCMenu* m_durationMenu = nullptr;
     cocos2d::CCMenu* m_codecMenu = nullptr;
     cocos2d::CCMenu* m_resMenu = nullptr;
@@ -76,6 +95,13 @@ private:
     cocos2d::CCMenu* m_bitrateMenu = nullptr;
     cocos2d::CCMenu* m_maxBitrateMenu = nullptr;
     cocos2d::CCMenu* m_micDevMenu = nullptr;
+    cocos2d::CCMenu* m_hwMenu = nullptr;
+    cocos2d::CCMenu* m_audioToggleMenu = nullptr;
+
+    // Individual buttons that lock during recording
+    CCMenuItemSpriteExtra* m_quickBrowseBtn = nullptr;
+    CCMenuItemSpriteExtra* m_storageBrowseBtn = nullptr;
+    CCMenuItemSpriteExtra* m_storageResetBtn = nullptr;
 
     // Sliders for Audio Volume
     Slider* m_gameVolSlider = nullptr;
@@ -90,17 +116,34 @@ private:
     CCMenuItemToggler* m_micToggle = nullptr;
     CCMenuItemToggler* m_hwAccelToggle = nullptr;
     cocos2d::CCLabelBMFont* m_hwAccelLabel = nullptr;
+    cocos2d::CCLabelBMFont* m_splitAudioLabel = nullptr;
+    cocos2d::CCLabelBMFont* m_micRecordLabel = nullptr;
 
-    // Warning banner
+    // Warning banner & action button
     cocos2d::CCLabelBMFont* m_lockWarningBanner = nullptr;
-
-    // Action buttons
     CCMenuItemSpriteExtra* m_toggleBtn = nullptr;
 
     // Microphone device selection
     CCMenuItemSpriteExtra* m_micDeviceBtn = nullptr;
+    std::string m_displayedMicName;
     std::vector<AudioDeviceInfo> m_availableMics;
     int m_currentMicIndex = 0;
+
+    // Settings dirty tracking & lock state (#17, #24, #31)
+    bool m_settingsDirty = false;
+    bool m_hasAppliedLockState = false;
+    bool m_isLocked = false;
+
+    // Asynchronous disk space monitor (#16)
+    geode::async::TaskHolder<DiskSpaceResult> m_diskCheckTask;
+    std::shared_ptr<std::atomic<bool>> m_diskCheckInFlight = std::make_shared<std::atomic<bool>>(false);
+    float m_diskCheckTimer = 0.0f;
+    float m_diskCheckDebounce = 0.0f;
+    bool m_diskCheckPending = false;
+    bool m_cachedDiskLow = false;
+    bool m_cachedIsTempLow = false;
+    uint64_t m_cachedFreeMB = 0;
+    uint64_t m_cachedNeededMB = 0;
 };
 
 } // namespace replay

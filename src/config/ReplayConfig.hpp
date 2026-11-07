@@ -9,11 +9,14 @@
 #include <windows.h>
 #include <shlobj.h>
 #include <string>
+#include <string_view>
+#include <vector>
 #include <filesystem>
 #include <chrono>
 #include <atomic>
 #include <mutex>
 #include <algorithm>
+#include <cctype>
 
 namespace replay {
 
@@ -123,6 +126,16 @@ struct ReplayConfig {
     std::string customTempFolder = "";
 
     static inline std::atomic<int> s_nativeFrameHeight{1080};
+
+    // Must ONLY be called on the main / OpenGL render thread (#18).
+    static void refreshNativeFrameHeight() noexcept {
+        if (auto view = cocos2d::CCEGLView::get()) {
+            auto fs = view->getFrameSize();
+            if (fs.height > 0.0f) {
+                s_nativeFrameHeight.store(static_cast<int>(fs.height + 0.5f), std::memory_order_relaxed);
+            }
+        }
+    }
 
     static const char* codecToString(CodecType c) noexcept {
         switch (c) {
@@ -264,24 +277,15 @@ struct ReplayConfig {
         customTempFolder = val;
     }
 
-    double getResolutionMultiplier() const {
+    // Thread-safe: reads only atomic state, never touches CCEGLView on worker threads (#18).
+    double getResolutionMultiplier() const noexcept {
         switch (resolution.load()) {
             case ResolutionType::HD_720P:   return 0.50;
             case ResolutionType::FHD_1080P: return 1.00;
             case ResolutionType::QHD_1440P: return 1.60;
             case ResolutionType::UHD_4K:    return 2.40;
             case ResolutionType::NATIVE: {
-                int frameH = 0;
-                if (auto view = cocos2d::CCEGLView::get()) {
-                    auto fs = view->getFrameSize();
-                    if (fs.height > 0.0f) {
-                        frameH = static_cast<int>(fs.height + 0.5f);
-                        s_nativeFrameHeight.store(frameH, std::memory_order_relaxed);
-                    }
-                }
-                if (frameH <= 0) {
-                    frameH = s_nativeFrameHeight.load(std::memory_order_relaxed);
-                }
+                int frameH = s_nativeFrameHeight.load(std::memory_order_relaxed);
                 if (frameH > 0) {
                     double factor = static_cast<double>(frameH) / 1080.0;
                     return std::clamp(factor, 0.50, 2.50);
@@ -292,7 +296,7 @@ struct ReplayConfig {
         }
     }
 
-    double getFpsMultiplier() const {
+    double getFpsMultiplier() const noexcept {
         int fps = targetFps.load();
         if (fps <= 60) return 1.00;
         if (fps == 120) return 1.40;
@@ -300,7 +304,7 @@ struct ReplayConfig {
         return 1.00 + (fps - 60) * 0.0053;
     }
 
-    double getCodecMultiplier() const {
+    double getCodecMultiplier() const noexcept {
         switch (codec.load()) {
             case CodecType::AV1: return 0.70;  // AV1: ~30% more efficient than H.264
             case CodecType::HEVC: return 0.85; // HEVC: ~15% more efficient than H.264
@@ -309,11 +313,11 @@ struct ReplayConfig {
         }
     }
 
-    int getEffectiveBitrateMbps() const {
+    int getEffectiveBitrateMbps() const noexcept {
         RateControlMode rc = rateControl.load();
         int br = bitrateMbps.load();
         if (rc == RateControlMode::CONSTANT_CBR) {
-            return std::clamp(br, 2, 250);
+            return std::clamp(br, 5, 250);
         }
         double mult = getResolutionMultiplier() * getFpsMultiplier() * getCodecMultiplier();
         if (rc == RateControlMode::CONSTANT_QUALITY) {
@@ -325,7 +329,7 @@ struct ReplayConfig {
         return std::clamp(val, 5, 250);
     }
 
-    int getEffectiveMaxBitrateMbps() const {
+    int getEffectiveMaxBitrateMbps() const noexcept {
         if (rateControl.load() == RateControlMode::CONSTANT_CBR) {
             return getEffectiveBitrateMbps();
         }
@@ -379,34 +383,57 @@ struct ReplayConfig {
 
         if (hardwareAcceleration.load()) {
             return name + " (" + getGpuAccelName() + ")";
-        } else {
-            return name + " (Software)";
         }
+        return name + " (Software)";
     }
 
-    double getEstimatedFileSizeMB() const {
-        double dur = static_cast<double>(durationSeconds.load());
+    double estimateSizeMBForDuration(double durSeconds) const noexcept {
         double videoMbps = static_cast<double>(getEffectiveBitrateMbps());
         double audioMbps = 0.192; // Game audio AAC
         if (splitAudioTracks.load() && recordMic.load()) {
             audioMbps += 0.128; // Mic audio AAC
         }
-        double totalMbps = videoMbps + audioMbps;
-        return (totalMbps * dur) / 8.0;
+        return ((videoMbps + audioMbps) * durSeconds) / 8.0;
+    }
+
+    double getEstimatedFileSizeMB() const noexcept {
+        return estimateSizeMBForDuration(static_cast<double>(durationSeconds.load()));
     }
 
     // Rolling segment buffer in TEMP keeps up to duration + 60s of completed 30s segments
     // plus the active 30s segment being recorded before the next purge (duration + 90s peak).
-    double getEstimatedTempBufferSizeMB() const {
-        double dur = static_cast<double>(durationSeconds.load()) + 90.0;
-        double videoMbps = static_cast<double>(getEffectiveBitrateMbps());
-        double audioMbps = 0.192;
-        if (splitAudioTracks.load() && recordMic.load()) {
-            audioMbps += 0.128;
-        }
-        return ((videoMbps + audioMbps) * dur) / 8.0;
+    double getEstimatedTempBufferSizeMB() const noexcept {
+        return estimateSizeMBForDuration(static_cast<double>(durationSeconds.load()) + 90.0);
     }
 
+    static std::string formatSizeMB(double totalMB) {
+        char buf[48];
+        if (totalMB >= 1024.0) {
+            snprintf(buf, sizeof(buf), "~%.2f GB", totalMB / 1024.0);
+        } else {
+            snprintf(buf, sizeof(buf), "~%d MB", static_cast<int>(totalMB + 0.5));
+        }
+        return std::string(buf);
+    }
+
+    std::string getEstimatedFileSizeText() const {
+        return "Est. Size: " + formatSizeMB(getEstimatedFileSizeMB());
+    }
+
+    std::string getEstimatedFileSizeDetailedText() const {
+        int dur = durationSeconds.load();
+        int m = dur / 60;
+        int s = dur % 60;
+        const char* rName = resolutionDisplayName(resolution.load());
+        std::string sizeStr = formatSizeMB(getEstimatedFileSizeMB());
+
+        char buf[160];
+        snprintf(buf, sizeof(buf), "Estimated File Size: %s (%s @ %d FPS, %d:%02d)",
+                 sizeStr.c_str(), rName, targetFps.load(), m, s);
+        return std::string(buf);
+    }
+
+    // Blocking filesystem query: call ONLY from worker / async tasks, never on the UI thread (#16).
     static uint64_t queryAvailableSpaceForPath(std::filesystem::path p) {
         std::error_code ec;
         while (!p.empty() && !std::filesystem::exists(p, ec)) {
@@ -414,35 +441,31 @@ struct ReplayConfig {
             if (parent == p) break;
             p = std::move(parent);
         }
-        if (p.empty()) return 0;
+        if (p.empty() || !std::filesystem::exists(p, ec)) return 0;
         auto space = std::filesystem::space(p, ec);
         return ec ? 0 : space.available;
     }
 
-    uint64_t getAvailableSaveDiskSpaceBytes() const {
-        return queryAvailableSpaceForPath(getRecordingsDirectory(false));
-    }
-
-    uint64_t getAvailableTempDiskSpaceBytes() const {
-        return queryAvailableSpaceForPath(getTempDirectory(false));
-    }
-
-    bool isLowDiskSpace(uint64_t* outFreeMB = nullptr, uint64_t* outNeededMB = nullptr, bool* outIsTemp = nullptr) const {
+    bool isLowDiskSpace(uint64_t* outFreeMB = nullptr, uint64_t* outNeededMB = nullptr,
+                        bool* outIsTemp = nullptr, bool includeTemp = true) const {
         constexpr uint64_t kMinFloorBytes = 350ULL * 1024 * 1024;
 
-        uint64_t saveAvail = getAvailableSaveDiskSpaceBytes();
+        auto saveDir = resolveRecordingsDirectory(false, true);
+        uint64_t saveAvail = queryAvailableSpaceForPath(saveDir);
         uint64_t saveNeeded = static_cast<uint64_t>(getEstimatedFileSizeMB() * 1024.0 * 1024.0);
         bool saveLow = (saveAvail > 0) && (saveAvail < saveNeeded || saveAvail < kMinFloorBytes);
 
-        uint64_t tempAvail = getAvailableTempDiskSpaceBytes();
-        uint64_t tempNeeded = static_cast<uint64_t>(getEstimatedTempBufferSizeMB() * 1024.0 * 1024.0);
-        bool tempLow = (tempAvail > 0) && (tempAvail < tempNeeded || tempAvail < kMinFloorBytes);
-
-        if (tempLow) {
-            if (outFreeMB) *outFreeMB = tempAvail / (1024 * 1024);
-            if (outNeededMB) *outNeededMB = std::max<uint64_t>(350, tempNeeded / (1024 * 1024));
-            if (outIsTemp) *outIsTemp = true;
-            return true;
+        if (includeTemp) {
+            auto tempDir = resolveTempDirectory(false, true);
+            uint64_t tempAvail = queryAvailableSpaceForPath(tempDir);
+            uint64_t tempNeeded = static_cast<uint64_t>(getEstimatedTempBufferSizeMB() * 1024.0 * 1024.0);
+            bool tempLow = (tempAvail > 0) && (tempAvail < tempNeeded || tempAvail < kMinFloorBytes);
+            if (tempLow) {
+                if (outFreeMB) *outFreeMB = tempAvail / (1024 * 1024);
+                if (outNeededMB) *outNeededMB = std::max<uint64_t>(350, tempNeeded / (1024 * 1024));
+                if (outIsTemp) *outIsTemp = true;
+                return true;
+            }
         }
         if (saveLow) {
             if (outFreeMB) *outFreeMB = saveAvail / (1024 * 1024);
@@ -453,44 +476,16 @@ struct ReplayConfig {
         return false;
     }
 
-    std::string getEstimatedFileSizeText() const {
-        double totalMB = getEstimatedFileSizeMB();
-        char buf[80];
-        if (totalMB >= 1024.0) {
-            snprintf(buf, sizeof(buf), "Est. Size: ~%.2f GB", totalMB / 1024.0);
-        } else {
-            snprintf(buf, sizeof(buf), "Est. Size: ~%d MB", static_cast<int>(totalMB + 0.5));
-        }
-        return std::string(buf);
-    }
-
-    std::string getEstimatedFileSizeDetailedText() const {
-        double totalMB = getEstimatedFileSizeMB();
-        int dur = durationSeconds.load();
-        int m = dur / 60;
-        int s = dur % 60;
-
-        const char* rName = resolutionDisplayName(resolution.load());
-
-        char buf[160];
-        if (totalMB >= 1024.0) {
-            snprintf(buf, sizeof(buf), "Estimated File Size: ~%.2f GB (%s @ %d FPS, %d:%02d)", totalMB / 1024.0, rName, targetFps.load(), m, s);
-        } else {
-            snprintf(buf, sizeof(buf), "Estimated File Size: ~%d MB (%s @ %d FPS, %d:%02d)", static_cast<int>(totalMB + 0.5), rName, targetFps.load(), m, s);
-        }
-        return std::string(buf);
-    }
-
-    static bool isH264Conflict(ResolutionType res, int fps) {
+    static bool isH264Conflict(ResolutionType res, int fps) noexcept {
         return (res == ResolutionType::UHD_4K && fps >= 240);
     }
 
-    void sanitizeCodecSettings() {
-        if (codec.load() == CodecType::H264) {
-            if (isH264Conflict(resolution.load(), targetFps.load())) {
-                targetFps = 120;
-            }
+    bool sanitizeCodecSettings() noexcept {
+        if (codec.load() == CodecType::H264 && isH264Conflict(resolution.load(), targetFps.load())) {
+            targetFps = 120;
+            return true;
         }
+        return false;
     }
 
     static inline std::atomic<bool> s_isSavingSettings{false};
@@ -510,14 +505,9 @@ struct ReplayConfig {
         std::string codecStr = mod->getSettingValue<std::string>("codec");
         std::string loadedCustomCodec = mod->getSettingValue<std::string>("custom-codec");
         std::string loadedSaveFolder = mod->getSettingValue<std::string>("save-folder");
-        std::string loadedTempFolder = mod->hasSetting("temp-folder")
-            ? mod->getSettingValue<std::string>("temp-folder")
-            : "";
+        std::string loadedTempFolder = mod->getSettingValue<std::string>("temp-folder");
 
-        if (mod->hasSetting("hardware-accel")) {
-            hardwareAcceleration = mod->getSettingValue<bool>("hardware-accel");
-        }
-
+        hardwareAcceleration = mod->getSettingValue<bool>("hardware-accel");
         codec = codecFromString(codecStr);
         resolution = resolutionFromString(mod->getSettingValue<std::string>("resolution"));
         rateControl = rateControlFromString(mod->getSettingValue<std::string>("rate-control"));
@@ -527,7 +517,7 @@ struct ReplayConfig {
         qualityLevel = std::clamp(static_cast<int>(mod->getSettingValue<int64_t>("quality-level")), 20, 100);
         targetFps = std::clamp(static_cast<int>(mod->getSettingValue<int64_t>("fps")), 30, 240);
 
-        sanitizeCodecSettings();
+        bool sanitized = sanitizeCodecSettings();
 
         splitAudioTracks = mod->getSettingValue<bool>("split-audio");
         recordMic = mod->getSettingValue<bool>("record-mic");
@@ -549,23 +539,20 @@ struct ReplayConfig {
         systemVolume = std::clamp(static_cast<float>(mod->getSettingValue<double>("system-volume")), 0.0f, 2.0f);
         micVolume = std::clamp(static_cast<float>(mod->getSettingValue<double>("mic-volume")), 0.0f, 2.0f);
         showNotification = mod->getSettingValue<bool>("show-notification");
-    }
 
-    static void setClampedInt(geode::Mod* mod, std::string_view key, int64_t val) {
-        if (auto sett = mod->getSetting(key)) {
-            if (auto intSett = geode::cast::typeinfo_pointer_cast<geode::IntSettingV3>(sett)) {
-                if (auto minV = intSett->getMinValue()) val = std::max(val, *minV);
-                if (auto maxV = intSett->getMaxValue()) val = std::min(val, *maxV);
-            }
+        if (sanitized) {
+            s_isSavingSettings.store(true);
+            setClampedSetting<geode::IntSettingV3>(mod, "fps", static_cast<int64_t>(targetFps.load()));
+            s_isSavingSettings.store(false);
         }
-        (void)mod->setSettingValue(key, val);
     }
 
-    static void setClampedFloat(geode::Mod* mod, std::string_view key, double val) {
+    template <typename SettingT, typename ValT>
+    static void setClampedSetting(geode::Mod* mod, std::string_view key, ValT val) {
         if (auto sett = mod->getSetting(key)) {
-            if (auto fltSett = geode::cast::typeinfo_pointer_cast<geode::FloatSettingV3>(sett)) {
-                if (auto minV = fltSett->getMinValue()) val = std::max(val, *minV);
-                if (auto maxV = fltSett->getMaxValue()) val = std::min(val, *maxV);
+            if (auto typed = geode::cast::typeinfo_pointer_cast<SettingT>(sett)) {
+                if (auto minV = typed->getMinValue()) val = std::max<ValT>(val, *minV);
+                if (auto maxV = typed->getMaxValue()) val = std::min<ValT>(val, *maxV);
             }
         }
         (void)mod->setSettingValue(key, val);
@@ -576,8 +563,8 @@ struct ReplayConfig {
         auto mod = geode::Mod::get();
         if (!mod) return;
         s_isSavingSettings.store(true);
-        setClampedFloat(mod, "system-volume", static_cast<double>(systemVolume.load()));
-        setClampedFloat(mod, "mic-volume", static_cast<double>(micVolume.load()));
+        setClampedSetting<geode::FloatSettingV3>(mod, "system-volume", static_cast<double>(systemVolume.load()));
+        setClampedSetting<geode::FloatSettingV3>(mod, "mic-volume", static_cast<double>(micVolume.load()));
         s_isSavingSettings.store(false);
     }
 
@@ -602,27 +589,25 @@ struct ReplayConfig {
         }
 
         (void)mod->setSettingValue("enabled", enabled.load());
-        setClampedInt(mod, "duration", static_cast<int64_t>(durationSeconds.load()));
+        setClampedSetting<geode::IntSettingV3>(mod, "duration", static_cast<int64_t>(durationSeconds.load()));
         (void)mod->setSettingValue("hardware-accel", hardwareAcceleration.load());
         (void)mod->setSettingValue("codec", std::string(codecToString(codec.load())));
         (void)mod->setSettingValue("custom-codec", curCustomCodec);
         (void)mod->setSettingValue("save-folder", curSaveFolder);
-        if (mod->hasSetting("temp-folder")) {
-            (void)mod->setSettingValue("temp-folder", curTempFolder);
-        }
+        (void)mod->setSettingValue("temp-folder", curTempFolder);
         (void)mod->setSettingValue("resolution", std::string(resolutionToString(resolution.load())));
         (void)mod->setSettingValue("rate-control", std::string(rateControlToString(rateControl.load())));
 
-        setClampedInt(mod, "bitrate", static_cast<int64_t>(bitrateMbps.load()));
-        setClampedInt(mod, "max-bitrate", static_cast<int64_t>(maxBitrateMbps.load()));
-        setClampedInt(mod, "quality-level", static_cast<int64_t>(qualityLevel.load()));
-        setClampedInt(mod, "fps", static_cast<int64_t>(targetFps.load()));
+        setClampedSetting<geode::IntSettingV3>(mod, "bitrate", static_cast<int64_t>(bitrateMbps.load()));
+        setClampedSetting<geode::IntSettingV3>(mod, "max-bitrate", static_cast<int64_t>(maxBitrateMbps.load()));
+        setClampedSetting<geode::IntSettingV3>(mod, "quality-level", static_cast<int64_t>(qualityLevel.load()));
+        setClampedSetting<geode::IntSettingV3>(mod, "fps", static_cast<int64_t>(targetFps.load()));
         (void)mod->setSettingValue("split-audio", splitAudioTracks.load());
         (void)mod->setSettingValue("record-mic", recordMic.load());
         (void)mod->setSettingValue("mic-device-id", curMicId);
         (void)mod->setSettingValue("mic-device-name", curMicName);
-        setClampedFloat(mod, "system-volume", static_cast<double>(systemVolume.load()));
-        setClampedFloat(mod, "mic-volume", static_cast<double>(micVolume.load()));
+        setClampedSetting<geode::FloatSettingV3>(mod, "system-volume", static_cast<double>(systemVolume.load()));
+        setClampedSetting<geode::FloatSettingV3>(mod, "mic-volume", static_cast<double>(micVolume.load()));
         (void)mod->setSettingValue("show-notification", showNotification.load());
 
         if (flushToDisk) {
@@ -635,7 +620,7 @@ struct ReplayConfig {
     // Returns the encoded video size for a given game framebuffer size.
     // Presets define the output HEIGHT; width follows the window aspect ratio
     // (no stretching on 16:10 / 21:9 monitors). Always even (NV12 requirement).
-    std::pair<int, int> getResolutionDimensions(int nativeW, int nativeH) const {
+    std::pair<int, int> getResolutionDimensions(int nativeW, int nativeH) const noexcept {
         if (nativeW <= 0 || nativeH <= 0) return {1920, 1080};
 
         int targetH = 0;
@@ -659,73 +644,161 @@ struct ReplayConfig {
         return {std::max(64, w), std::max(64, h)};
     }
 
+    // Pure lexical normalization: strips surrounding whitespace/quotes, validates syntax,
+    // removes trailing separators so `.filename()` is never empty on `"D:\\Temp\\"` (#23).
+    static std::filesystem::path normalizeCustomDirPath(const std::string& rawUtf8) {
+        size_t first = 0;
+        size_t last = rawUtf8.size();
+        while (first < last && (std::isspace(static_cast<unsigned char>(rawUtf8[first])) || rawUtf8[first] == '"')) {
+            ++first;
+        }
+        while (last > first && (std::isspace(static_cast<unsigned char>(rawUtf8[last - 1])) || rawUtf8[last - 1] == '"')) {
+            --last;
+        }
+        if (first >= last) return {};
+
+        std::wstring wide = geode::utils::string::utf8ToWide(rawUtf8.substr(first, last - first));
+        if (wide.empty()) return {};
+
+        std::filesystem::path p(wide);
+        if (!p.is_absolute() || !p.has_root_name() || !p.has_root_directory()) {
+            return {};
+        }
+
+        p = p.lexically_normal();
+        while (!p.has_filename() && p.parent_path() != p) {
+            p = p.parent_path();
+        }
+
+        // Validate non-root path components against forbidden Win32 filename characters
+        std::filesystem::path rel = p.relative_path();
+        for (const auto& comp : rel) {
+            const auto& ws = comp.native();
+            if (ws.empty()) continue;
+            for (wchar_t wc : ws) {
+                if (wc < 32 || wc == L'<' || wc == L'>' || wc == L':' ||
+                    wc == L'"' || wc == L'|' || wc == L'?' || wc == L'*') {
+                    return {};
+                }
+            }
+        }
+        return p;
+    }
+
+    // When createIfMissing == false, performs zero disk I/O so UI callers never block (#16).
     std::filesystem::path getRecordingsDirectory(bool createIfMissing = false) const {
-        std::string saveFolderStr = getCustomSaveFolder();
-        if (!saveFolderStr.empty()) {
-            std::error_code ec;
-            std::filesystem::path customPath(geode::utils::string::utf8ToWide(saveFolderStr));
-            if (customPath.is_absolute()) {
-                if (createIfMissing && !std::filesystem::exists(customPath, ec)) {
-                    std::filesystem::create_directories(customPath, ec);
-                }
-                if (!createIfMissing || std::filesystem::exists(customPath, ec)) {
-                    return customPath;
-                }
-            }
-        }
-
-        PWSTR pszVideos = nullptr;
-        HRESULT hr = SHGetKnownFolderPath(FOLDERID_Videos, 0, nullptr, &pszVideos);
-        if (SUCCEEDED(hr) && pszVideos) {
-            std::filesystem::path dir = std::filesystem::path(pszVideos) / L"Geometry Dash";
-            CoTaskMemFree(pszVideos);
-            std::error_code ec;
-            if (createIfMissing) {
-                std::filesystem::create_directories(dir, ec);
-            }
-            if (!createIfMissing || (!ec && std::filesystem::exists(dir, ec))) {
-                return dir;
-            }
-        } else if (pszVideos) {
-            CoTaskMemFree(pszVideos);
-        }
-
-        std::filesystem::path dir = geode::dirs::getGameDir() / L"Replays";
-        if (createIfMissing) {
-            std::error_code ec;
-            std::filesystem::create_directories(dir, ec);
-        }
-        return dir;
+        return resolveRecordingsDirectory(createIfMissing, createIfMissing);
     }
 
     std::filesystem::path getTempDirectory(bool createIfMissing = false) const {
-        std::string tempFolderStr = getCustomTempFolder();
-        if (!tempFolderStr.empty()) {
-            std::error_code ec;
-            std::filesystem::path customPath(geode::utils::string::utf8ToWide(tempFolderStr));
-            if (customPath.is_absolute()) {
-                auto fname = customPath.filename().wstring();
-                if (fname != L"GeometryDash_InstantReplay" && fname != L"InstantReplay") {
-                    customPath /= L"GeometryDash_InstantReplay";
-                }
-                if (createIfMissing && !std::filesystem::exists(customPath, ec)) {
-                    std::filesystem::create_directories(customPath, ec);
-                }
-                if (!createIfMissing || std::filesystem::exists(customPath, ec)) {
-                    return customPath;
-                }
+        return resolveTempDirectory(createIfMissing, createIfMissing);
+    }
+
+    // Finds the nearest existing directory on disk for folder-picker initial path without creating folders (#11).
+    std::filesystem::path getExistingRecordingsPickerPath() const {
+        std::filesystem::path p = resolveRecordingsDirectory(false, true);
+        std::error_code ec;
+        while (!p.empty() && !std::filesystem::is_directory(p, ec)) {
+            auto parent = p.parent_path();
+            if (parent == p) break;
+            p = std::move(parent);
+        }
+        return p;
+    }
+
+private:
+    static const std::filesystem::path& cachedDefaultVideosDir() {
+        static const std::filesystem::path s_videosDir = []() -> std::filesystem::path {
+            PWSTR pszVideos = nullptr;
+            HRESULT hr = SHGetKnownFolderPath(FOLDERID_Videos, 0, nullptr, &pszVideos);
+            std::filesystem::path result;
+            if (SUCCEEDED(hr) && pszVideos) {
+                result = std::filesystem::path(pszVideos) / L"Geometry Dash";
+            }
+            if (pszVideos) {
+                CoTaskMemFree(pszVideos);
+            }
+            return result;
+        }();
+        return s_videosDir;
+    }
+
+    static const std::filesystem::path& cachedDefaultTempDir() {
+        static const std::filesystem::path s_tempDir = []() -> std::filesystem::path {
+            wchar_t tempBuf[MAX_PATH + 1] = {};
+            DWORD len = GetTempPathW(MAX_PATH, tempBuf);
+            if (len > 0 && len <= MAX_PATH) {
+                return std::filesystem::path(tempBuf) / L"GeometryDash_InstantReplay";
+            }
+            return {};
+        }();
+        return s_tempDir;
+    }
+
+    static bool isPathCreatableOrExistingDir(const std::filesystem::path& dir, bool createIfMissing) {
+        if (dir.empty()) return false;
+        std::error_code ec;
+        if (std::filesystem::is_directory(dir, ec)) {
+            return true;
+        }
+        if (std::filesystem::exists(dir, ec)) {
+            // Exists on disk, but is NOT a directory (e.g. regular file) (#11, #22)
+            return false;
+        }
+        if (createIfMissing) {
+            std::filesystem::create_directories(dir, ec);
+            return !ec && std::filesystem::is_directory(dir, ec);
+        }
+        // Verify root drive exists and nearest existing ancestor is a directory, not a file
+        auto cur = dir;
+        while (!cur.empty() && !std::filesystem::exists(cur, ec)) {
+            auto parent = cur.parent_path();
+            if (parent == cur) return false; // Root volume itself does not exist (e.g. Z:\)
+            cur = std::move(parent);
+        }
+        return !cur.empty() && std::filesystem::is_directory(cur, ec);
+    }
+
+    std::filesystem::path resolveRecordingsDirectory(bool createIfMissing, bool verifyOnDisk) const {
+        std::filesystem::path customPath = normalizeCustomDirPath(getCustomSaveFolder());
+        if (!customPath.empty()) {
+            if (!verifyOnDisk || isPathCreatableOrExistingDir(customPath, createIfMissing)) {
+                return customPath;
             }
         }
 
-        wchar_t tempBuf[MAX_PATH + 1] = {};
-        DWORD len = GetTempPathW(MAX_PATH, tempBuf);
-        if (len > 0 && len <= MAX_PATH) {
-            std::filesystem::path dir = std::filesystem::path(tempBuf) / L"GeometryDash_InstantReplay";
-            if (createIfMissing) {
-                std::error_code ec;
-                std::filesystem::create_directories(dir, ec);
+        const auto& videosDir = cachedDefaultVideosDir();
+        if (!videosDir.empty()) {
+            if (!verifyOnDisk || isPathCreatableOrExistingDir(videosDir, createIfMissing)) {
+                return videosDir;
             }
-            return dir;
+        }
+
+        std::filesystem::path fallback = geode::dirs::getGameDir() / L"Replays";
+        if (createIfMissing) {
+            std::error_code ec;
+            std::filesystem::create_directories(fallback, ec);
+        }
+        return fallback;
+    }
+
+    std::filesystem::path resolveTempDirectory(bool createIfMissing, bool verifyOnDisk) const {
+        std::filesystem::path customPath = normalizeCustomDirPath(getCustomTempFolder());
+        if (!customPath.empty()) {
+            auto fname = customPath.filename().wstring();
+            if (fname != L"GeometryDash_InstantReplay" && fname != L"InstantReplay") {
+                customPath /= L"GeometryDash_InstantReplay";
+            }
+            if (!verifyOnDisk || isPathCreatableOrExistingDir(customPath, createIfMissing)) {
+                return customPath;
+            }
+        }
+
+        const auto& sysTempDir = cachedDefaultTempDir();
+        if (!sysTempDir.empty()) {
+            if (!verifyOnDisk || isPathCreatableOrExistingDir(sysTempDir, createIfMissing)) {
+                return sysTempDir;
+            }
         }
 
         std::filesystem::path fallback = geode::dirs::getTempDir() / L"InstantReplay";
@@ -736,7 +809,6 @@ struct ReplayConfig {
         return fallback;
     }
 
-private:
     mutable std::mutex m_mutex;
 };
 

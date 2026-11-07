@@ -16,6 +16,7 @@
 #include <vector>
 #include <memory>
 #include <mutex>
+#include <functional>
 
 namespace replay {
 
@@ -47,7 +48,8 @@ public:
         CodecType codec,
         bool hardwareAcceleration = true,
         const std::string& customCodec = "",
-        int gameSampleRate = 44100
+        int gameSampleRate = 48000,
+        const std::function<void()>& onBeforeFallback = nullptr
     );
 
     bool writeVideoFrame(IMFMediaBuffer* videoBuffer, int width, int height, int64_t timestampHns);
@@ -55,11 +57,12 @@ public:
     bool writeMicAudio(const float* pcmFloat, int numSamples, int channels, int sampleRate, int64_t timestampHns);
 
     bool finish();
-    bool isRecording() const { return m_recording; }
+    bool isRecording() const noexcept { return m_recording; }
+    int encodedGameSampleRate() const noexcept { return m_gameSampleRate; }
 
     // Identifies the stream layout of the current segment. Segments with different keys
     // cannot be remuxed into one file without re-encoding.
-    const std::string& formatKey() const { return m_formatKey; }
+    const std::string& formatKey() const noexcept { return m_formatKey; }
 
     // Remuxes the segments (oldest first) into finalOutputPath without re-encoding.
     // trimStartSeconds drops that much from the beginning of the first segment
@@ -81,14 +84,15 @@ private:
         int qualityLevel = 80;
         RateControlMode rateControl = RateControlMode::ADAPTIVE_VBR;
         bool splitAudio = false;
-        int gameSampleRate = 44100;
+        int gameSampleRate = 48000;
     };
 
     bool tryStartLocked(const std::wstring& outputPath, const GUID& subtype, bool hardware,
-                        const StartParams& params, std::string& error);
+                        const StartParams& params, HRESULT& outHr, std::string& error);
     bool finishLocked();
     bool createVideoSample(IMFMediaBuffer* videoBuffer, int64_t timestampHns, IMFSample** ppSample);
-    bool createAudioSample(const float* pcmFloat, int numSamples, int channels, int sampleRate, int64_t timestampHns, IMFSample** ppSample);
+    bool createAudioSample(const float* pcmFloat, int numSamples, int channels, int sampleRate,
+                           int64_t timestampHns, IMFSample** ppSample);
 
     IMFSinkWriter* m_sinkWriter = nullptr;
     DWORD m_videoStreamIndex = 0;
@@ -98,6 +102,7 @@ private:
     int m_width = 1920;
     int m_height = 1080;
     int m_fps = 60;
+    int m_gameSampleRate = 48000;
     bool m_splitAudio = true;
     bool m_recording = false;
     std::string m_formatKey;

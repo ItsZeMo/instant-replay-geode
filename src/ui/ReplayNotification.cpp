@@ -4,7 +4,7 @@
 
 #include <cocos2d.h>
 #include <cocos-ext.h>
-#include <filesystem>
+#include <algorithm>
 
 using namespace cocos2d;
 using namespace cocos2d::extension;
@@ -61,11 +61,12 @@ bool ReplayNotification::init(const std::string& filePath, double durationSecond
     titleLabel->setPosition(ccp(-width / 2 + 60.0f, 10.0f));
     this->addChild(titleLabel);
 
-    // Subtitle with filename and duration
+    // Subtitle with filename and rounded duration
     auto slash = filePath.find_last_of("\\/");
     std::string filename = (slash == std::string::npos) ? filePath : filePath.substr(slash + 1);
-    int m = static_cast<int>(durationSeconds) / 60;
-    int s = static_cast<int>(durationSeconds) % 60;
+    int totalSec = std::max(0, static_cast<int>(durationSeconds + 0.5));
+    int m = totalSec / 60;
+    int s = totalSec % 60;
     char subBuf[128];
     snprintf(subBuf, sizeof(subBuf), "%s (%d:%02d)", filename.c_str(), m, s);
 

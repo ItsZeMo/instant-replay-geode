@@ -1,5 +1,26 @@
 # Changelog
 
+## v1.0.4
+- **Stability, Threading & Resource Management:**
+  - Restored non-blocking `MF_SINK_WRITER_DISABLE_THROTTLING` on `IMFSinkWriter` paired with bounded in-flight video frame tracking (`MAX_IN_FLIGHT_ENCODER_FRAMES = 16`) and continuous `100 ms` silence synthesis on idle audio streams (`> 200 ms` behind video), preventing potential deadlocks on stop/exit when e.g. microphone capture is enabled with no mic connected.
+  - Reduced steady-state `FrameGrabber` buffer pool from 64 frames (`288 MB`) to 6 frames (`<= 50 MB`) and cleared pooled buffers when capture stops.
+  - Fixed render-thread data race in `FrameGrabber::setCapturing` via atomic `m_captureEpoch`, synchronized `m_running` / `m_saving` / `m_saveRequested` / `m_sessionId` transitions under `m_queueMutex`, guarded `m_activeSegments` under `m_segmentMutex`, and ensured all `ComRef` wrappers on worker/WASAPI threads are released before `CoUninitialize()`.
+  - Replaced shared write error counter with independent per-stream consecutive failure counters (`video`, `game audio`, `mic audio`).
+  - Cached native window height atomically on the main thread so worker threads never read `CCEGLView`.
+
+- **Seamless Audio & Video Encoding:**
+  - Eliminated `10–21 ms` audio drops and clicks at 30-second segment boundaries and after `F6` saves by draining queued FMOD/WASAPI audio into the closing segment before rotation and preserving boundary packets on continuation segments.
+  - Fixed `int64_t` QPC multiplication overflow in WASAPI packet timestamp calculation after `~25.6` hours of system uptime.
+  - Eliminated remaining `~4–5%` VSync frame drops under jitter on 120/240 Hz displays by replacing peak-jitter resync with a `3/8` interval tolerance, 2-interval lag cushion, and EMA swap-rate tracking.
+  - Raised GOP keyframe spacing cap from 60 to 240 frames (1-second GOP up to 240 FPS).
+  - Prevented transient hardware encoder session-limit failures during async segment finalization from pinning `AV1 -> HEVC` fallback for the session, fixed `software_hevc` custom codec parsing, and preserved negative B-frame decode lead (`cutHns - firstVideoDts`) during MP4 concatenation so initial `DTS` values are never crushed together at `0`.
+
+- **UI, Paths & Workflow:**
+  - Removed all synchronous filesystem checks from the main UI thread; disk space monitoring in `ReplayPopup` now runs asynchronously via `geode::async::TaskHolder` + `runtime().spawnBlocking`.
+  - Normalized custom save/temp paths (stripping quotes, whitespace, and trailing slashes to prevent duplicate `GeometryDash_InstantReplay` subfolders, rejecting regular files and missing drives, and cleaning previous temp directories on change).
+  - Properly disabled, unfocused, and dimmed all locked `TextInput`, `Slider`, toggle, and preset controls during active recording (including guarding async folder-picker callbacks), added dirty-state tracking so closing `ReplayPopup` without edits avoids redundant disk writes, and fixed UTF-8 path suffix truncation.
+  - Fixed `.github/workflows/antigravity-agent.yml` checksum verification and push permissions.
+
 ## v1.0.3
 - **Stability & Crash Prevention:**
   - Replaced `AppDelegate::trySaveGame` shutdown hook with `$on_game(Exiting)` to avoid premature teardown during regular in-game saves.

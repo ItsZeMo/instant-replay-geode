@@ -32,10 +32,13 @@ class FrameGrabber {
 public:
     static FrameGrabber* get();
 
+    // True when no external consumer (such as Media Foundation's async pipeline) holds a ref.
+    static bool isMediaBufferUnique(IMFMediaBuffer* buf) noexcept;
+
     void initialize();
     void cleanup(bool glContextValid = true);
 
-    // Enables/disables capture and discards any stale pending PBO readback (#6)
+    // Thread-safe: signals capture state change; render-thread state resets on next swap (#12).
     void setCapturing(bool active);
 
     // Called on the OpenGL render thread right BEFORE the back buffer is swapped
@@ -43,6 +46,7 @@ public:
 
     // Return a consumed frame buffer to the pool so the render thread does not allocate
     void recycleFrame(std::shared_ptr<CapturedFrame> frame);
+    void clearPool();
 
     using FrameCallback = std::function<void(std::shared_ptr<CapturedFrame>)>;
     void setFrameCallback(FrameCallback callback);
@@ -54,8 +58,12 @@ private:
     bool ensureScaleTarget(int width, int height);
     void ensurePbo(int index, size_t bytes);
     std::shared_ptr<CapturedFrame> acquireFrame(size_t requiredBytes);
+    void resetRenderThreadState() noexcept;
 
     std::atomic<bool> m_capturing{false};
+    std::atomic<uint64_t> m_captureEpoch{0};
+    uint64_t m_seenEpoch = 0;
+
     bool m_initialized = false;
     bool m_hasPbo = false;
     bool m_hasBlit = false;
@@ -66,7 +74,7 @@ private:
     int m_fboWidth = 0;
     int m_fboHeight = 0;
 
-    // Double-buffered async readback
+    // Double-buffered async readback (render thread only)
     unsigned int m_pbos[2] = {0, 0};
     size_t m_pboCapacity[2] = {0, 0};
     int m_pboWidth[2] = {0, 0};
@@ -75,13 +83,18 @@ private:
     std::chrono::steady_clock::time_point m_pboTime[2];
     int m_pboIndex = 0;
 
-    // Reusable IMFMediaBuffer frame pool (eliminates per-frame 8-33 MB allocation & double copy)
+    // Reusable IMFMediaBuffer frame pool (bounded steady-state working set, #7)
     std::mutex m_poolMutex;
     std::vector<std::shared_ptr<CapturedFrame>> m_framePool;
     std::vector<uint8_t> m_syncScratch;
 
+    // Frame pacing state (render thread only, #5)
     std::chrono::steady_clock::time_point m_nextCaptureTime{};
+    std::chrono::steady_clock::time_point m_lastSwapTime{};
+    std::chrono::steady_clock::time_point m_lastCapturedTime{};
+    double m_avgSwapIntervalNs = 0.0;
     int m_lastTargetFps = 0;
+
     FrameCallback m_callback;
 };
 

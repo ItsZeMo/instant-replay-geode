@@ -13,7 +13,6 @@
 #include "capture/FrameGrabber.hpp"
 #include "capture/AudioGrabber.hpp"
 #include "ui/ReplayPopup.hpp"
-#include "ui/ReplayNotification.hpp"
 
 using namespace geode::prelude;
 using namespace replay;
@@ -27,6 +26,18 @@ static bool shouldIgnoreKeybindWhileTyping(Keybind const& kb) {
     return !hasCtrlOrAlt && !isFKey;
 }
 
+static void addReplayButtonToMenu(CCNode* menu, CCObject* target, SEL_MenuHandler selector) {
+    if (!menu) return;
+    auto spr = CCSprite::createWithSpriteFrameName("GJ_completesIcon_001.png");
+    if (!spr) return;
+    spr->setScale(0.85f);
+    spr->setColor(ccc3(100, 220, 255));
+    auto btn = CCMenuItemSpriteExtra::create(spr, target, selector);
+    btn->setID("instant-replay-button"_spr);
+    menu->addChild(btn);
+    menu->updateLayout();
+}
+
 static void triggerSaveReplay() {
     geode::log::info("Instant Replay: Keybind triggered Save Replay");
     ReplayManager::get()->saveReplay();
@@ -35,6 +46,10 @@ static void triggerSaveReplay() {
 static void triggerToggleReplay() {
     geode::log::info("Instant Replay: Keybind triggered Toggle Replay");
     ReplayManager::get()->toggleReplay();
+    if (auto* popup = ReplayPopup::get()) {
+        popup->refreshUI();
+        popup->updateStatusDisplay(0.0f);
+    }
     if (ReplayConfig::get().showNotification.load()) {
         bool active = ReplayManager::get()->isReplayActive();
         geode::Notification::create(
@@ -97,18 +112,15 @@ $on_mod(Loaded) {
         }
 
         static bool s_batchPending = false;
-        static bool s_wasActiveBeforeBatch = false;
         static bool s_enabledChanged = false;
         static bool s_recordingParamChanged = false;
 
         if (!s_batchPending) {
             s_batchPending = true;
-            s_wasActiveBeforeBatch = ReplayManager::get()->isReplayActive();
             s_enabledChanged = false;
             s_recordingParamChanged = false;
 
             geode::Loader::get()->queueInMainThread([]() {
-                bool wasActive = s_wasActiveBeforeBatch;
                 bool enabledChanged = s_enabledChanged;
                 bool paramChanged = s_recordingParamChanged;
                 s_batchPending = false;
@@ -118,21 +130,22 @@ $on_mod(Loaded) {
                 auto mod = geode::Mod::get();
                 if (!mod) return;
 
+                bool isActive = ReplayManager::get()->isReplayActive();
                 bool targetEnabled = enabledChanged
                     ? mod->getSettingValue<bool>("enabled")
                     : ReplayConfig::get().enabled.load();
 
-                if (wasActive && targetEnabled && paramChanged) {
+                if (isActive && targetEnabled && paramChanged) {
                     geode::Notification::create(
                         "Recording settings can only be changed when recording is OFF!",
                         geode::NotificationIcon::Warning,
                         1.5f
                     )->show();
-                    ReplayConfig::get().saveToSettings();
+                    ReplayConfig::get().saveToSettings(true);
                     return;
                 }
 
-                if (wasActive && !targetEnabled) {
+                if (isActive && !targetEnabled) {
                     ReplayManager::get()->setReplayEnabled(false);
                 }
 
@@ -189,20 +202,7 @@ class $modify(ReplayFMOD, FMODAudioEngine) {
 class $modify(ReplayMenuLayer, MenuLayer) {
     bool init() {
         if (!MenuLayer::init()) return false;
-
-        auto bottomMenu = this->getChildByID("bottom-menu");
-        if (bottomMenu) {
-            auto spr = CCSprite::createWithSpriteFrameName("GJ_completesIcon_001.png");
-            if (spr) {
-                spr->setScale(0.85f);
-                spr->setColor(ccc3(100, 220, 255));
-                auto btn = CCMenuItemSpriteExtra::create(spr, this, menu_selector(ReplayMenuLayer::onOpenReplay));
-                btn->setID("instant-replay-button"_spr);
-                bottomMenu->addChild(btn);
-                bottomMenu->updateLayout();
-            }
-        }
-
+        addReplayButtonToMenu(this->getChildByID("bottom-menu"), this, menu_selector(ReplayMenuLayer::onOpenReplay));
         return true;
     }
 
@@ -215,19 +215,7 @@ class $modify(ReplayMenuLayer, MenuLayer) {
 class $modify(ReplayPauseLayer, PauseLayer) {
     void customSetup() {
         PauseLayer::customSetup();
-
-        auto rightMenu = this->getChildByID("right-button-menu");
-        if (rightMenu) {
-            auto spr = CCSprite::createWithSpriteFrameName("GJ_completesIcon_001.png");
-            if (spr) {
-                spr->setScale(0.85f);
-                spr->setColor(ccc3(100, 220, 255));
-                auto btn = CCMenuItemSpriteExtra::create(spr, this, menu_selector(ReplayPauseLayer::onOpenReplay));
-                btn->setID("instant-replay-button"_spr);
-                rightMenu->addChild(btn);
-                rightMenu->updateLayout();
-            }
-        }
+        addReplayButtonToMenu(this->getChildByID("right-button-menu"), this, menu_selector(ReplayPauseLayer::onOpenReplay));
     }
 
     void onOpenReplay(CCObject*) {

@@ -49,32 +49,33 @@ instant-replay-geode/
 
 1. **Video Capture (`src/capture/FrameGrabber.cpp`)**
    - Hooked in `ReplayEGLView::swapBuffers` (`src/main.cpp`) with hook priority `100000` (and after `absolllute.megahack`) so capture runs **after** all overlays have rendered, right before presentation.
-   - Frame pacing uses `m_nextCaptureTime += interval` with a small jitter tolerance (`interval / 6`) to preserve fractional frame-interval remainders without dropping VSync frames.
+   - Frame pacing uses `m_nextCaptureTime += interval` with a `3/8` interval tolerance and a 2-interval lag cushion (plus EMA swap-rate detection for 1:1 VSync capture) so driver/OS frame jitter never locks `m_nextCaptureTime` onto late spikes or drops subsequent on-time VSync frames.
    - Uses an OpenGL FBO + `glBlitFramebuffer` to scale the backbuffer to the target resolution (`getResolutionDimensions()`, always even width/height for NV12 compatibility) on the GPU.
-   - Reads pixels asynchronously via 2 alternating Pixel Buffer Objects (`m_pbos[2]`) in `GL_BGRA` format directly into a pooled `IMFMediaBuffer` inside `CapturedFrame` (`acquireFrame` / `recycleFrame`), avoiding per-frame heap allocations and eliminating a second copy in `MediaFoundationEncoder`.
+   - Reads pixels asynchronously via 2 alternating Pixel Buffer Objects (`m_pbos[2]`) in `GL_BGRA` format directly into a bounded pool (`kMaxPooledFrames = 6`, `<= 50 MB`) of `IMFMediaBuffer`s inside `CapturedFrame` (`acquireFrame` / `recycleFrame`), avoiding per-frame heap allocations and releasing pool memory when capture stops.
    - **Note:** OpenGL readback is bottom-up. Pixels are kept bottom-up in `CapturedFrame` and flipped at zero CPU cost by passing a negative stride (`-width * 4`) to Media Foundation (`MF_MT_DEFAULT_STRIDE`).
 
 2. **Audio Capture (`src/capture/AudioGrabber.cpp`)**
    - **Game Audio:** Custom FMOD DSP attached to the tail of the Master `ChannelGroup`. Writes normalized 2-channel stereo float PCM into a pre-allocated **lock-free SPSC ring buffer** (`m_gameRingBuffer`, 65536 stereo frames) with zero heap allocations and zero mutex locks on the real-time FMOD mixer thread. Drained by the worker thread via `drainGameAudio()`.
-   - **Microphone Audio:** Event-driven WASAPI capture thread (`micCaptureThreadFunc`), started only when both `enabled` and `recordMic` are true, and stopped immediately in `ReplayManager::stopReplay()`. Uses `eConsole` first (falling back to `eCommunications`), maintains a stateful fractional-phase linear resampler (`StereoResampler`) to `48000 Hz` across packet boundaries, and automatically recovers from device invalidation (`AUDCLNT_E_DEVICE_INVALIDATED`).
+   - **Microphone Audio:** Event-driven WASAPI capture thread (`micCaptureThreadFunc`), started only when both `enabled` and `recordMic` are true, and stopped immediately in `ReplayManager::stopReplay()`. Uses `eConsole` first (falling back to `eCommunications`), computes overflow-safe 64-bit QPC packet timestamps, maintains a stateful fractional-phase linear resampler (`StereoResampler`) to `48000 Hz` across packet boundaries, and automatically recovers from device invalidation (`AUDCLNT_E_DEVICE_INVALIDATED`).
 
 3. **Worker Thread & Rolling Segments (`src/recorder/ReplayManager.cpp`)**
    - Takes an immutable `ReplayConfig` snapshot (`m_sessionConfig`) at `startReplay()`.
    - Encodes into rolling 30-second MP4 segments (`SEGMENT_DURATION = 30.0`) inside `getTempDirectory() / seg_<N>.mp4`.
-   - **Asynchronous Segment Rotation:** Every 30 seconds, the previous segment's `IMFSinkWriter::Finalize()` is offloaded to `m_finalizeThread` while a new `MediaFoundationEncoder` starts immediately on the worker thread, anchoring `m_currentSegmentStart` to the timestamp taken before rotation.
-   - **Audio Timestamp Resync:** Compares sample-counter timestamps against wall-clock capture timestamps; bridges small positive gaps (`40–500 ms`) with silence, jumps sample counters across larger pauses (`> 500 ms`), and trims negative overlaps (`< -40 ms`) so audio never drifts or lags behind video.
-   - **Error & Backoff Handling:** Tracks encoder start failures (exponential backoff, stopping after 3 consecutive failures) and write failures (`writeVideoFrame` / `writeGameAudio` / `writeMicAudio`), stopping replay cleanly on the main thread and notifying the user on fatal disk errors.
+   - **Asynchronous Segment Rotation & Seamless Audio:** Drains pending FMOD/WASAPI audio into the closing segment before rotation, offloads `IMFSinkWriter::Finalize()` to `m_finalizeThread` while starting the next segment immediately on the worker thread, and preserves boundary packets on continuation segments so zero audio samples are lost across 30-second boundaries.
+   - **Audio Timestamp Resync & Keep-Alive:** Compares sample-counter timestamps against wall-clock capture timestamps; bridges small positive gaps (`40–500 ms`) with silence, jumps sample counters across larger pauses (`> 500 ms`), trims negative overlaps (`< -40 ms`), and synthesizes continuous silence on idle audio streams (`> 200 ms` behind video).
+   - **Per-Stream Error & Backoff Handling:** Tracks encoder start failures (exponential backoff, stopping after 3 consecutive failures) and independent consecutive write error counters per stream (`video`, `game audio`, `mic audio`), stopping replay cleanly on the main thread guarded by session ID.
 
 4. **Media Foundation Encoder & Fallback Cascade (`src/encoder/MediaFoundationEncoder.cpp`)**
+   - `IMFSinkWriter` runs with `MF_SINK_WRITER_DISABLE_THROTTLING = TRUE` so `WriteSample` never blocks/deadlocks when an audio stream is idle; `ReplayManager` bounds in-flight uncompressed video frames (`MAX_IN_FLIGHT_ENCODER_FRAMES = 16`).
    - `MediaFoundationEncoder::start()` builds a fallback list:
      `Cached Working Codec -> Requested Codec (HW) -> HEVC (HW) -> H.264 (HW) -> H.264 (SW)`.
-   - Caches the working `(GUID subtype, bool hardware)` only when it matches the requested hardware/software tier so transient hardware failures never permanently lock the session to software encoding.
+   - Joins any background segment finalization (`onBeforeFallback`) and retries the primary hardware codec before falling back, and only caches fallback codecs on permanent codec-unsupported errors when the primary codec has never succeeded in the current session.
    - Wraps the caller's `IMFMediaBuffer` directly in an `IMFSample` with zero additional pixel copies.
 
 5. **Saving & Lossless Segment Remuxing (`ReplayManager::handleSaveRequest` & `MediaFoundationEncoder::concatenateSegments`)**
    - Synchronously finalizes the active segment, selects the newest segments with matching `formatKey` covering `durationSeconds`, and computes `trimStartSeconds = std::max(0.0, totalSeconds - maxDuration)`.
    - Locks the selected segment file paths in `m_exportLockedSegments` so `stopReplay()`, `purgeOldSegments()`, or `cleanupTempDir()` cannot delete them while `m_exportThread` is reading them.
-   - `concatenateSegments()` scans the first segment for a keyframe near `trimStartSeconds`, remuxes all compressed video/audio samples without re-encoding (preserving B-frame PTS/DTS ordering), checks every `ReadSample`, `WriteSample`, and `Finalize` call, and removes any partial output file on failure.
+   - `concatenateSegments()` scans the first segment for a keyframe near `trimStartSeconds` (and shifts initial PTS by any B-frame decode lead so negative initial DTS is never clamped together at `0`), remuxes all compressed video/audio samples without re-encoding, checks every `ReadSample`, `WriteSample`, and `Finalize` call, and removes any partial output file on failure.
 
 ---
 
@@ -82,12 +83,14 @@ instant-replay-geode/
 
 1. **Unicode Paths on Windows:**
    Never use `std::filesystem::path::string()` or `std::filesystem::path(std::string)` directly, nor `_dupenv_s("USERPROFILE" / "TEMP")` — on Windows MSVC they use the narrow ANSI codepage instead of UTF-8. Always use `geode::utils::string::pathToString(path)`, `geode::utils::string::utf8ToWide(str)`, `SHGetKnownFolderPath(FOLDERID_Videos, ...)`, and `GetTempPathW`.
-2. **Settings Clamping & Re-entrancy Guard (`ReplayConfig::s_isSavingSettings`):**
-   In Geode 5.10+, `IntSettingV3::setValue` resets to `defaultValue` if a value exceeds `min`/`max` in `mod.json`. Always write integer/float settings through `setClampedInt` / `setClampedFloat` and keep `s_isSavingSettings = true` while saving.
-3. **Do Not Overwrite Focused `geode::TextInput`:**
+2. **Zero Disk I/O on Main Thread:**
+   UI getters (`getRecordingsDirectory(false)`, `getTempDirectory(false)`) must not perform filesystem checks (`exists`, `space`, `create_directories`). Disk space monitoring in `ReplayPopup` runs asynchronously off the main thread.
+3. **Settings Clamping & Re-entrancy Guard (`ReplayConfig::s_isSavingSettings`):**
+   In Geode 5.10+, `IntSettingV3::setValue` resets to `defaultValue` if a value exceeds `min`/`max` in `mod.json`. Always write integer/float settings through `setClampedSetting` and keep `s_isSavingSettings = true` while saving.
+4. **Do Not Overwrite Focused `geode::TextInput`:**
    In `ReplayPopup::refreshUI()` and `updateFolderDisplay()`, always check `!isInputFocused(input)` before calling `input->setString(...)`, otherwise typing multi-digit numbers (like `"35"` or `"100"`) will clobber the user's input mid-keystroke.
-4. **Clean Shutdown Before OpenGL Teardown:**
-   `ReplayManager::shutdown()` is hooked on `$on_game(Exiting)` in `src/main.cpp` so OpenGL FBOs/PBOs and FMOD DSPs are released while the GL context and FMOD system are still valid. Never call `glDelete*` or access other singletons from static destructors (`~ReplayManager()`, `~FrameGrabber()`).
+5. **Clean Shutdown & COM Lifetime:**
+   `ReplayManager::shutdown()` is hooked on `$on_game(Exiting)` in `src/main.cpp` so OpenGL FBOs/PBOs and FMOD DSPs are released while the GL context and FMOD system are still valid. All `ComRef` wrappers on worker/WASAPI threads must be destroyed before `CoUninitialize()`.
 
 ---
 
