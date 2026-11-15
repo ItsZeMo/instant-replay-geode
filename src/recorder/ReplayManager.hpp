@@ -49,6 +49,8 @@ public:
     // Applies the "enabled" state (e.g. from Geode settings) to the running recorder
     void setReplayEnabled(bool enabled);
     bool isReplayActive() const noexcept { return m_running.load(); }
+    bool isStopping() const noexcept { return m_stopping.load(); }
+    bool isReplayLocked() const noexcept { return m_running.load() || m_stopping.load(); }
     bool isSaving() const noexcept { return m_saving.load(); }
 
     // Direct folder opener
@@ -165,6 +167,8 @@ private:
     void cleanupTempDir();
     void joinFinalizeThread();
     void joinExportThread();
+    void joinStopThread();
+    void finishStopCleanup();
 
     // Segment file ownership: files used by a running export are never deleted
     // directly, deletion is deferred until the export releases them.
@@ -193,10 +197,15 @@ private:
     ReplayConfig m_sessionConfig{};
 
     std::atomic<bool> m_running{false};
+    std::atomic<bool> m_stopping{false};
     std::atomic<bool> m_saving{false};
     std::atomic<bool> m_saveRequested{false};
     std::atomic<bool> m_shuttingDown{false};
     uint64_t m_sessionId = 0; // guarded by m_queueMutex (#12, #13)
+
+    // Asynchronous teardown thread for non-blocking Stop Recording (#B7)
+    std::thread m_stopThread;
+    std::mutex m_stopMutex;
 
     std::unique_ptr<MediaFoundationEncoder> m_encoder;
     std::deque<std::shared_ptr<CapturedFrame>> m_inFlightFrames; // worker thread only (#1, #7)

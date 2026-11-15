@@ -54,6 +54,7 @@ ReplayManager::~ReplayManager() {
     if (m_workerThread.joinable()) {
         m_workerThread.join();
     }
+    joinStopThread();
     joinPrepareThread();
     discardPreparedEncoder();
     joinFinalizeThread();
@@ -169,6 +170,13 @@ void ReplayManager::joinExportThread() {
     }
 }
 
+void ReplayManager::joinStopThread() {
+    std::lock_guard<std::mutex> lock(m_stopMutex);
+    if (m_stopThread.joinable()) {
+        m_stopThread.join();
+    }
+}
+
 void ReplayManager::reclaimInFlightFrames(bool forceClear) {
     if (forceClear) {
         for (auto& f : m_inFlightFrames) {
@@ -264,6 +272,10 @@ void ReplayManager::shutdown() {
 void ReplayManager::startReplay() {
     if (m_running.load() || m_shuttingDown.load()) return;
 
+    // If an asynchronous Stop is still finishing in the background, wait for it before restarting
+    joinStopThread();
+    if (m_running.load() || m_shuttingDown.load()) return;
+
     ReplayConfig::refreshNativeFrameHeight();
 
     // Ensure any previous worker thread has exited completely (e.g. after fatal error self-stop)
@@ -344,15 +356,7 @@ void ReplayManager::startReplay() {
     m_workerThread = std::thread(&ReplayManager::workerThreadFunc, this, m_sessionConfig);
 }
 
-void ReplayManager::stopReplay() {
-    FrameGrabber::get()->setCapturing(false);
-    {
-        std::lock_guard<std::mutex> lock(m_queueMutex);
-        m_running.store(false);
-        ++m_sessionId;
-    }
-    m_cv.notify_all();
-
+void ReplayManager::finishStopCleanup() {
     if (m_workerThread.joinable()) {
         m_workerThread.join();
     }
@@ -404,6 +408,47 @@ void ReplayManager::stopReplay() {
         }
         m_currentFormatKey.clear();
     }
+
+    m_stopping.store(false);
+
+    if (!m_shuttingDown.load()) {
+        geode::queueInMainThread([]() {
+            if (auto* popup = ReplayPopup::get()) {
+                popup->refreshUI();
+                popup->updateStatusDisplay(0.0f);
+                popup->scheduleDiskSpaceCheck(true);
+            }
+        });
+    }
+}
+
+void ReplayManager::stopReplay() {
+    FrameGrabber::get()->setCapturing(false);
+    {
+        std::lock_guard<std::mutex> lock(m_queueMutex);
+        m_running.store(false);
+        ++m_sessionId;
+    }
+    m_prepareCancel.store(true);
+    m_cv.notify_all();
+
+    if (m_shuttingDown.load()) {
+        m_stopping.store(true);
+        // Synchronous teardown on game exit so GL/FMOD stay valid (#5 invariant)
+        joinStopThread();
+        finishStopCleanup();
+        return;
+    }
+
+    if (m_stopping.exchange(true)) {
+        return;
+    }
+
+    joinStopThread();
+    std::lock_guard<std::mutex> lock(m_stopMutex);
+    m_stopThread = std::thread([this]() {
+        finishStopCleanup();
+    });
 }
 
 void ReplayManager::setReplayEnabled(bool enabled) {

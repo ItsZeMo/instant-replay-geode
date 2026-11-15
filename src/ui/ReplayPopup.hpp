@@ -25,6 +25,7 @@ public:
 
     void updateStatusDisplay(float dt = 0.0f);
     void refreshUI(bool syncTogglers = true);
+    void scheduleDiskSpaceCheck(bool immediate);
 
 protected:
     bool init(float width, float height);
@@ -51,7 +52,6 @@ private:
     void markSettingsDirty(bool flushToDisk = false);
     void finalizePendingBitrateClamp();
 
-    void scheduleDiskSpaceCheck(bool immediate);
     void triggerAsyncDiskCheck();
     void applyDiskSpaceResult(bool low, uint64_t freeMB, uint64_t neededMB, bool isTempLow);
     void refreshDiskWarnLabel();
@@ -128,6 +128,7 @@ private:
     std::string m_displayedMicName;
     std::vector<AudioDeviceInfo> m_availableMics;
     int m_currentMicIndex = 0;
+    geode::async::TaskHolder<std::vector<AudioDeviceInfo>> m_micEnumTask;
 
     // Settings dirty tracking & lock state (#17, #24, #31)
     bool m_settingsDirty = false;

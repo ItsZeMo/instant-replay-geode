@@ -303,7 +303,7 @@ bool ReplayPopup::init(float width, float height) {
 }
 
 bool ReplayPopup::guardLocked() const {
-    if (ReplayManager::get()->isReplayActive()) {
+    if (ReplayManager::get()->isReplayLocked()) {
         static std::chrono::steady_clock::time_point s_lastWarnTime{};
         auto now = std::chrono::steady_clock::now();
         if (now - s_lastWarnTime >= std::chrono::milliseconds(1500)) {
@@ -970,15 +970,14 @@ void ReplayPopup::setupAudioStorageTab(CCNode* page, CCSize const& winSize, floa
     micDevTitle->setPosition(ccp(20.0f, winSize.height - 138.0f));
     page->addChild(micDevTitle);
 
-    m_availableMics = AudioGrabber::getAvailableMicrophones();
-    m_currentMicIndex = 0;
     const auto curId = ReplayConfig::get().getMicDeviceId();
-    for (size_t i = 0; i < m_availableMics.size(); ++i) {
-        if (m_availableMics[i].id == curId) {
-            m_currentMicIndex = static_cast<int>(i);
-            break;
-        }
-    }
+    const auto curName = ReplayConfig::get().getMicDeviceName();
+    std::string initialMicName = (!curId.empty() && curId != "default" && !curName.empty())
+        ? curName
+        : "Default System Device";
+    m_availableMics.clear();
+    m_availableMics.push_back({curId.empty() ? "default" : curId, initialMicName});
+    m_currentMicIndex = 0;
 
     m_micDevMenu = CCMenu::create();
     m_micDevMenu->setPosition(ccp(270.0f, winSize.height - 138.0f));
@@ -991,7 +990,7 @@ void ReplayPopup::setupAudioStorageTab(CCNode* page, CCSize const& winSize, floa
     setBtnScale(prevBtn, 0.65f);
     m_micDevMenu->addChild(prevBtn);
 
-    m_displayedMicName = m_availableMics.empty() ? "Default Device" : m_availableMics[m_currentMicIndex].name;
+    m_displayedMicName = initialMicName;
     auto devSpr = ButtonSprite::create(m_displayedMicName.c_str(), "goldFont.fnt", "GJ_button_01.png", 0.75f);
     m_micDeviceBtn = CCMenuItemExt::createSpriteExtra(devSpr, [this](auto*) {
         this->cycleMicDevice(1);
@@ -1008,6 +1007,25 @@ void ReplayPopup::setupAudioStorageTab(CCNode* page, CCSize const& winSize, floa
     m_micDevMenu->addChild(nextBtn);
 
     m_micDevMenu->alignItemsHorizontallyWithPadding(6.0f);
+
+    m_micEnumTask.spawn(
+        geode::async::runtime().spawnBlocking<std::vector<AudioDeviceInfo>>([]() {
+            return AudioGrabber::getAvailableMicrophones();
+        }),
+        [this](std::vector<AudioDeviceInfo> mics) {
+            if (mics.empty()) return;
+            m_availableMics = std::move(mics);
+            m_currentMicIndex = 0;
+            const auto savedId = ReplayConfig::get().getMicDeviceId();
+            for (size_t i = 0; i < m_availableMics.size(); ++i) {
+                if (m_availableMics[i].id == savedId) {
+                    m_currentMicIndex = static_cast<int>(i);
+                    break;
+                }
+            }
+            this->refreshMicDeviceButton();
+        }
+    );
 
     // Volume Sliders (0% - 200% range; lightweight in-memory update while dragging; disk flush on popup close)
     float volRowY = winSize.height - 168.0f;
@@ -1162,7 +1180,9 @@ void ReplayPopup::updateStatusDisplay(float dt) {
 
     auto mgr = ReplayManager::get();
     bool isRec = mgr->isReplayActive();
-    applyLockState(isRec);
+    bool isStopping = mgr->isStopping();
+    bool locked = mgr->isReplayLocked();
+    applyLockState(locked);
 
     if (dt > 0.0f) {
         m_diskCheckTimer += dt;
@@ -1182,6 +1202,8 @@ void ReplayPopup::updateStatusDisplay(float dt) {
     if (m_statusLabel) {
         if (mgr->isSaving()) {
             m_statusLabel->setString("Saving Replay...");
+        } else if (isStopping) {
+            m_statusLabel->setString("Stopping...");
         } else if (isRec) {
             m_statusLabel->setString("Replay Active (Settings Locked)");
         } else {
@@ -1192,6 +1214,8 @@ void ReplayPopup::updateStatusDisplay(float dt) {
     if (m_statusDot) {
         if (mgr->isSaving()) {
             m_statusDot->setColor(ccc3(0, 220, 255)); // Cyan
+        } else if (isStopping) {
+            m_statusDot->setColor(ccc3(255, 185, 50)); // Amber
         } else if (isRec) {
             m_statusDot->setColor(ccc3(50, 255, 50)); // Green
         } else {
@@ -1200,7 +1224,10 @@ void ReplayPopup::updateStatusDisplay(float dt) {
     }
 
     if (m_lockWarningBanner) {
-        if (isRec) {
+        if (isStopping) {
+            m_lockWarningBanner->setString("(!) Stopping recording in background...");
+            m_lockWarningBanner->setColor(ccc3(255, 185, 50));
+        } else if (isRec) {
             m_lockWarningBanner->setString("(!) Recording is ACTIVE: settings locked! Stop recording to edit.");
             m_lockWarningBanner->setColor(ccc3(255, 85, 85));
         } else {
@@ -1211,9 +1238,12 @@ void ReplayPopup::updateStatusDisplay(float dt) {
 
     if (m_toggleBtn) {
         if (auto spr = typeinfo_cast<ButtonSprite*>(m_toggleBtn->getNormalImage())) {
-            spr->setString(isRec ? "Stop Recording" : "Start Recording");
-            spr->updateBGImage(isRec ? "GJ_button_06.png" : "GJ_button_01.png");
+            const char* btnLabel = isStopping ? "Stopping..." : (isRec ? "Stop Recording" : "Start Recording");
+            const char* btnBg = isStopping ? "GJ_button_04.png" : (isRec ? "GJ_button_06.png" : "GJ_button_01.png");
+            spr->setString(btnLabel);
+            spr->updateBGImage(btnBg);
         }
+        setMenuItemLocked(m_toggleBtn, isStopping);
     }
 
     refreshDiskWarnLabel();
@@ -1250,7 +1280,7 @@ void ReplayPopup::updateStatusDisplay(float dt) {
 
 void ReplayPopup::refreshUI(bool syncTogglers) {
     const auto& cfg = ReplayConfig::get();
-    bool locked = ReplayManager::get()->isReplayActive();
+    bool locked = ReplayManager::get()->isReplayLocked();
 
     // Duration menu highlight
     int curDur = cfg.durationSeconds.load();
@@ -1356,9 +1386,10 @@ void ReplayPopup::refreshMicDeviceButton() {
     if (m_currentMicIndex < 0 || m_currentMicIndex >= static_cast<int>(m_availableMics.size())) {
         m_currentMicIndex = 0;
     }
+    const bool locked = ReplayManager::get()->isReplayLocked();
     const std::string& name = m_availableMics[m_currentMicIndex].name;
     if (name == m_displayedMicName) {
-        setMenuItemLocked(m_micDeviceBtn, ReplayManager::get()->isReplayActive());
+        setMenuItemLocked(m_micDeviceBtn, locked);
         return;
     }
     m_displayedMicName = name;
@@ -1366,7 +1397,7 @@ void ReplayPopup::refreshMicDeviceButton() {
     m_micDeviceBtn->setNormalImage(spr);
     m_micDeviceBtn->setContentSize(spr->getContentSize());
     setBtnScale(m_micDeviceBtn, 0.62f);
-    setMenuItemLocked(m_micDeviceBtn, ReplayManager::get()->isReplayActive());
+    setMenuItemLocked(m_micDeviceBtn, locked);
     if (m_micDevMenu) {
         m_micDevMenu->alignItemsHorizontallyWithPadding(6.0f);
     }

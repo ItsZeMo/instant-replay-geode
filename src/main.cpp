@@ -132,11 +132,12 @@ $on_mod(Loaded) {
                 if (!mod) return;
 
                 bool isActive = ReplayManager::get()->isReplayActive();
+                bool isLocked = ReplayManager::get()->isReplayLocked();
                 bool targetEnabled = enabledChanged
                     ? mod->getSettingValue<bool>("enabled")
                     : ReplayConfig::get().enabled.load();
 
-                if (isActive && targetEnabled && paramChanged) {
+                if (isLocked && targetEnabled && paramChanged) {
                     geode::Notification::create(
                         "Recording settings can only be changed when recording is OFF!",
                         geode::NotificationIcon::Warning,
