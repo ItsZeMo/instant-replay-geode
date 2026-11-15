@@ -121,7 +121,9 @@ private:
 
     // Warning banner & action button
     cocos2d::CCLabelBMFont* m_lockWarningBanner = nullptr;
+    cocos2d::CCMenu* m_actionMenu = nullptr;
     CCMenuItemSpriteExtra* m_toggleBtn = nullptr;
+    std::string m_lastToggleBtnLabel;
 
     // Microphone device selection
     CCMenuItemSpriteExtra* m_micDeviceBtn = nullptr;

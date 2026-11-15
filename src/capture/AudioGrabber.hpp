@@ -152,7 +152,7 @@ private:
     std::chrono::steady_clock::time_point m_nextDspRetryTime{};
 
     // Lock-free SPSC ring buffer for real-time FMOD DSP game audio (power-of-two stereo frames)
-    static constexpr size_t kGameRingFrames = 65536; // ~1.36s at 48 kHz
+    static constexpr size_t kGameRingFrames = 262144; // ~5.46s at 48 kHz
     static constexpr size_t kGameRingMask = kGameRingFrames - 1;
     std::vector<float> m_gameRingBuffer;
     std::atomic<size_t> m_gameRingWriteFrame{0};

@@ -494,9 +494,9 @@ void ReplayPopup::setupDashboardTab(CCNode* page, CCSize const& winSize, float c
     page->addChild(m_diskSpaceWarnLabel);
 
     // Action Buttons Menu (always unlocked!)
-    auto actionMenu = CCMenu::create();
-    actionMenu->setPosition(ccp(centerX, winSize.height - 144.0f));
-    page->addChild(actionMenu);
+    m_actionMenu = CCMenu::create();
+    m_actionMenu->setPosition(ccp(centerX, winSize.height - 144.0f));
+    page->addChild(m_actionMenu);
 
     std::string saveLabel = getSaveKeybindLabel();
     auto saveSpr = ButtonSprite::create(saveLabel.c_str(), "goldFont.fnt", "GJ_button_01.png", 0.75f);
@@ -506,7 +506,7 @@ void ReplayPopup::setupDashboardTab(CCNode* page, CCSize const& winSize, float c
         this->updateStatusDisplay(0.0f);
     });
     setBtnScale(saveBtn, 0.68f);
-    actionMenu->addChild(saveBtn);
+    m_actionMenu->addChild(saveBtn);
 
     auto toggleSpr = ButtonSprite::create("Toggle Replay", "goldFont.fnt", "GJ_button_04.png", 0.75f);
     m_toggleBtn = CCMenuItemExt::createSpriteExtra(toggleSpr, [this](auto*) {
@@ -523,16 +523,16 @@ void ReplayPopup::setupDashboardTab(CCNode* page, CCSize const& winSize, float c
         this->scheduleDiskSpaceCheck(true);
     });
     setBtnScale(m_toggleBtn, 0.68f);
-    actionMenu->addChild(m_toggleBtn);
+    m_actionMenu->addChild(m_toggleBtn);
 
     auto folderSpr = ButtonSprite::create("Open Folder", "goldFont.fnt", "GJ_button_05.png", 0.75f);
     auto folderBtn = CCMenuItemExt::createSpriteExtra(folderSpr, [](auto*) {
         ReplayManager::get()->openRecordingsFolder();
     });
     setBtnScale(folderBtn, 0.68f);
-    actionMenu->addChild(folderBtn);
+    m_actionMenu->addChild(folderBtn);
 
-    actionMenu->alignItemsHorizontallyWithPadding(6.0f);
+    m_actionMenu->alignItemsHorizontallyWithPadding(6.0f);
 
     // Duration Presets Row
     auto durTitle = CCLabelBMFont::create("Duration:", "goldFont.fnt");
@@ -1237,11 +1237,19 @@ void ReplayPopup::updateStatusDisplay(float dt) {
     }
 
     if (m_toggleBtn) {
-        if (auto spr = typeinfo_cast<ButtonSprite*>(m_toggleBtn->getNormalImage())) {
-            const char* btnLabel = isStopping ? "Stopping..." : (isRec ? "Stop Recording" : "Start Recording");
+        const char* btnLabel = isStopping ? "Stopping..." : (isRec ? "Stop Recording" : "Start Recording");
+        if (m_lastToggleBtnLabel != btnLabel) {
+            m_lastToggleBtnLabel = btnLabel;
             const char* btnBg = isStopping ? "GJ_button_04.png" : (isRec ? "GJ_button_06.png" : "GJ_button_01.png");
-            spr->setString(btnLabel);
-            spr->updateBGImage(btnBg);
+            if (auto spr = typeinfo_cast<ButtonSprite*>(m_toggleBtn->getNormalImage())) {
+                spr->setString(btnLabel);
+                spr->updateBGImage(btnBg);
+                m_toggleBtn->setContentSize(spr->getContentSize());
+            }
+            setBtnScale(m_toggleBtn, 0.68f);
+            if (m_actionMenu) {
+                m_actionMenu->alignItemsHorizontallyWithPadding(6.0f);
+            }
         }
         setMenuItemLocked(m_toggleBtn, isStopping);
     }

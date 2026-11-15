@@ -55,7 +55,7 @@ instant-replay-geode/
    - **Note:** OpenGL readback is bottom-up. Pixels are kept bottom-up in `CapturedFrame` and flipped at zero CPU cost by passing a negative stride (`-width * 4`) to Media Foundation (`MF_MT_DEFAULT_STRIDE`).
 
 2. **Audio Capture (`src/capture/AudioGrabber.cpp`)**
-   - **Game Audio:** Custom FMOD DSP attached to the tail of the Master `ChannelGroup`. Writes normalized 2-channel stereo float PCM into a pre-allocated **lock-free SPSC ring buffer** (`m_gameRingBuffer`, 65536 stereo frames) with zero heap allocations and zero mutex locks on the real-time FMOD mixer thread. Drained by the worker thread via `drainGameAudio()`.
+   - **Game Audio:** Custom FMOD DSP attached to the tail of the Master `ChannelGroup`. Writes normalized 2-channel stereo float PCM into a pre-allocated **lock-free SPSC ring buffer** (`m_gameRingBuffer`, 262144 stereo frames / ~5.46s @ 48 kHz) with zero heap allocations and zero mutex locks on the real-time FMOD mixer thread. Drained by the worker thread via `drainGameAudio()`.
    - **Microphone Audio:** Event-driven WASAPI capture thread (`micCaptureThreadFunc`), started only when both `enabled` and `recordMic` are true, and stopped immediately in `ReplayManager::stopReplay()`. Uses `eConsole` first (falling back to `eCommunications`), computes overflow-safe 64-bit QPC packet timestamps, maintains a stateful fractional-phase linear resampler (`StereoResampler`) to `48000 Hz` across packet boundaries, and automatically recovers from device invalidation (`AUDCLNT_E_DEVICE_INVALIDATED`).
 
 3. **Worker Thread & Rolling Segments (`src/recorder/ReplayManager.cpp`)**
