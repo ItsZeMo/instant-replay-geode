@@ -5,8 +5,9 @@
 #include "../ui/ReplayNotification.hpp"
 #include "../ui/ReplayPopup.hpp"
 #include <Geode/binding/FMODAudioEngine.hpp>
+#include <Geode/utils/async.hpp>
+#include <Geode/utils/file.hpp>
 #include <windows.h>
-#include <shellapi.h>
 #include <sstream>
 #include <iomanip>
 #include <ctime>
@@ -1454,6 +1455,8 @@ void ReplayManager::handleSaveRequest(
                 } else {
                     m_carryGameAudio = {};
                     m_carryMicAudio.clear();
+                    m_encoderFailCount++;
+                    m_nextEncoderRetryTime = std::chrono::steady_clock::now() + std::chrono::seconds(2 * m_encoderFailCount);
                 }
             } else {
                 m_prepareCancel.store(true);
@@ -1933,20 +1936,60 @@ void ReplayManager::workerThreadFunc(ReplayConfig sessionConfig) {
     if (SUCCEEDED(coHr)) CoUninitialize();
 }
 
-void ReplayManager::saveReplay() {
+SaveReplayResult ReplayManager::saveReplay() {
     {
         std::lock_guard<std::mutex> lock(m_queueMutex);
-        if (!m_running.load()) return;
+        if (!m_running.load() || m_shuttingDown.load()) return SaveReplayResult::NotRunning;
         bool expected = false;
-        if (!m_saving.compare_exchange_strong(expected, true)) return;
+        if (!m_saving.compare_exchange_strong(expected, true)) return SaveReplayResult::AlreadySaving;
         m_saveRequested.store(true);
     }
     m_cv.notify_all();
+    return SaveReplayResult::Started;
+}
+
+void ReplayManager::showSaveFeedback(SaveReplayResult result) {
+    switch (result) {
+        case SaveReplayResult::NotRunning:
+            geode::Notification::create(
+                "Instant Replay is OFF (Ctrl+F6 to enable)",
+                geode::NotificationIcon::Warning,
+                2.0f
+            )->show();
+            break;
+        case SaveReplayResult::AlreadySaving:
+            geode::Notification::create(
+                "Previous replay is still saving...",
+                geode::NotificationIcon::Info,
+                1.5f
+            )->show();
+            break;
+        case SaveReplayResult::Started:
+            break;
+    }
 }
 
 void ReplayManager::openRecordingsFolder() {
-    auto dir = ReplayConfig::get().getRecordingsDirectory(true);
-    ShellExecuteW(NULL, L"open", dir.c_str(), NULL, NULL, SW_SHOWNORMAL);
+    auto cfg = ReplayConfig::get().snapshot();
+    geode::async::runtime().spawnBlocking<void>([cfg]() {
+        HRESULT coHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+        std::filesystem::path dir = cfg.getRecordingsDirectory(true);
+        std::error_code ec;
+        bool exists = std::filesystem::exists(dir, ec) && std::filesystem::is_directory(dir, ec);
+        bool opened = exists && geode::utils::file::openFolder(dir);
+        if (SUCCEEDED(coHr)) CoUninitialize();
+
+        if (!opened) {
+            std::string dirStr = geode::utils::string::pathToString(dir);
+            geode::queueInMainThread([dirStr]() {
+                geode::Notification::create(
+                    "Instant Replay: failed to open folder (" + dirStr + ")",
+                    geode::NotificationIcon::Error,
+                    3.0f
+                )->show();
+            });
+        }
+    });
 }
 
 } // namespace replay

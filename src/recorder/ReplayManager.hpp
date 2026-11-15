@@ -29,6 +29,12 @@ struct SegmentInfo {
     std::string formatKey; // segments can only be merged with segments of the same format
 };
 
+enum class SaveReplayResult {
+    Started,
+    NotRunning,
+    AlreadySaving
+};
+
 class ReplayManager {
 public:
     static ReplayManager* get();
@@ -37,7 +43,8 @@ public:
     void shutdown();
 
     // User actions
-    void saveReplay();
+    SaveReplayResult saveReplay();
+    static void showSaveFeedback(SaveReplayResult result);
     void toggleReplay();
     // Applies the "enabled" state (e.g. from Geode settings) to the running recorder
     void setReplayEnabled(bool enabled);

@@ -501,7 +501,8 @@ void ReplayPopup::setupDashboardTab(CCNode* page, CCSize const& winSize, float c
     std::string saveLabel = getSaveKeybindLabel();
     auto saveSpr = ButtonSprite::create(saveLabel.c_str(), "goldFont.fnt", "GJ_button_01.png", 0.75f);
     auto saveBtn = CCMenuItemExt::createSpriteExtra(saveSpr, [this](auto*) {
-        ReplayManager::get()->saveReplay();
+        auto res = ReplayManager::get()->saveReplay();
+        ReplayManager::showSaveFeedback(res);
         this->updateStatusDisplay(0.0f);
     });
     setBtnScale(saveBtn, 0.68f);

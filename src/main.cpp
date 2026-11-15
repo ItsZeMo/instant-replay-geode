@@ -40,7 +40,8 @@ static void addReplayButtonToMenu(CCNode* menu, CCObject* target, SEL_MenuHandle
 
 static void triggerSaveReplay() {
     geode::log::info("Instant Replay: Keybind triggered Save Replay");
-    ReplayManager::get()->saveReplay();
+    auto res = ReplayManager::get()->saveReplay();
+    ReplayManager::showSaveFeedback(res);
 }
 
 static void triggerToggleReplay() {
