@@ -4,7 +4,19 @@
 - **SDK, Build & Documentation:**
   - Updated target Geode SDK to `v5.11.2` (Geometry Dash `2.2081`).
   - Added GitHub Actions Windows x64 build workflow (`.github/workflows/build.yml`).
-  - Updated `AGENTS.md` (main-thread invariant #6), `README.md`, and `about.md`.
+  - Updated `AGENTS.md` (main-thread invariant #6, session-fixed resolution, pre-warm, recovery, `262144`-frame ring buffer), `README.md`, and `about.md`.
+
+- **Capture, Audio & Encoding Pipeline:**
+  - Added asynchronous next-segment encoder pre-warming (`m_prepareThread`) at `25 s` of the `30 s` segment cycle (capped at `<= 2` live encoders), sample-accurate boundary audio splitting across continuation segments, and non-blocking `F6` replay saving (segment finalization and concatenation run off the worker thread).
+  - Locked capture/encoder resolution for the entire recording session (`FrameGrabber::setTargetResolution`) with aspect-preserving letterbox/pillarbox scaling on window resize, eliminating mid-session resolution splits.
+  - Handled OpenGL context switches (`wglGetCurrentContext`) by recreating PBO/FBO/RBO resources cleanly, and replaced permanent FBO-blit disablement with a 5-second retry cooldown.
+  - Stopped recording immediately on fatal storage errors (`ERROR_DISK_FULL`, `ERROR_ACCESS_DENIED`, `ERROR_WRITE_PROTECT`), attempted one encoder recreation/fallback before stopping on repeated non-storage write failures, and passed `CODECAPI_*` parameters via `IMFAttributes` into `SetInputMediaType` while logging `ICodecAPI` errors and effective rate-control mode.
+  - Enlarged the FMOD game audio SPSC ring buffer from `65536` (`~1.36 s`) to `262144` stereo frames (`~5.46 s` at `48 kHz`).
+
+- **UI, Responsiveness & Storage Isolation:**
+  - Moved `Stop Recording` teardown (`m_stopThread` / `"Stopping..."` UI state) and WASAPI microphone device enumeration (`m_micEnumTask`) off the main thread, eliminated `ExportThread` synchronous waiting under lock on back-to-back `F6` presses with explicit user feedback when recording is off or an export is already in flight, and switched folder opening to `geode::utils::file::openFolder` on a background thread.
+  - Updated `ReplayPopup` action button layout when the Toggle Replay button text changes so buttons re-align cleanly without overlap.
+  - Isolated temporary segments into per-process `pid_<PID>` subdirectories protected by exclusive `session.lock` handles, hardened orphaned directory cleanup with non-throwing `directory_iterator` loops, and fixed GPU vendor matching so `"Microsoft Corporation"` never false-matches `"AMF"`.
 
 ## v1.0.4
 - **Stability, Threading & Resource Management:**
