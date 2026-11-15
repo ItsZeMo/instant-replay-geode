@@ -8,7 +8,7 @@ This document provides the complete architectural context, invariants, and build
 
 - **Mod ID:** `zemo.instant-replay`
 - **Target Platform:** Windows 64-bit (`WIN32` / `x86_64`, guarded by `#ifdef GEODE_IS_WINDOWS`)
-- **Target Game / Loader:** Geometry Dash `2.2081`, Geode SDK `v5.10.1`
+- **Target Game / Loader:** Geometry Dash `2.2081`, Geode SDK `v5.11.2`
 - **Language Standard:** C++23 (`clang-cl` or MSVC)
 - **Purpose:** ShadowPlay-style background instant replay recorder for Geometry Dash. Continuously records rolling 30-second MP4 segments in the background using hardware-accelerated Windows Media Foundation encoders and lossless segment remuxing when the user presses `F6` (Save Replay).
 
@@ -91,6 +91,8 @@ instant-replay-geode/
    In `ReplayPopup::refreshUI()` and `updateFolderDisplay()`, always check `!isInputFocused(input)` before calling `input->setString(...)`, otherwise typing multi-digit numbers (like `"35"` or `"100"`) will clobber the user's input mid-keystroke.
 5. **Clean Shutdown & COM Lifetime:**
    `ReplayManager::shutdown()` is hooked on `$on_game(Exiting)` in `src/main.cpp` so OpenGL FBOs/PBOs and FMOD DSPs are released while the GL context and FMOD system are still valid. All `ComRef` wrappers on worker/WASAPI threads must be destroyed before `CoUninitialize()`.
+6. **Main-Thread-Only Cocos2d / GD APIs, `Notification`, and `FMODAudioEngine`:**
+   Never call cocos2d-x APIs, Geometry Dash classes, `geode::Notification` / `ReplayNotification`, or `FMODAudioEngine` from worker, finalize, prepare, export, WASAPI, or FMOD mixer threads. Marshal all UI/notification/audio-engine actions via `geode::queueInMainThread`.
 
 ---
 

@@ -1,0 +1,22 @@
+name: Build Geode Mod
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: geode-sdk/build-geode-mod@main
+        id: build
+        with:
+          sdk: given
+          cli: v3.9.0
+          target: Win64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: instant-replay-win64
+          path: ${{ steps.build.outputs.build-output }}

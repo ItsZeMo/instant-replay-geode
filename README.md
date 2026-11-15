@@ -1,7 +1,7 @@
 # 🎬 Instant Replay for Geometry Dash (Geode)
 
 > **Developer:** ZeMo (`zemo.instant-replay`)  
-> **Platform:** Windows 64-bit | **Geometry Dash:** `2.2081` | **Geode SDK:** `v5.10.1` | **Standard:** C++23
+> **Platform:** Windows 64-bit | **Geometry Dash:** `2.2081` | **Geode SDK:** `v5.11.2` | **Standard:** C++23
 
 Hardware-accelerated, ShadowPlay-style background **Instant Replay** recorder built natively into Geometry Dash. Continuously buffers the last `N` seconds of gameplay (5s – 3600s) into rolling segments and exports an MP4 on demand (`F6`) with zero FPS drop.
 
@@ -43,7 +43,7 @@ flowchart LR
 | [`AGENTS.md`](./AGENTS.md) | Comprehensive architectural & invariant guide for LLMs and developers |
 | [`changelog.md`](./changelog.md) | Release changelog |
 | [`LICENSE`](./LICENSE) | MIT License |
-| [`src/main.cpp`](./src/main.cpp) | Hooks (`AppDelegate`, `CCEGLView`, `FMODAudioEngine`, menus), keybinds & setting listeners |
+| [`src/main.cpp`](./src/main.cpp) | Hooks (`$on_game(Exiting)`, `CCEGLView`, `FMODAudioEngine`, menus), keybinds & setting listeners |
 | [`src/config/ReplayConfig.hpp`](./src/config/ReplayConfig.hpp) | Thread-safe configuration, snapshots, disk space estimators & `mod.json` sync |
 | [`src/capture/FrameGrabber.cpp`](./src/capture/FrameGrabber.cpp) | OpenGL FBO downscaler, async PBO pixel readback, and reusable frame buffer pool |
 | [`src/capture/AudioGrabber.cpp`](./src/capture/AudioGrabber.cpp) | Lock-free FMOD DSP game audio ring buffer & stateful WASAPI microphone capture |
@@ -57,7 +57,7 @@ flowchart LR
 
 ## 🛠️ Building (Windows)
 
-1. Install [Geode CLI](https://github.com/geode-sdk/cli), [Geode SDK v5.10.1+](https://github.com/geode-sdk/geode), CMake 3.21+, Ninja, and Visual Studio 2022 / LLVM (`clang-cl`).
+1. Install [Geode CLI](https://github.com/geode-sdk/cli), [Geode SDK v5.11.2](https://github.com/geode-sdk/geode), CMake 3.21+, Ninja, and Visual Studio 2022 / LLVM (`clang-cl`).
 2. Ensure `GEODE_SDK` points to your Geode SDK directory.
 3. Run:
    ```powershell

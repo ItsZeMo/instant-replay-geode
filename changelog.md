@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.0.5
+- **SDK, Build & Documentation:**
+  - Updated target Geode SDK to `v5.11.2` (Geometry Dash `2.2081`).
+  - Added GitHub Actions Windows x64 build workflow (`.github/workflows/build.yml`).
+  - Updated `AGENTS.md` (main-thread invariant #6), `README.md`, and `about.md`.
+
 ## v1.0.4
 - **Stability, Threading & Resource Management:**
   - Restored non-blocking `MF_SINK_WRITER_DISABLE_THROTTLING` on `IMFSinkWriter` paired with bounded in-flight video frame tracking (`MAX_IN_FLIGHT_ENCODER_FRAMES = 16`) and continuous `100 ms` silence synthesis on idle audio streams (`> 200 ms` behind video), preventing potential deadlocks on stop/exit when e.g. microphone capture is enabled with no mic connected.
@@ -19,7 +25,6 @@
   - Removed all synchronous filesystem checks from the main UI thread; disk space monitoring in `ReplayPopup` now runs asynchronously via `geode::async::TaskHolder` + `runtime().spawnBlocking`.
   - Normalized custom save/temp paths (stripping quotes, whitespace, and trailing slashes to prevent duplicate `GeometryDash_InstantReplay` subfolders, rejecting regular files and missing drives, and cleaning previous temp directories on change).
   - Properly disabled, unfocused, and dimmed all locked `TextInput`, `Slider`, toggle, and preset controls during active recording (including guarding async folder-picker callbacks), added dirty-state tracking so closing `ReplayPopup` without edits avoids redundant disk writes, and fixed UTF-8 path suffix truncation.
-  - Fixed `.github/workflows/antigravity-agent.yml` checksum verification and push permissions.
 
 ## v1.0.3
 - **Stability & Crash Prevention:**

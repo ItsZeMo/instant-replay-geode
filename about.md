@@ -1,7 +1,7 @@
 # 🎬 Instant Replay
 
 > **Developer:** **ZeMo**  
-> **Version:** **v1.0.2** | **Platform:** Windows 64-bit (Geometry Dash 2.2081 / Geode v5.10.1)
+> **Version:** **v1.0.5** | **Platform:** Windows 64-bit (Geometry Dash 2.2081 / Geode v5.11.2)
 
 Never lose an epic demon completion, new best, or hilarious fail again! **Instant Replay** brings high-performance, background replay recording directly into Geometry Dash with zero FPS impact, GPU hardware acceleration, adaptive bitrate, multi-track audio, and seamless Geode integration.
 
@@ -29,7 +29,7 @@ Never lose an epic demon completion, new best, or hilarious fail again! **Instan
 * **Separate Audio Tracks:** Game sound and microphone are recorded into **two separate, independent audio streams** inside the single MP4 container. When opened in *Adobe Premiere Pro, DaVinci Resolve,* or *Sony Vegas*, you can adjust voice and game volume independently!
 * **Low-Latency WASAPI Capture:** Ultra-low latency event-driven WASAPI capture eliminates lag and maintains microsecond lockstep synchronization with video.
 * **Native RobTop Sliders:** Precise volume sliders with live percentage indicators for both Game and Microphone audio.
-* **Microphone Device Selector:** Cycle through any physical microphone plugged into your PC (USB mics, headsets, Realtek audio) with instant live hot-swapping.
+* **Microphone Device Selector:** Cycle through any physical microphone plugged into your PC (USB mics, headsets, Realtek audio) while recording is stopped.
 
 ### 👁️ In-Game UI & Overlay Capture
 * Frame grabbing captures the screen right before display presentation. Your **in-game UI, FPS counters, Geode overlays, and custom texture packs** are cleanly captured in your replays!
@@ -57,7 +57,7 @@ Never lose an epic demon completion, new best, or hilarious fail again! **Instan
 1. Launch Geometry Dash.
 2. Press **`F9`** (or click the Instant Replay icon on the Main Menu / Pause Menu).
 3. On the **Dashboard** tab, select your desired replay duration (e.g., 2 minutes).
-4. Verify the status: a green dot with **`Replay: 0:00 / 2:00`** confirms background replay is recording.
+4. Verify the status: a green dot with **`Replay Active (Settings Locked)`** confirms background replay is recording.
 5. Play normally! When you achieve a victory or new best, press **`F6`**. A notification will confirm the save, and your MP4 will be saved to your recordings folder.
 
 ### 2. Recommended Codec Settings by GPU
