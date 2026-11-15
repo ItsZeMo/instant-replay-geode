@@ -52,6 +52,7 @@ void FrameGrabber::initialize() {
     MediaFoundationEncoder::globalInitialize();
     (void)ReplayConfig::getGpuAccelName();
 
+    m_glContext = wglGetCurrentContext();
     m_hasPbo = glGenBuffers && glBindBuffer && glBufferData && glMapBuffer && glUnmapBuffer;
     if (m_hasPbo) {
         glGenBuffers(2, m_pbos);
@@ -61,6 +62,10 @@ void FrameGrabber::initialize() {
                 glGenRenderbuffers && glBindRenderbuffer && glRenderbufferStorage &&
                 glFramebufferRenderbuffer && glCheckFramebufferStatus;
 
+    m_blitRetryAfter = {};
+    m_failedBlitW = 0;
+    m_failedBlitH = 0;
+    m_blitFailLogged = false;
     resetRenderThreadState();
     m_initialized = true;
 }
@@ -91,9 +96,7 @@ void FrameGrabber::setCapturing(bool active) {
     }
 }
 
-void FrameGrabber::cleanup(bool glContextValid) {
-    m_capturing.store(false, std::memory_order_release);
-    m_captureEpoch.fetch_add(1, std::memory_order_acq_rel);
+void FrameGrabber::resetGlResources(bool glContextValid) noexcept {
     if (glContextValid && m_initialized) {
         if (m_pbos[0] != 0 && glDeleteBuffers) {
             glDeleteBuffers(2, m_pbos);
@@ -110,8 +113,19 @@ void FrameGrabber::cleanup(bool glContextValid) {
     m_rbo = 0;
     m_fboWidth = m_fboHeight = 0;
     m_pboCapacity[0] = m_pboCapacity[1] = 0;
+    m_glContext = nullptr;
+    m_blitRetryAfter = {};
+    m_failedBlitW = 0;
+    m_failedBlitH = 0;
+    m_blitFailLogged = false;
     resetRenderThreadState();
     m_initialized = false;
+}
+
+void FrameGrabber::cleanup(bool glContextValid) {
+    m_capturing.store(false, std::memory_order_release);
+    m_captureEpoch.fetch_add(1, std::memory_order_acq_rel);
+    resetGlResources(glContextValid);
 
     std::lock_guard<std::mutex> lock(m_poolMutex);
     m_framePool.clear();
@@ -169,8 +183,11 @@ void FrameGrabber::recycleFrame(std::shared_ptr<CapturedFrame> frame) {
     }
 }
 
-bool FrameGrabber::ensureScaleTarget(int width, int height) {
+bool FrameGrabber::ensureScaleTarget(int width, int height, std::chrono::steady_clock::time_point now) {
     if (m_fbo && m_fboWidth == width && m_fboHeight == height) return true;
+    if (width == m_failedBlitW && height == m_failedBlitH && now < m_blitRetryAfter) {
+        return false;
+    }
 
     GLint prevRbo = 0, prevDraw = 0;
     glGetIntegerv(GL_RENDERBUFFER_BINDING, &prevRbo);
@@ -184,15 +201,30 @@ bool FrameGrabber::ensureScaleTarget(int width, int height) {
 
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_fbo);
     glFramebufferRenderbuffer(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, m_rbo);
-    bool ok = glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+    GLenum status = glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER);
+    bool ok = (status == GL_FRAMEBUFFER_COMPLETE);
 
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, prevDraw);
     glBindRenderbuffer(GL_RENDERBUFFER, prevRbo);
 
     if (!ok) {
-        m_hasBlit = false; // fall back to CPU scaling permanently
+        m_fboWidth = 0;
+        m_fboHeight = 0;
+        m_failedBlitW = width;
+        m_failedBlitH = height;
+        m_blitRetryAfter = now + std::chrono::seconds(5);
+        if (!m_blitFailLogged) {
+            m_blitFailLogged = true;
+            geode::log::warn(
+                "FrameGrabber: FBO scale target {}x{} incomplete (status 0x{:X}), temporarily falling back to CPU scale",
+                width, height, static_cast<unsigned int>(status));
+        }
         return false;
     }
+    m_failedBlitW = 0;
+    m_failedBlitH = 0;
+    m_blitRetryAfter = {};
+    m_blitFailLogged = false;
     m_fboWidth = width;
     m_fboHeight = height;
     return true;
@@ -322,7 +354,13 @@ void FrameGrabber::captureCurrentFrame() {
         m_nextCaptureTime = now;
     }
 
+    HGLRC curCtx = wglGetCurrentContext();
     if (!m_initialized) {
+        initialize();
+    } else if (curCtx && curCtx != m_glContext) {
+        geode::log::warn("FrameGrabber: OpenGL context changed ({} -> {}), recreating GL resources",
+            static_cast<const void*>(m_glContext), static_cast<const void*>(curCtx));
+        resetGlResources(false);
         initialize();
     }
 
@@ -368,7 +406,7 @@ void FrameGrabber::captureCurrentFrame() {
     // 1. Scale the back buffer to the session-fixed encoder size with aspect-preserving bars
     int readW = srcW & ~1;
     int readH = srcH & ~1;
-    if (m_hasBlit && ensureScaleTarget(dstW, dstH)) {
+    if (m_hasBlit && ensureScaleTarget(dstW, dstH, now)) {
         DestRect rect = computeAspectFitRect(srcW, srcH, dstW, dstH);
         GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
         if (scissor) glDisable(GL_SCISSOR_TEST);

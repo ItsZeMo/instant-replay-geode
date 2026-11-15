@@ -58,10 +58,11 @@ private:
     FrameGrabber();
     ~FrameGrabber();
 
-    bool ensureScaleTarget(int width, int height);
+    bool ensureScaleTarget(int width, int height, std::chrono::steady_clock::time_point now);
     void ensurePbo(int index, size_t bytes);
     std::shared_ptr<CapturedFrame> acquireFrame(size_t requiredBytes);
     void resetRenderThreadState() noexcept;
+    void resetGlResources(bool glContextValid) noexcept;
 
     std::atomic<bool> m_capturing{false};
     std::atomic<uint64_t> m_captureEpoch{0};
@@ -72,6 +73,11 @@ private:
     bool m_initialized = false;
     bool m_hasPbo = false;
     bool m_hasBlit = false;
+    HGLRC m_glContext = nullptr;
+    std::chrono::steady_clock::time_point m_blitRetryAfter{};
+    int m_failedBlitW = 0;
+    int m_failedBlitH = 0;
+    bool m_blitFailLogged = false;
 
     // GPU downscale target (FBO + renderbuffer)
     unsigned int m_fbo = 0;

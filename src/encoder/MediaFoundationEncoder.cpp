@@ -48,12 +48,32 @@ bool isPermanentCodecUnsupported(HRESULT hr) noexcept {
            hr == E_NOTIMPL;
 }
 
+const char* requestedRateControlName(RateControlMode mode) noexcept {
+    switch (mode) {
+        case RateControlMode::ADAPTIVE_VBR: return "AdaptiveVBR";
+        case RateControlMode::CONSTANT_CBR: return "CBR";
+        case RateControlMode::CONSTANT_QUALITY: return "Quality";
+        default: return "Unknown";
+    }
+}
+
+const char* rateControlModeName(ULONG mode) noexcept {
+    switch (mode) {
+        case eAVEncCommonRateControlMode_CBR: return "CBR";
+        case eAVEncCommonRateControlMode_PeakConstrainedVBR: return "PeakConstrainedVBR";
+        case eAVEncCommonRateControlMode_UnconstrainedVBR: return "UnconstrainedVBR";
+        case eAVEncCommonRateControlMode_Quality: return "Quality";
+        default: return "Other";
+    }
+}
+
 // Session-wide codec cache: avoids re-probing missing hardware codecs every 30s,
 // while never pinning transient HW/session-limit failures to a lower codec or SW (#9, #10).
 std::mutex s_codecCacheMutex;
 std::string s_cachedRequestKey;
 std::string s_confirmedPrimaryKey;
 std::string s_lastLoggedCodecKey;
+std::string s_lastLoggedRcKey;
 GUID s_cachedSubtype = MFVideoFormat_H264;
 bool s_cachedHardware = true;
 bool s_hasCachedCodec = false;
@@ -73,6 +93,7 @@ void MediaFoundationEncoder::resetCodecCache() {
     s_cachedRequestKey.clear();
     s_confirmedPrimaryKey.clear();
     s_lastLoggedCodecKey.clear();
+    s_lastLoggedRcKey.clear();
     s_hasCachedCodec = false;
 }
 
@@ -374,7 +395,17 @@ bool MediaFoundationEncoder::tryStartLocked(
         if (FAILED(hr)) return recordFail(hr, "AddStream(video): " + hrToString(hr));
     }
 
-    // 2. Video input format (RGB32 / BGRA uncompressed) - this is where a missing encoder is detected
+    // 2. Video input format (RGB32 / BGRA uncompressed) + pre-negotiation encoding parameters
+    const UINT32 meanBps = static_cast<UINT32>(p.bitrateMbps) * 1000000u;
+    const UINT32 maxBps = static_cast<UINT32>(p.maxBitrateMbps) * 1000000u;
+    const UINT32 clampedQuality = static_cast<UINT32>(std::clamp(p.qualityLevel, 1, 100));
+    ULONG targetRcMode = eAVEncCommonRateControlMode_PeakConstrainedVBR;
+    if (p.rateControl == RateControlMode::CONSTANT_CBR) {
+        targetRcMode = eAVEncCommonRateControlMode_CBR;
+    } else if (p.rateControl == RateControlMode::CONSTANT_QUALITY) {
+        targetRcMode = eAVEncCommonRateControlMode_Quality;
+    }
+
     {
         ComRef<IMFMediaType> videoIn;
         hr = MFCreateMediaType(videoIn.put());
@@ -390,38 +421,93 @@ bool MediaFoundationEncoder::tryStartLocked(
         videoIn->SetUINT32(MF_MT_DEFAULT_STRIDE, static_cast<UINT32>(-(static_cast<LONG>(p.width) * 4)));
         videoIn->SetUINT32(MF_MT_FIXED_SIZE_SAMPLES, TRUE);
         videoIn->SetUINT32(MF_MT_SAMPLE_SIZE, static_cast<UINT32>(p.width) * p.height * 4);
-        hr = m_sinkWriter->SetInputMediaType(m_videoStreamIndex, videoIn.get(), NULL);
+
+        ComRef<IMFAttributes> encParams;
+        if (SUCCEEDED(MFCreateAttributes(encParams.put(), 4)) && encParams) {
+            encParams->SetUINT32(CODECAPI_AVEncCommonRateControlMode, targetRcMode);
+            if (p.rateControl == RateControlMode::ADAPTIVE_VBR) {
+                encParams->SetUINT32(CODECAPI_AVEncCommonMeanBitRate, meanBps);
+                encParams->SetUINT32(CODECAPI_AVEncCommonMaxBitRate, maxBps);
+            } else if (p.rateControl == RateControlMode::CONSTANT_CBR) {
+                encParams->SetUINT32(CODECAPI_AVEncCommonMeanBitRate, meanBps);
+            } else if (p.rateControl == RateControlMode::CONSTANT_QUALITY) {
+                encParams->SetUINT32(CODECAPI_AVEncCommonQuality, clampedQuality);
+            }
+            encParams->SetUINT32(CODECAPI_AVEncMPVGOPSize, gopFrames);
+        }
+
+        hr = m_sinkWriter->SetInputMediaType(m_videoStreamIndex, videoIn.get(), encParams.get());
+        if (FAILED(hr) && encParams && !isPermanentCodecUnsupported(hr)) {
+            HRESULT retryHr = m_sinkWriter->SetInputMediaType(m_videoStreamIndex, videoIn.get(), NULL);
+            if (SUCCEEDED(retryHr)) {
+                geode::log::warn(
+                    "Instant Replay: {} ({}) rejected pEncodingParameters ({}), falling back to ICodecAPI",
+                    subtypeName(subtype), hardware ? "HW" : "SW", hrToString(hr));
+                hr = retryHr;
+            }
+        }
         if (FAILED(hr)) return recordFail(hr, "SetInputMediaType(video): " + hrToString(hr));
     }
 
-    // 3. Rate control + keyframe interval via ICodecAPI (best effort: not every MFT supports every property)
+    // 3. Rate control + keyframe interval via ICodecAPI (log failures & verify effective RC mode once per config)
     {
+        std::string rcLogKey = std::string(subtypeName(subtype)) + "|" + (hardware ? "hw" : "sw") + "|" + requestedRateControlName(p.rateControl);
+        bool logRcOnce = false;
+        {
+            std::lock_guard<std::mutex> cacheLock(s_codecCacheMutex);
+            if (s_lastLoggedRcKey != rcLogKey) {
+                s_lastLoggedRcKey = rcLogKey;
+                logRcOnce = true;
+            }
+        }
+
         ComRef<ICodecAPI> codecApi;
         hr = m_sinkWriter->GetServiceForStream(m_videoStreamIndex, GUID_NULL, __uuidof(ICodecAPI), (void**)codecApi.put());
         if (SUCCEEDED(hr) && codecApi) {
-            VARIANT var;
-            VariantInit(&var);
-            var.vt = VT_UI4;
+            auto setCodecU32 = [&](const GUID& prop, const char* propName, ULONG value) {
+                VARIANT var;
+                VariantInit(&var);
+                var.vt = VT_UI4;
+                var.ulVal = value;
+                HRESULT setHr = codecApi->SetValue(&prop, &var);
+                if (FAILED(setHr)) {
+                    geode::log::warn("Instant Replay: {} ({}) ICodecAPI::SetValue({}) failed: {}",
+                        subtypeName(subtype), hardware ? "HW" : "SW", propName, hrToString(setHr));
+                }
+            };
+
             if (p.rateControl == RateControlMode::ADAPTIVE_VBR) {
-                var.ulVal = eAVEncCommonRateControlMode_PeakConstrainedVBR;
-                codecApi->SetValue(&CODECAPI_AVEncCommonRateControlMode, &var);
-                var.ulVal = static_cast<ULONG>(p.bitrateMbps) * 1000000u;
-                codecApi->SetValue(&CODECAPI_AVEncCommonMeanBitRate, &var);
-                var.ulVal = static_cast<ULONG>(p.maxBitrateMbps) * 1000000u;
-                codecApi->SetValue(&CODECAPI_AVEncCommonMaxBitRate, &var);
+                setCodecU32(CODECAPI_AVEncCommonRateControlMode, "RateControlMode(PeakConstrainedVBR)", targetRcMode);
+                setCodecU32(CODECAPI_AVEncCommonMeanBitRate, "MeanBitRate", meanBps);
+                setCodecU32(CODECAPI_AVEncCommonMaxBitRate, "MaxBitRate", maxBps);
             } else if (p.rateControl == RateControlMode::CONSTANT_CBR) {
-                var.ulVal = eAVEncCommonRateControlMode_CBR;
-                codecApi->SetValue(&CODECAPI_AVEncCommonRateControlMode, &var);
-                var.ulVal = static_cast<ULONG>(p.bitrateMbps) * 1000000u;
-                codecApi->SetValue(&CODECAPI_AVEncCommonMeanBitRate, &var);
+                setCodecU32(CODECAPI_AVEncCommonRateControlMode, "RateControlMode(CBR)", targetRcMode);
+                setCodecU32(CODECAPI_AVEncCommonMeanBitRate, "MeanBitRate", meanBps);
             } else if (p.rateControl == RateControlMode::CONSTANT_QUALITY) {
-                var.ulVal = eAVEncCommonRateControlMode_Quality;
-                codecApi->SetValue(&CODECAPI_AVEncCommonRateControlMode, &var);
-                var.ulVal = static_cast<ULONG>(std::clamp(p.qualityLevel, 1, 100));
-                codecApi->SetValue(&CODECAPI_AVEncCommonQuality, &var);
+                setCodecU32(CODECAPI_AVEncCommonRateControlMode, "RateControlMode(Quality)", targetRcMode);
+                setCodecU32(CODECAPI_AVEncCommonQuality, "Quality", clampedQuality);
             }
-            var.ulVal = static_cast<ULONG>(gopFrames);
-            codecApi->SetValue(&CODECAPI_AVEncMPVGOPSize, &var);
+            setCodecU32(CODECAPI_AVEncMPVGOPSize, "MPVGOPSize", gopFrames);
+
+            if (logRcOnce) {
+                VARIANT readVar;
+                VariantInit(&readVar);
+                HRESULT getHr = codecApi->GetValue(&CODECAPI_AVEncCommonRateControlMode, &readVar);
+                if (SUCCEEDED(getHr) && (readVar.vt == VT_UI4 || readVar.vt == VT_I4)) {
+                    ULONG actual = (readVar.vt == VT_UI4) ? readVar.ulVal : static_cast<ULONG>(readVar.lVal);
+                    geode::log::info("Instant Replay: {} ({}) effective rate control: {} (mode={}, requested={})",
+                        subtypeName(subtype), hardware ? "HW" : "SW",
+                        rateControlModeName(actual), actual, requestedRateControlName(p.rateControl));
+                } else {
+                    geode::log::info("Instant Replay: {} ({}) rate control readback unavailable ({}, requested={})",
+                        subtypeName(subtype), hardware ? "HW" : "SW",
+                        hrToString(getHr), requestedRateControlName(p.rateControl));
+                }
+                VariantClear(&readVar);
+            }
+        } else if (logRcOnce) {
+            geode::log::info("Instant Replay: {} ({}) ICodecAPI unavailable ({}), using pEncodingParameters only",
+                subtypeName(subtype), hardware ? "HW" : "SW", hrToString(hr));
         }
     }
 
