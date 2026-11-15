@@ -70,11 +70,23 @@ void FrameGrabber::clearPool() {
     m_framePool.clear();
 }
 
+void FrameGrabber::setTargetResolution(int width, int height) noexcept {
+    if (width >= 16 && height >= 16) {
+        m_sessionTargetW.store(width & ~1, std::memory_order_release);
+        m_sessionTargetH.store(height & ~1, std::memory_order_release);
+    } else {
+        m_sessionTargetW.store(0, std::memory_order_release);
+        m_sessionTargetH.store(0, std::memory_order_release);
+    }
+}
+
 void FrameGrabber::setCapturing(bool active) {
     // Only touch atomics and mutex-guarded pool here; render-thread fields reset via m_captureEpoch (#12).
     m_captureEpoch.fetch_add(1, std::memory_order_acq_rel);
     m_capturing.store(active, std::memory_order_release);
     if (!active) {
+        m_sessionTargetW.store(0, std::memory_order_release);
+        m_sessionTargetH.store(0, std::memory_order_release);
         clearPool();
     }
 }
@@ -193,16 +205,59 @@ void FrameGrabber::ensurePbo(int index, size_t bytes) {
     m_pboCapacity[index] = bytes;
 }
 
-// Nearest-neighbour BGRA resize (only used when FBO blit is unavailable)
+struct DestRect {
+    int x0 = 0;
+    int y0 = 0;
+    int x1 = 0;
+    int y1 = 0;
+    bool hasBars = false;
+};
+
+static DestRect computeAspectFitRect(int srcW, int srcH, int dstW, int dstH) noexcept {
+    if (srcW <= 0 || srcH <= 0 || dstW <= 0 || dstH <= 0) {
+        return {0, 0, dstW, dstH, false};
+    }
+    int64_t lhs = static_cast<int64_t>(srcW) * dstH;
+    int64_t rhs = static_cast<int64_t>(dstW) * srcH;
+    int64_t diff = (lhs >= rhs) ? (lhs - rhs) : (rhs - lhs);
+    if (diff <= std::max<int64_t>(srcH, dstH)) {
+        return {0, 0, dstW, dstH, false};
+    }
+
+    int fitW = dstW;
+    int fitH = dstH;
+    if (lhs > rhs) {
+        fitH = std::max(1, static_cast<int>((static_cast<int64_t>(dstW) * srcH + srcW / 2) / srcW));
+    } else {
+        fitW = std::max(1, static_cast<int>((static_cast<int64_t>(dstH) * srcW + srcH / 2) / srcH));
+    }
+    fitW = std::min(fitW, dstW);
+    fitH = std::min(fitH, dstH);
+    int x0 = (dstW - fitW) / 2;
+    int y0 = (dstH - fitH) / 2;
+    bool hasBars = (x0 > 0 || y0 > 0 || fitW < dstW || fitH < dstH);
+    return {x0, y0, x0 + fitW, y0 + fitH, hasBars};
+}
+
+// Nearest-neighbour BGRA resize with aspect-preserving letterbox/pillarbox bars
+// (only used when FBO blit is unavailable)
 static void resizeNearest(const uint8_t* src, int sw, int sh, uint8_t* dst, int dw, int dh) {
     const uint32_t* s = reinterpret_cast<const uint32_t*>(src);
     uint32_t* d = reinterpret_cast<uint32_t*>(dst);
-    for (int y = 0; y < dh; ++y) {
-        int sy = std::min(sh - 1, static_cast<int>((static_cast<int64_t>(y) * sh) / dh));
+    DestRect rect = computeAspectFitRect(sw, sh, dw, dh);
+    if (rect.hasBars) {
+        std::fill_n(d, static_cast<size_t>(dw) * dh, 0xFF000000u);
+    }
+    int fitW = rect.x1 - rect.x0;
+    int fitH = rect.y1 - rect.y0;
+    if (fitW <= 0 || fitH <= 0) return;
+
+    for (int y = 0; y < fitH; ++y) {
+        int sy = std::min(sh - 1, static_cast<int>((static_cast<int64_t>(y) * sh) / fitH));
         const uint32_t* row = s + static_cast<size_t>(sy) * sw;
-        uint32_t* out = d + static_cast<size_t>(y) * dw;
-        for (int x = 0; x < dw; ++x) {
-            int sx = std::min(sw - 1, static_cast<int>((static_cast<int64_t>(x) * sw) / dw));
+        uint32_t* out = d + static_cast<size_t>(rect.y0 + y) * dw + rect.x0;
+        for (int x = 0; x < fitW; ++x) {
+            int sx = std::min(sw - 1, static_cast<int>((static_cast<int64_t>(x) * sw) / fitW));
             out[x] = row[sx];
         }
     }
@@ -289,7 +344,15 @@ void FrameGrabber::captureCurrentFrame() {
     }
     if (srcW < 16 || srcH < 16) return;
 
-    auto [dstW, dstH] = config.getResolutionDimensions(srcW, srcH);
+    int dstW = m_sessionTargetW.load(std::memory_order_acquire);
+    int dstH = m_sessionTargetH.load(std::memory_order_acquire);
+    if (dstW <= 0 || dstH <= 0) {
+        auto [w, h] = config.getResolutionDimensions(srcW, srcH);
+        dstW = w;
+        dstH = h;
+        m_sessionTargetW.store(dstW, std::memory_order_release);
+        m_sessionTargetH.store(dstH, std::memory_order_release);
+    }
 
     GLint prevRead = 0, prevDraw = 0, prevPack = 4;
     GLint prevReadBuffer = GL_BACK, prevDrawBuffer = GL_BACK;
@@ -302,10 +365,11 @@ void FrameGrabber::captureCurrentFrame() {
     glGetIntegerv(GL_PACK_ALIGNMENT, &prevPack);
     glPixelStorei(GL_PACK_ALIGNMENT, 4);
 
-    // 1. Scale the back buffer to the encoder size on the GPU
+    // 1. Scale the back buffer to the session-fixed encoder size with aspect-preserving bars
     int readW = srcW & ~1;
     int readH = srcH & ~1;
     if (m_hasBlit && ensureScaleTarget(dstW, dstH)) {
+        DestRect rect = computeAspectFitRect(srcW, srcH, dstW, dstH);
         GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
         if (scissor) glDisable(GL_SCISSOR_TEST);
 
@@ -313,8 +377,17 @@ void FrameGrabber::captureCurrentFrame() {
         glReadBuffer(GL_BACK);
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_fbo);
         glDrawBuffer(GL_COLOR_ATTACHMENT0);
-        GLenum filter = (srcW == dstW && srcH == dstH) ? GL_NEAREST : GL_LINEAR;
-        glBlitFramebuffer(0, 0, srcW, srcH, 0, 0, dstW, dstH, GL_COLOR_BUFFER_BIT, filter);
+        if (rect.hasBars) {
+            GLfloat prevClear[4] = {0.f, 0.f, 0.f, 1.f};
+            glGetFloatv(GL_COLOR_CLEAR_VALUE, prevClear);
+            glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT);
+            glClearColor(prevClear[0], prevClear[1], prevClear[2], prevClear[3]);
+        }
+        int fitW = rect.x1 - rect.x0;
+        int fitH = rect.y1 - rect.y0;
+        GLenum filter = (srcW == fitW && srcH == fitH) ? GL_NEAREST : GL_LINEAR;
+        glBlitFramebuffer(0, 0, srcW, srcH, rect.x0, rect.y0, rect.x1, rect.y1, GL_COLOR_BUFFER_BIT, filter);
         glBindFramebuffer(GL_READ_FRAMEBUFFER, m_fbo);
         glReadBuffer(GL_COLOR_ATTACHMENT0);
 

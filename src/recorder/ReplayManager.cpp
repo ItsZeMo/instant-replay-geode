@@ -319,6 +319,17 @@ void ReplayManager::startReplay() {
         AudioGrabber::get()->stopMicCapture();
     }
 
+    int targetW = 0, targetH = 0;
+    if (auto view = cocos2d::CCEGLView::get()) {
+        auto fs = view->getFrameSize();
+        int initW = static_cast<int>(fs.width);
+        int initH = static_cast<int>(fs.height);
+        if (initW >= 16 && initH >= 16) {
+            std::tie(targetW, targetH) = m_sessionConfig.getResolutionDimensions(initW, initH);
+        }
+    }
+    FrameGrabber::get()->setTargetResolution(targetW, targetH);
+
     m_currentSegmentStart = std::chrono::steady_clock::now();
     FrameGrabber::get()->setCapturing(true);
     {

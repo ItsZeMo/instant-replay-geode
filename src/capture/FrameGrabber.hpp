@@ -38,6 +38,9 @@ public:
     void initialize();
     void cleanup(bool glContextValid = true);
 
+    // Thread-safe: fixes the session output resolution (0,0 = auto-detect on first frame)
+    void setTargetResolution(int width, int height) noexcept;
+
     // Thread-safe: signals capture state change; render-thread state resets on next swap (#12).
     void setCapturing(bool active);
 
@@ -62,6 +65,8 @@ private:
 
     std::atomic<bool> m_capturing{false};
     std::atomic<uint64_t> m_captureEpoch{0};
+    std::atomic<int> m_sessionTargetW{0};
+    std::atomic<int> m_sessionTargetH{0};
     uint64_t m_seenEpoch = 0;
 
     bool m_initialized = false;
