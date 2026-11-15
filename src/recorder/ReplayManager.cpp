@@ -59,6 +59,85 @@ ReplayManager::~ReplayManager() {
     discardPreparedEncoder();
     joinFinalizeThread();
     joinExportThread();
+    releaseSessionLock(false);
+}
+
+namespace {
+bool parsePidFolderName(const std::wstring& name, DWORD& outPid) {
+    if (name.size() <= 4 || name.compare(0, 4, L"pid_") != 0) return false;
+    uint64_t val = 0;
+    for (size_t i = 4; i < name.size(); ++i) {
+        wchar_t c = name[i];
+        if (c < L'0' || c > L'9') return false;
+        val = val * 10 + static_cast<uint64_t>(c - L'0');
+        if (val > 0xFFFFFFFFULL) return false;
+    }
+    outPid = static_cast<DWORD>(val);
+    return outPid != 0;
+}
+
+bool isPidProcessAlive(DWORD pid) {
+    if (pid == 0) return false;
+    if (pid == GetCurrentProcessId()) return true;
+    HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!hProc) {
+        return GetLastError() != ERROR_INVALID_PARAMETER;
+    }
+    DWORD exitCode = 0;
+    bool alive = GetExitCodeProcess(hProc, &exitCode) && exitCode == STILL_ACTIVE;
+    CloseHandle(hProc);
+    return alive;
+}
+} // namespace
+
+void ReplayManager::ensureSessionLock(const std::filesystem::path& pidTempDir) {
+    if (pidTempDir.empty()) return;
+    std::lock_guard<std::mutex> lock(m_sessionLockMutex);
+    if (m_sessionLockHandle != INVALID_HANDLE_VALUE && m_sessionLockDir == pidTempDir) {
+        return;
+    }
+
+    auto lockPath = pidTempDir / L"session.lock";
+    HANDLE hNew = CreateFileW(
+        lockPath.c_str(),
+        GENERIC_READ | GENERIC_WRITE,
+        0, // exclusive lock so live instances are never cleaned by another process
+        nullptr,
+        OPEN_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr
+    );
+    if (hNew == INVALID_HANDLE_VALUE) {
+        geode::log::warn("ReplayManager: failed to lock session file '{}': err={}",
+            geode::utils::string::pathToString(lockPath), GetLastError());
+        return;
+    }
+
+    if (m_sessionLockHandle != INVALID_HANDLE_VALUE) {
+        CloseHandle(m_sessionLockHandle);
+        m_sessionLockHandle = INVALID_HANDLE_VALUE;
+        if (!m_sessionLockDir.empty()) {
+            std::error_code ec;
+            std::filesystem::remove(m_sessionLockDir / L"session.lock", ec);
+            std::filesystem::remove(m_sessionLockDir, ec);
+        }
+    }
+    m_sessionLockHandle = hNew;
+    m_sessionLockDir = pidTempDir;
+}
+
+void ReplayManager::releaseSessionLock(bool removeFiles) {
+    std::lock_guard<std::mutex> lock(m_sessionLockMutex);
+    if (m_sessionLockHandle != INVALID_HANDLE_VALUE) {
+        CloseHandle(m_sessionLockHandle);
+        m_sessionLockHandle = INVALID_HANDLE_VALUE;
+    }
+    if (removeFiles && !m_sessionLockDir.empty()) {
+        std::error_code ec;
+        std::filesystem::remove(m_sessionLockDir / L"session.lock", ec);
+        std::filesystem::remove(m_sessionLockDir, ec);
+    }
+    m_sessionLockDir.clear();
 }
 
 std::filesystem::path ReplayManager::getTempDir(bool createIfMissing) const {
@@ -68,28 +147,94 @@ std::filesystem::path ReplayManager::getTempDir(bool createIfMissing) const {
 void ReplayManager::cleanupTempDir() {
     std::lock_guard<std::mutex> lock(m_segmentMutex);
 
-    auto cleanSingleDir = [this](const std::filesystem::path& dir) {
+    auto cleanSegmentsInDir = [this](const std::filesystem::path& dir) {
         if (dir.empty()) return;
         std::error_code ec;
         if (!std::filesystem::exists(dir, ec) || !std::filesystem::is_directory(dir, ec)) return;
-        for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+        std::filesystem::directory_iterator it(dir, ec);
+        std::filesystem::directory_iterator end;
+        while (!ec && it != end) {
             std::error_code fileEc;
-            if (!entry.is_regular_file(fileEc) || !isSegmentFile(entry.path())) {
+            bool isReg = it->is_regular_file(fileEc);
+            auto entryPath = it->path();
+            it.increment(ec);
+            if (!isReg || !isSegmentFile(entryPath)) {
                 continue;
             }
-            auto wpath = entry.path().wstring();
+            auto wpath = entryPath.wstring();
             if (m_exportLockedSegments.find(wpath) != m_exportLockedSegments.end()) {
                 m_deferredDeletes.push_back(wpath);
             } else {
-                std::filesystem::remove(entry.path(), fileEc);
+                std::filesystem::remove(entryPath, fileEc);
             }
         }
     };
 
+    auto cleanOrphanedPidDirs = [&cleanSegmentsInDir](const std::filesystem::path& baseDir) {
+        if (baseDir.empty()) return;
+        std::error_code ec;
+        if (!std::filesystem::exists(baseDir, ec) || !std::filesystem::is_directory(baseDir, ec)) return;
+        DWORD selfPid = GetCurrentProcessId();
+        std::filesystem::directory_iterator it(baseDir, ec);
+        std::filesystem::directory_iterator end;
+        while (!ec && it != end) {
+            std::error_code dirEc;
+            bool isDir = it->is_directory(dirEc);
+            auto dirPath = it->path();
+            it.increment(ec);
+            if (!isDir) continue;
+
+            DWORD otherPid = 0;
+            if (!parsePidFolderName(dirPath.filename().wstring(), otherPid) || otherPid == selfPid) {
+                continue;
+            }
+
+            auto lockPath = dirPath / L"session.lock";
+            HANDLE hLock = CreateFileW(
+                lockPath.c_str(),
+                GENERIC_READ | GENERIC_WRITE,
+                0,
+                nullptr,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                nullptr
+            );
+            if (hLock == INVALID_HANDLE_VALUE) {
+                DWORD err = GetLastError();
+                if (err == ERROR_SHARING_VIOLATION) {
+                    continue; // active instance holds session.lock
+                }
+                if ((err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND) || isPidProcessAlive(otherPid)) {
+                    continue;
+                }
+            } else if (isPidProcessAlive(otherPid)) {
+                CloseHandle(hLock);
+                continue;
+            }
+
+            cleanSegmentsInDir(dirPath);
+            if (hLock != INVALID_HANDLE_VALUE) {
+                CloseHandle(hLock);
+            }
+            std::error_code rmEc;
+            std::filesystem::remove(lockPath, rmEc);
+            std::filesystem::remove(dirPath, rmEc); // removes only if empty
+        }
+    };
+
     auto curTempDir = getTempDir(false);
-    cleanSingleDir(curTempDir);
+    cleanSegmentsInDir(curTempDir);
     if (!m_lastTempDir.empty() && m_lastTempDir != curTempDir) {
-        cleanSingleDir(m_lastTempDir);
+        cleanSegmentsInDir(m_lastTempDir);
+    }
+
+    auto curBaseDir = ReplayConfig::get().getTempBaseDirectory(false);
+    cleanOrphanedPidDirs(curBaseDir);
+    if (!m_lastTempDir.empty()) {
+        auto lastBaseDir = m_lastTempDir.parent_path();
+        if (!lastBaseDir.empty() && lastBaseDir != curBaseDir) {
+            cleanOrphanedPidDirs(lastBaseDir);
+        }
     }
 }
 
@@ -267,6 +412,7 @@ void ReplayManager::shutdown() {
     AudioGrabber::get()->cleanup();
     FrameGrabber::get()->cleanup(true);
     cleanupTempDir();
+    releaseSessionLock(true);
 }
 
 void ReplayManager::startReplay() {
@@ -1227,6 +1373,7 @@ bool ReplayManager::startNewSegment(
     if (m_videoWidth <= 0 || m_videoHeight <= 0) return false; // wait for first frame
 
     auto tempDir = cfg.getTempDirectory(true);
+    ensureSessionLock(tempDir);
     {
         std::lock_guard<std::mutex> segLock(m_segmentMutex);
         m_lastTempDir = tempDir;
@@ -1375,6 +1522,7 @@ void ReplayManager::startPrepareNextSegment(const ReplayConfig& cfg) {
         HRESULT coHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
 
         auto tempDir = cfg.getTempDirectory(true);
+        ensureSessionLock(tempDir);
         auto segFile = tempDir / (L"seg_" + std::to_wstring(segIdx) + L".mp4");
         std::wstring segPath = segFile.wstring();
 

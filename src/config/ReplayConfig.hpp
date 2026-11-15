@@ -357,7 +357,7 @@ struct ReplayConfig {
 
         if (v.find("nvidia") != std::string::npos || r.find("nvidia") != std::string::npos || r.find("geforce") != std::string::npos) {
             s_cached = "NVENC";
-        } else if (v.find("amd") != std::string::npos || v.find("ati") != std::string::npos || r.find("radeon") != std::string::npos) {
+        } else if (v.starts_with("amd") || v.starts_with("ati") || v.starts_with("advanced micro devices") || r.find("radeon") != std::string::npos) {
             s_cached = "AMF";
         } else if (v.find("intel") != std::string::npos || r.find("intel") != std::string::npos) {
             s_cached = "QSV";
@@ -685,13 +685,28 @@ struct ReplayConfig {
         return p;
     }
 
+    static std::wstring currentPidSubfolder() {
+        return L"pid_" + std::to_wstring(GetCurrentProcessId());
+    }
+
     // When createIfMissing == false, performs zero disk I/O so UI callers never block (#16).
     std::filesystem::path getRecordingsDirectory(bool createIfMissing = false) const {
         return resolveRecordingsDirectory(createIfMissing, createIfMissing);
     }
 
-    std::filesystem::path getTempDirectory(bool createIfMissing = false) const {
+    std::filesystem::path getTempBaseDirectory(bool createIfMissing = false) const {
         return resolveTempDirectory(createIfMissing, createIfMissing);
+    }
+
+    std::filesystem::path getTempDirectory(bool createIfMissing = false) const {
+        auto base = resolveTempDirectory(createIfMissing, createIfMissing);
+        if (base.empty()) return {};
+        auto pidDir = base / currentPidSubfolder();
+        if (createIfMissing) {
+            std::error_code ec;
+            std::filesystem::create_directories(pidDir, ec);
+        }
+        return pidDir;
     }
 
     // Finds the nearest existing directory on disk for folder-picker initial path without creating folders (#11).

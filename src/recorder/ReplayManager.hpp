@@ -164,6 +164,8 @@ private:
     );
     void handleFatalRecordingError(const std::string& reason);
     void purgeOldSegments(const ReplayConfig& cfg);
+    void ensureSessionLock(const std::filesystem::path& pidTempDir);
+    void releaseSessionLock(bool removeFiles);
     void cleanupTempDir();
     void joinFinalizeThread();
     void joinExportThread();
@@ -256,6 +258,11 @@ private:
     std::vector<std::wstring> m_deferredDeletes;
     std::filesystem::path m_lastTempDir;
     mutable std::mutex m_segmentMutex;
+
+    // Exclusive per-PID session lock inside pid_<PID> temp folder
+    HANDLE m_sessionLockHandle = INVALID_HANDLE_VALUE;
+    std::filesystem::path m_sessionLockDir;
+    std::mutex m_sessionLockMutex;
 
     // Asynchronous segment finalizer thread (prevents 30s rotation from stalling worker thread)
     std::thread m_finalizeThread;
