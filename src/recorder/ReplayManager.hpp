@@ -78,8 +78,22 @@ private:
         std::chrono::steady_clock::time_point timestamp{};
     };
 
+    enum class WriteCheckResult {
+        Ok,
+        ToleratedError,
+        Recovered,
+        Fatal
+    };
+
     void workerThreadFunc(ReplayConfig sessionConfig);
     void reclaimInFlightFrames(bool forceClear = false);
+    WriteCheckResult handleEncoderWriteError(
+        const char* streamLabel,
+        const EncoderOpResult& res,
+        int& errorCounter,
+        const ReplayConfig& cfg,
+        std::string& outFatalError
+    );
     bool processPendingAudio(
         const ReplayConfig& sessionConfig,
         std::vector<float>& gameAudioScratch,
@@ -91,6 +105,7 @@ private:
         const ReplayConfig& sessionConfig,
         int encGameRate,
         std::vector<float>& silenceScratch,
+        bool& outRecovered,
         std::string& outFatalError
     );
     void feedMicChunkIntoMix(
@@ -105,6 +120,7 @@ private:
         std::vector<float>& gameAudioScratch,
         std::vector<float>& resampledGameAudioScratch,
         std::vector<float>& silenceScratch,
+        bool& outRecovered,
         std::string& outFatalError
     );
     bool flushCarryAudio(
@@ -154,12 +170,16 @@ private:
     void resetMicMixer();
     void appendMicToMix(const AudioChunk& chunk, int targetRate, size_t startFrameOffset = 0, size_t maxFrameCount = SIZE_MAX);
     void mixMicInto(float* stereoSamples, size_t numFrames);
-    bool flushMicMixFifo(int rate, bool checkErrors);
+    bool flushMicMixFifo(int rate, bool checkErrors, const ReplayConfig& cfg,
+                         bool& outRecovered, std::string& outFatalError);
 
     // Shared timestamp resync + encoder write for game and mic audio streams
     bool writeAudioWithResync(bool isGameAudio, float* samples, int numSamples, int rate,
                               std::chrono::steady_clock::time_point timestamp,
-                              std::vector<float>& silenceScratch);
+                              const ReplayConfig& cfg,
+                              std::vector<float>& silenceScratch,
+                              bool& outRecovered,
+                              std::string& outFatalError);
 
     std::filesystem::path getTempDir(bool createIfMissing = false) const;
 
@@ -211,6 +231,8 @@ private:
     int m_videoWriteErrors = 0;
     int m_gameAudioWriteErrors = 0;
     int m_micAudioWriteErrors = 0;
+    bool m_writeRecoveryAttempted = false;
+    EncoderOpResult m_lastStartError{};
     std::chrono::steady_clock::time_point m_nextEncoderRetryTime{};
 
     std::vector<SegmentInfo> m_activeSegments;

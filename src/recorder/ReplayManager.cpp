@@ -299,6 +299,8 @@ void ReplayManager::startReplay() {
     m_videoWriteErrors = 0;
     m_gameAudioWriteErrors = 0;
     m_micAudioWriteErrors = 0;
+    m_writeRecoveryAttempted = false;
+    m_lastStartError = {};
     m_nextEncoderRetryTime = {};
     m_prepareFailedCount = 0;
     m_prepareFailedLastAttempt.store(false);
@@ -520,24 +522,87 @@ void ReplayManager::mixMicInto(float* stereoSamples, size_t numFrames) {
     }
 }
 
-bool ReplayManager::flushMicMixFifo(int rate, bool checkErrors) {
+ReplayManager::WriteCheckResult ReplayManager::handleEncoderWriteError(
+    const char* streamLabel,
+    const EncoderOpResult& res,
+    int& errorCounter,
+    const ReplayConfig& cfg,
+    std::string& outFatalError
+) {
+    std::string codec = m_encoder ? m_encoder->activeCodecName() : "encoder";
+    std::string detail = res.message.empty() ? MediaFoundationEncoder::formatHr(res.hr) : res.message;
+
+    if (MediaFoundationEncoder::isFatalStorageError(res.hr)) {
+        outFatalError = "Instant Replay stopped: " + codec + " failed writing " +
+                        streamLabel + " (" + detail + ")";
+        return WriteCheckResult::Fatal;
+    }
+
+    errorCounter++;
+    if (errorCounter < MAX_CONSECUTIVE_WRITE_ERRORS) {
+        return WriteCheckResult::ToleratedError;
+    }
+
+    geode::log::error("Instant Replay: {} {} write errors on {} ({})",
+                      errorCounter, streamLabel, codec, detail);
+
+    if (!m_writeRecoveryAttempted) {
+        m_writeRecoveryAttempted = true;
+        geode::log::warn("Instant Replay: recreating {} encoder via fallback cascade after {} write errors",
+                         codec, streamLabel);
+
+        m_prepareCancel.store(true);
+        joinPrepareThread();
+        discardPreparedEncoder();
+
+        finalizeCurrentSegment(true, cfg);
+        MediaFoundationEncoder::resetCodecCache();
+
+        if (startNewSegment(cfg, std::chrono::steady_clock::now(), true)) {
+            return WriteCheckResult::Recovered;
+        }
+
+        std::string startDetail = m_lastStartError.message.empty()
+            ? MediaFoundationEncoder::formatHr(m_lastStartError.hr)
+            : m_lastStartError.message;
+        outFatalError = "Instant Replay stopped: " + codec + " " + streamLabel +
+                        " write error (" + detail + "); recovery failed (" + startDetail + ")";
+        return WriteCheckResult::Fatal;
+    }
+
+    outFatalError = "Instant Replay stopped: repeated " + std::string(streamLabel) +
+                    " write failure on " + codec + " (" + detail + ")";
+    return WriteCheckResult::Fatal;
+}
+
+bool ReplayManager::flushMicMixFifo(
+    int rate,
+    bool checkErrors,
+    const ReplayConfig& cfg,
+    bool& outRecovered,
+    std::string& outFatalError
+) {
+    outRecovered = false;
     size_t availSamples = m_micMixFifo.size() - m_micMixReadPos;
     if (availSamples < 2 || !m_encoder || rate <= 0) return true;
     int numSamples = static_cast<int>(availSamples / 2);
     const float* dataPtr = m_micMixFifo.data() + m_micMixReadPos;
     int64_t ts = (m_gameAudioSamples * 10000000LL) / rate;
-    bool ok = m_encoder->writeGameAudio(dataPtr, numSamples, 2, rate, ts);
+    EncoderOpResult res = m_encoder->writeGameAudio(dataPtr, numSamples, 2, rate, ts);
     m_micMixFifo.clear();
     m_micMixReadPos = 0;
-    if (ok) {
+    if (res) {
         m_gameAudioSamples += numSamples;
         if (checkErrors) m_gameAudioWriteErrors = 0;
         return true;
     }
-    if (checkErrors && ++m_gameAudioWriteErrors >= MAX_CONSECUTIVE_WRITE_ERRORS) {
+    if (!checkErrors) return true;
+    WriteCheckResult wc = handleEncoderWriteError("game audio", res, m_gameAudioWriteErrors, cfg, outFatalError);
+    if (wc == WriteCheckResult::Recovered) {
+        outRecovered = true;
         return false;
     }
-    return true;
+    return wc != WriteCheckResult::Fatal;
 }
 
 bool ReplayManager::writeAudioWithResync(
@@ -546,8 +611,12 @@ bool ReplayManager::writeAudioWithResync(
     int numSamples,
     int rate,
     std::chrono::steady_clock::time_point timestamp,
-    std::vector<float>& silenceScratch
+    const ReplayConfig& cfg,
+    std::vector<float>& silenceScratch,
+    bool& outRecovered,
+    std::string& outFatalError
 ) {
+    outRecovered = false;
     constexpr int kChannels = 2;
     if (!samples || numSamples <= 0 || rate <= 0 || !m_encoder) return true;
 
@@ -574,6 +643,7 @@ bool ReplayManager::writeAudioWithResync(
 
     int64_t& sampleCounter = isGameAudio ? m_gameAudioSamples : m_micAudioSamples;
     int& errorCounter = isGameAudio ? m_gameAudioWriteErrors : m_micAudioWriteErrors;
+    const char* streamLabel = isGameAudio ? "game audio" : "microphone audio";
     int64_t expectedHns = (sampleCounter * 10000000LL) / rate;
     int64_t gapHns = chunkStartHns - expectedHns;
 
@@ -585,11 +655,16 @@ bool ReplayManager::writeAudioWithResync(
                 if (isGameAudio && m_mixMicIntoGame) {
                     mixMicInto(silenceScratch.data(), static_cast<size_t>(silenceSamples));
                 }
-                bool silenceOk = isGameAudio
+                EncoderOpResult silenceRes = isGameAudio
                     ? m_encoder->writeGameAudio(silenceScratch.data(), silenceSamples, kChannels, rate, expectedHns)
                     : m_encoder->writeMicAudio(silenceScratch.data(), silenceSamples, kChannels, rate, expectedHns);
-                if (silenceOk) {
+                if (silenceRes) {
                     sampleCounter += silenceSamples;
+                } else if (MediaFoundationEncoder::isFatalStorageError(silenceRes.hr)) {
+                    std::string codec = m_encoder ? m_encoder->activeCodecName() : "encoder";
+                    outFatalError = "Instant Replay stopped: " + codec + " failed writing " +
+                                    streamLabel + " (" + silenceRes.message + ")";
+                    return false;
                 }
             }
         } else {
@@ -614,19 +689,21 @@ bool ReplayManager::writeAudioWithResync(
         mixMicInto(samples, static_cast<size_t>(numSamples));
     }
 
-    bool ok = isGameAudio
+    EncoderOpResult res = isGameAudio
         ? m_encoder->writeGameAudio(samples, numSamples, kChannels, rate, ts)
         : m_encoder->writeMicAudio(samples, numSamples, kChannels, rate, ts);
-    if (ok) {
+    if (res) {
         sampleCounter += numSamples;
         errorCounter = 0;
         return true;
     }
 
-    if (++errorCounter >= MAX_CONSECUTIVE_WRITE_ERRORS) {
+    WriteCheckResult wc = handleEncoderWriteError(streamLabel, res, errorCounter, cfg, outFatalError);
+    if (wc == WriteCheckResult::Recovered) {
+        outRecovered = true;
         return false;
     }
-    return true;
+    return wc != WriteCheckResult::Fatal;
 }
 
 void ReplayManager::feedMicChunkIntoMix(
@@ -660,8 +737,10 @@ bool ReplayManager::writeKeepAliveSilence(
     const ReplayConfig& sessionConfig,
     int encGameRate,
     std::vector<float>& silenceScratch,
+    bool& outRecovered,
     std::string& outFatalError
 ) {
+    outRecovered = false;
     // Synthesize continuous keep-alive silence on any idle audio stream lagging >200ms behind video (#1).
     // Keeps MP4 muxer streams interleaved without buffering unbounded packets when e.g. no mic is connected.
     if (m_lastVideoHns < 0) return true;
@@ -673,12 +752,17 @@ bool ReplayManager::writeKeepAliveSilence(
         if (m_mixMicIntoGame) {
             mixMicInto(silenceScratch.data(), static_cast<size_t>(keepAliveSamples));
         }
-        if (m_encoder->writeGameAudio(silenceScratch.data(), keepAliveSamples, 2, encGameRate, gameAudioHns)) {
+        EncoderOpResult res = m_encoder->writeGameAudio(silenceScratch.data(), keepAliveSamples, 2, encGameRate, gameAudioHns);
+        if (res) {
             m_gameAudioSamples += keepAliveSamples;
             m_gameAudioWriteErrors = 0;
-        } else if (++m_gameAudioWriteErrors >= MAX_CONSECUTIVE_WRITE_ERRORS) {
-            outFatalError = "Instant Replay stopped: audio write error (TEMP drive may be full)";
-            return false;
+        } else {
+            WriteCheckResult wc = handleEncoderWriteError("game audio", res, m_gameAudioWriteErrors, sessionConfig, outFatalError);
+            if (wc == WriteCheckResult::Recovered) {
+                outRecovered = true;
+                return false;
+            }
+            if (wc == WriteCheckResult::Fatal) return false;
         }
     }
 
@@ -688,12 +772,17 @@ bool ReplayManager::writeKeepAliveSilence(
         if (m_lastVideoHns - micAudioHns > 2000000LL) {
             constexpr int kKeepAliveMicSamples = kMicRate / 10; // 4800 stereo frames (100ms)
             silenceScratch.assign(static_cast<size_t>(kKeepAliveMicSamples) * 2, 0.0f);
-            if (m_encoder->writeMicAudio(silenceScratch.data(), kKeepAliveMicSamples, 2, kMicRate, micAudioHns)) {
+            EncoderOpResult res = m_encoder->writeMicAudio(silenceScratch.data(), kKeepAliveMicSamples, 2, kMicRate, micAudioHns);
+            if (res) {
                 m_micAudioSamples += kKeepAliveMicSamples;
                 m_micAudioWriteErrors = 0;
-            } else if (++m_micAudioWriteErrors >= MAX_CONSECUTIVE_WRITE_ERRORS) {
-                outFatalError = "Instant Replay stopped: microphone audio write error (TEMP drive may be full)";
-                return false;
+            } else {
+                WriteCheckResult wc = handleEncoderWriteError("microphone audio", res, m_micAudioWriteErrors, sessionConfig, outFatalError);
+                if (wc == WriteCheckResult::Recovered) {
+                    outRecovered = true;
+                    return false;
+                }
+                if (wc == WriteCheckResult::Fatal) return false;
             }
         }
     }
@@ -724,6 +813,7 @@ bool ReplayManager::processPendingAudio(
     size_t gameAudioFrames = AudioGrabber::get()->drainGameAudio(gameAudioScratch, gameSampleRate, gameAudioTime);
 
     const int encGameRate = (m_segmentGameSampleRate > 0) ? m_segmentGameSampleRate : 48000;
+    bool recovered = false;
 
     // 1. In single-track mode (recordMic && !splitAudioTracks), feed mic packets into mix FIFO first
     if (m_mixMicIntoGame) {
@@ -749,18 +839,17 @@ bool ReplayManager::processPendingAudio(
         }
 
         if (numSamples > 0) {
-            if (!writeAudioWithResync(true, samplesPtr, numSamples, encGameRate, gameAudioTime, silenceScratch)) {
-                outFatalError = "Instant Replay stopped: audio write error (TEMP drive may be full)";
-                return false;
+            if (!writeAudioWithResync(true, samplesPtr, numSamples, encGameRate, gameAudioTime,
+                                      sessionConfig, silenceScratch, recovered, outFatalError)) {
+                return recovered;
             }
         }
     } else if (m_mixMicIntoGame) {
         // If no game audio arrived for >=100ms in single-track mode, flush queued mic audio directly
         size_t thresholdSamples = static_cast<size_t>(encGameRate / 10) * 2;
         if ((m_micMixFifo.size() - m_micMixReadPos) >= thresholdSamples) {
-            if (!flushMicMixFifo(encGameRate, true)) {
-                outFatalError = "Instant Replay stopped: audio write error (TEMP drive may be full)";
-                return false;
+            if (!flushMicMixFifo(encGameRate, true, sessionConfig, recovered, outFatalError)) {
+                return recovered;
             }
         }
     }
@@ -770,13 +859,16 @@ bool ReplayManager::processPendingAudio(
         if (!micAudio || micAudio->samples.size() < 2) continue;
         int numSamples = static_cast<int>(micAudio->samples.size() / 2);
         if (!writeAudioWithResync(false, micAudio->samples.data(), numSamples,
-                                  AudioGrabber::kMicSampleRate, micAudio->timestamp, silenceScratch)) {
-            outFatalError = "Instant Replay stopped: microphone audio write error (TEMP drive may be full)";
-            return false;
+                                  AudioGrabber::kMicSampleRate, micAudio->timestamp,
+                                  sessionConfig, silenceScratch, recovered, outFatalError)) {
+            return recovered;
         }
     }
 
-    return writeKeepAliveSilence(sessionConfig, encGameRate, silenceScratch, outFatalError);
+    if (!writeKeepAliveSilence(sessionConfig, encGameRate, silenceScratch, recovered, outFatalError)) {
+        return recovered;
+    }
+    return true;
 }
 
 bool ReplayManager::splitAudioAtBoundary(
@@ -785,8 +877,10 @@ bool ReplayManager::splitAudioAtBoundary(
     std::vector<float>& gameAudioScratch,
     std::vector<float>& resampledGameAudioScratch,
     std::vector<float>& silenceScratch,
+    bool& outRecovered,
     std::string& outFatalError
 ) {
+    outRecovered = false;
     if (!m_encoder || !m_encoder->isRecording()) return true;
 
     std::vector<std::shared_ptr<AudioChunk>> pendingMicAudio;
@@ -836,6 +930,12 @@ bool ReplayManager::splitAudioAtBoundary(
         }
     }
 
+    auto clearCarryOnRecover = [this, &outRecovered]() {
+        m_carryGameAudio = {};
+        m_carryMicAudio.clear();
+        outRecovered = true;
+    };
+
     // Resample drained game audio once before splitting to avoid resampler reset clicks at segment join.
     if (gameAudioFrames > 0) {
         int srcRate = (gameSampleRate > 0) ? gameSampleRate : 48000;
@@ -854,8 +954,13 @@ bool ReplayManager::splitAudioAtBoundary(
         int64_t splitGame = std::clamp<int64_t>(static_cast<int64_t>(std::llround(offsetSec * encGameRate)), 0, totalGameFrames);
 
         if (splitGame > 0) {
-            if (!writeAudioWithResync(true, samplesPtr, static_cast<int>(splitGame), encGameRate, gameAudioTime, silenceScratch)) {
-                outFatalError = "Instant Replay stopped: audio write error (TEMP drive may be full)";
+            bool rec = false;
+            if (!writeAudioWithResync(true, samplesPtr, static_cast<int>(splitGame), encGameRate, gameAudioTime,
+                                      cfg, silenceScratch, rec, outFatalError)) {
+                if (rec) {
+                    clearCarryOnRecover();
+                    return true;
+                }
                 return false;
             }
         }
@@ -868,8 +973,12 @@ bool ReplayManager::splitAudioAtBoundary(
     } else if (m_mixMicIntoGame) {
         size_t thresholdSamples = static_cast<size_t>(encGameRate / 10) * 2;
         if ((m_micMixFifo.size() - m_micMixReadPos) >= thresholdSamples) {
-            if (!flushMicMixFifo(encGameRate, true)) {
-                outFatalError = "Instant Replay stopped: audio write error (TEMP drive may be full)";
+            bool rec = false;
+            if (!flushMicMixFifo(encGameRate, true, cfg, rec, outFatalError)) {
+                if (rec) {
+                    clearCarryOnRecover();
+                    return true;
+                }
                 return false;
             }
         }
@@ -877,14 +986,29 @@ bool ReplayManager::splitAudioAtBoundary(
 
     for (const auto& micAudio : closingMicChunks) {
         int numSamples = static_cast<int>(micAudio->samples.size() / 2);
-        if (numSamples > 0 && !writeAudioWithResync(false, micAudio->samples.data(), numSamples,
-                                                   kMicRate, micAudio->timestamp, silenceScratch)) {
-            outFatalError = "Instant Replay stopped: microphone audio write error (TEMP drive may be full)";
-            return false;
+        if (numSamples > 0) {
+            bool rec = false;
+            if (!writeAudioWithResync(false, micAudio->samples.data(), numSamples,
+                                      kMicRate, micAudio->timestamp,
+                                      cfg, silenceScratch, rec, outFatalError)) {
+                if (rec) {
+                    clearCarryOnRecover();
+                    return true;
+                }
+                return false;
+            }
         }
     }
 
-    return writeKeepAliveSilence(cfg, encGameRate, silenceScratch, outFatalError);
+    bool rec = false;
+    if (!writeKeepAliveSilence(cfg, encGameRate, silenceScratch, rec, outFatalError)) {
+        if (rec) {
+            clearCarryOnRecover();
+            return true;
+        }
+        return false;
+    }
+    return true;
 }
 
 bool ReplayManager::flushCarryAudio(
@@ -900,6 +1024,7 @@ bool ReplayManager::flushCarryAudio(
     }
 
     const int encGameRate = (m_segmentGameSampleRate > 0) ? m_segmentGameSampleRate : 48000;
+    bool recovered = false;
 
     if (m_mixMicIntoGame) {
         for (const auto& micAudio : m_carryMicAudio) {
@@ -918,11 +1043,11 @@ bool ReplayManager::flushCarryAudio(
             ptr = resampledScratch.data();
             numSamples = static_cast<int>(resampledScratch.size() / 2);
         }
-        if (numSamples > 0 && !writeAudioWithResync(true, ptr, numSamples, encGameRate, m_carryGameAudio.timestamp, silenceScratch)) {
-            outFatalError = "Instant Replay stopped: audio write error (TEMP drive may be full)";
+        if (numSamples > 0 && !writeAudioWithResync(true, ptr, numSamples, encGameRate, m_carryGameAudio.timestamp,
+                                                    cfg, silenceScratch, recovered, outFatalError)) {
             m_carryGameAudio = {};
             m_carryMicAudio.clear();
-            return false;
+            return recovered;
         }
     }
 
@@ -931,11 +1056,11 @@ bool ReplayManager::flushCarryAudio(
             if (!micAudio || micAudio->samples.size() < 2) continue;
             int numSamples = static_cast<int>(micAudio->samples.size() / 2);
             if (!writeAudioWithResync(false, micAudio->samples.data(), numSamples,
-                                      AudioGrabber::kMicSampleRate, micAudio->timestamp, silenceScratch)) {
-                outFatalError = "Instant Replay stopped: microphone audio write error (TEMP drive may be full)";
+                                      AudioGrabber::kMicSampleRate, micAudio->timestamp,
+                                      cfg, silenceScratch, recovered, outFatalError)) {
                 m_carryGameAudio = {};
                 m_carryMicAudio.clear();
-                return false;
+                return recovered;
             }
         }
     }
@@ -951,7 +1076,9 @@ void ReplayManager::flushTrailingSilenceForClose(const ReplayConfig& cfg) {
     // Ensure short segments (<200ms) never close with completely empty audio tracks
     if (m_gameAudioSamples == 0 && m_lastVideoHns >= 0) {
         if (m_mixMicIntoGame && (m_micMixFifo.size() - m_micMixReadPos) >= 2) {
-            flushMicMixFifo(gameRate, false);
+            bool ignoredRec = false;
+            std::string ignoredErr;
+            flushMicMixFifo(gameRate, false, cfg, ignoredRec, ignoredErr);
         } else {
             int silenceSamples = std::clamp<int>(
                 static_cast<int>((std::max<int64_t>(m_lastVideoHns, 1000000LL) * gameRate) / 10000000LL),
@@ -1076,7 +1203,7 @@ bool ReplayManager::startNewSegment(
     int effBitrate = cfg.getEffectiveBitrateMbps();
     int effMaxBitrate = std::max(cfg.getEffectiveMaxBitrateMbps(), effBitrate);
 
-    bool ok = m_encoder->start(
+    m_lastStartError = m_encoder->start(
         m_currentSegmentPath,
         m_videoWidth,
         m_videoHeight,
@@ -1093,7 +1220,7 @@ bool ReplayManager::startNewSegment(
         [this]() { joinFinalizeThread(); }
     );
 
-    if (ok) {
+    if (m_lastStartError) {
         m_currentFormatKey = m_encoder->formatKey();
         m_segmentGameSampleRate = m_encoder->encodedGameSampleRate();
         m_encoderFailCount = 0;
@@ -1106,7 +1233,8 @@ bool ReplayManager::startNewSegment(
         return true;
     }
 
-    geode::log::error("Instant Replay: failed to start encoder ({}x{})", m_videoWidth, m_videoHeight);
+    geode::log::error("Instant Replay: failed to start encoder ({}x{}): {}",
+                      m_videoWidth, m_videoHeight, m_lastStartError.message);
     m_currentSegmentPath.clear();
     m_currentFormatKey.clear();
     m_isContinuationSegment = false;
@@ -1229,7 +1357,7 @@ void ReplayManager::startPrepareNextSegment(const ReplayConfig& cfg) {
                 forcedSubtype,
                 useForcedHardware,
                 forcedHardware
-            );
+            ).ok;
         }
 
         if (ok && !m_prepareCancel.load()) {
@@ -1302,42 +1430,51 @@ void ReplayManager::handleSaveRequest(
 
     if (continueRecording && wasRecording) {
         std::string ignoredErr;
-        splitAudioAtBoundary(boundaryTime, cfg, gameAudioScratch, resampledGameAudioScratch, silenceScratch, ignoredErr);
+        bool recovered = false;
+        splitAudioAtBoundary(boundaryTime, cfg, gameAudioScratch, resampledGameAudioScratch, silenceScratch, recovered, ignoredErr);
 
-        bool canHotSwap = false;
-        {
-            std::lock_guard<std::mutex> lock(m_prepareDataMutex);
-            canHotSwap = (m_prepared.encoder && m_prepared.encoder->isRecording() &&
-                          m_prepared.width == m_videoWidth && m_prepared.height == m_videoHeight);
-        }
-
-        if (canHotSwap && !m_finalizeInFlight.load()) {
-            extraPending = finalizeCurrentSegment(false, cfg);
-            if (activatePreparedOrStartNew(cfg, boundaryTime, true, false)) {
-                flushCarryAudio(cfg, resampledGameAudioScratch, silenceScratch, ignoredErr);
-            } else {
-                m_carryGameAudio = {};
-                m_carryMicAudio.clear();
-            }
-        } else {
+        if (recovered) {
             m_prepareCancel.store(true);
             joinPrepareThread();
             discardPreparedEncoder();
+            m_carryGameAudio = {};
+            m_carryMicAudio.clear();
+        } else {
+            bool canHotSwap = false;
+            {
+                std::lock_guard<std::mutex> lock(m_prepareDataMutex);
+                canHotSwap = (m_prepared.encoder && m_prepared.encoder->isRecording() &&
+                              m_prepared.width == m_videoWidth && m_prepared.height == m_videoHeight);
+            }
 
-            finalizeCurrentSegment(true, cfg);
-            purgeOldSegments(cfg);
-            if (m_running.load()) {
-                if (startNewSegment(cfg, boundaryTime, true)) {
+            if (canHotSwap && !m_finalizeInFlight.load()) {
+                extraPending = finalizeCurrentSegment(false, cfg);
+                if (activatePreparedOrStartNew(cfg, boundaryTime, true, false)) {
                     flushCarryAudio(cfg, resampledGameAudioScratch, silenceScratch, ignoredErr);
                 } else {
                     m_carryGameAudio = {};
                     m_carryMicAudio.clear();
-                    m_encoderFailCount++;
-                    m_nextEncoderRetryTime = std::chrono::steady_clock::now() + std::chrono::seconds(2 * m_encoderFailCount);
                 }
             } else {
-                m_carryGameAudio = {};
-                m_carryMicAudio.clear();
+                m_prepareCancel.store(true);
+                joinPrepareThread();
+                discardPreparedEncoder();
+
+                finalizeCurrentSegment(true, cfg);
+                purgeOldSegments(cfg);
+                if (m_running.load()) {
+                    if (startNewSegment(cfg, boundaryTime, true)) {
+                        flushCarryAudio(cfg, resampledGameAudioScratch, silenceScratch, ignoredErr);
+                    } else {
+                        m_carryGameAudio = {};
+                        m_carryMicAudio.clear();
+                        m_encoderFailCount++;
+                        m_nextEncoderRetryTime = std::chrono::steady_clock::now() + std::chrono::seconds(2 * m_encoderFailCount);
+                    }
+                } else {
+                    m_carryGameAudio = {};
+                    m_carryMicAudio.clear();
+                }
             }
         }
     } else if (!continueRecording) {
@@ -1551,6 +1688,25 @@ void ReplayManager::workerThreadFunc(ReplayConfig sessionConfig) {
             m_nextPrepareRetryTime = now + std::chrono::seconds(2 * m_prepareFailedCount);
         }
 
+        auto handleStartFailure = [this, &frame, &hadFatalError, &now]() -> bool {
+            std::string detail = m_lastStartError.message.empty()
+                ? MediaFoundationEncoder::formatHr(m_lastStartError.hr)
+                : m_lastStartError.message;
+            m_encoderFailCount++;
+            if (MediaFoundationEncoder::isFatalStorageError(m_lastStartError.hr) ||
+                m_encoderFailCount >= MAX_ENCODER_START_FAILURES) {
+                if (frame) {
+                    FrameGrabber::get()->recycleFrame(std::move(frame));
+                    frame.reset();
+                }
+                hadFatalError = true;
+                handleFatalRecordingError("Instant Replay stopped: " + detail);
+                return true;
+            }
+            m_nextEncoderRetryTime = now + std::chrono::seconds(2 * m_encoderFailCount);
+            return false;
+        };
+
         // (Re)start encoder when the first frame arrives or the output size changes
         if (frame && (frame->width != m_videoWidth || frame->height != m_videoHeight ||
                       !m_encoder || !m_encoder->isRecording())) {
@@ -1564,30 +1720,24 @@ void ReplayManager::workerThreadFunc(ReplayConfig sessionConfig) {
 
             if (now >= m_nextEncoderRetryTime) {
                 bool hadActiveEnc = (m_encoder && m_encoder->isRecording());
+                bool splitRecovered = false;
                 if (hadActiveEnc) {
                     std::string ignoredErr;
-                    splitAudioAtBoundary(frame->timestamp, sessionConfig, gameAudioScratch, resampledGameAudioScratch, silenceScratch, ignoredErr);
+                    splitAudioAtBoundary(frame->timestamp, sessionConfig, gameAudioScratch, resampledGameAudioScratch, silenceScratch, splitRecovered, ignoredErr);
                 }
-                m_videoWidth = frame->width;
-                m_videoHeight = frame->height;
-                if (rotateSegment(false, sessionConfig, frame->timestamp)) {
-                    if (hadActiveEnc) {
-                        std::string ignoredErr;
-                        flushCarryAudio(sessionConfig, resampledGameAudioScratch, silenceScratch, ignoredErr);
+                if (!splitRecovered) {
+                    m_videoWidth = frame->width;
+                    m_videoHeight = frame->height;
+                    if (rotateSegment(false, sessionConfig, frame->timestamp)) {
+                        if (hadActiveEnc) {
+                            std::string ignoredErr;
+                            flushCarryAudio(sessionConfig, resampledGameAudioScratch, silenceScratch, ignoredErr);
+                        }
+                    } else {
+                        m_carryGameAudio = {};
+                        m_carryMicAudio.clear();
+                        if (handleStartFailure()) break;
                     }
-                } else {
-                    m_carryGameAudio = {};
-                    m_carryMicAudio.clear();
-                    m_encoderFailCount++;
-                    if (m_encoderFailCount >= MAX_ENCODER_START_FAILURES) {
-                        FrameGrabber::get()->recycleFrame(std::move(frame));
-                        frame.reset();
-                        hadFatalError = true;
-                        handleFatalRecordingError("Instant Replay stopped: encoder failed to initialize (check disk space or GPU drivers)");
-                        break;
-                    }
-                    // Exponential backoff before retrying so we never retry-storm on every frame
-                    m_nextEncoderRetryTime = now + std::chrono::seconds(2 * m_encoderFailCount);
                 }
             }
         }
@@ -1619,7 +1769,8 @@ void ReplayManager::workerThreadFunc(ReplayConfig sessionConfig) {
 
                     auto boundaryTime = frame ? frame->timestamp : now;
                     std::string audioFatalErr;
-                    if (!splitAudioAtBoundary(boundaryTime, sessionConfig, gameAudioScratch, resampledGameAudioScratch, silenceScratch, audioFatalErr)) {
+                    bool splitRecovered = false;
+                    if (!splitAudioAtBoundary(boundaryTime, sessionConfig, gameAudioScratch, resampledGameAudioScratch, silenceScratch, splitRecovered, audioFatalErr)) {
                         if (frame) {
                             FrameGrabber::get()->recycleFrame(std::move(frame));
                             frame.reset();
@@ -1629,45 +1780,42 @@ void ReplayManager::workerThreadFunc(ReplayConfig sessionConfig) {
                         break;
                     }
 
-                    bool rotated = false;
-                    if (hasPreparedReady && !m_finalizeInFlight.load()) {
-                        finalizeCurrentSegment(false, sessionConfig);
-                        rotated = activatePreparedOrStartNew(sessionConfig, boundaryTime, true, true);
-                    } else {
-                        finalizeCurrentSegment(true, sessionConfig);
-                        rotated = activatePreparedOrStartNew(sessionConfig, boundaryTime, true, true);
-                    }
+                    if (!splitRecovered) {
+                        bool wasHealthy = (m_videoWriteErrors == 0 && m_gameAudioWriteErrors == 0 && m_micAudioWriteErrors == 0);
+                        bool rotated = false;
+                        if (hasPreparedReady && !m_finalizeInFlight.load()) {
+                            finalizeCurrentSegment(false, sessionConfig);
+                            rotated = activatePreparedOrStartNew(sessionConfig, boundaryTime, true, true);
+                        } else {
+                            finalizeCurrentSegment(true, sessionConfig);
+                            rotated = activatePreparedOrStartNew(sessionConfig, boundaryTime, true, true);
+                        }
 
-                    if (rotated) {
-                        if (!flushCarryAudio(sessionConfig, resampledGameAudioScratch, silenceScratch, audioFatalErr)) {
-                            if (frame) {
-                                FrameGrabber::get()->recycleFrame(std::move(frame));
-                                frame.reset();
+                        if (rotated) {
+                            if (wasHealthy) {
+                                m_writeRecoveryAttempted = false;
                             }
-                            hadFatalError = true;
-                            handleFatalRecordingError(audioFatalErr);
-                            break;
-                        }
-                    } else {
-                        m_carryGameAudio = {};
-                        m_carryMicAudio.clear();
-                        m_encoderFailCount++;
-                        if (m_encoderFailCount >= MAX_ENCODER_START_FAILURES) {
-                            if (frame) {
-                                FrameGrabber::get()->recycleFrame(std::move(frame));
-                                frame.reset();
+                            if (!flushCarryAudio(sessionConfig, resampledGameAudioScratch, silenceScratch, audioFatalErr)) {
+                                if (frame) {
+                                    FrameGrabber::get()->recycleFrame(std::move(frame));
+                                    frame.reset();
+                                }
+                                hadFatalError = true;
+                                handleFatalRecordingError(audioFatalErr);
+                                break;
                             }
-                            hadFatalError = true;
-                            handleFatalRecordingError("Instant Replay stopped: encoder failed to initialize (check disk space or GPU drivers)");
-                            break;
+                        } else {
+                            m_carryGameAudio = {};
+                            m_carryMicAudio.clear();
+                            if (handleStartFailure()) break;
                         }
-                        m_nextEncoderRetryTime = now + std::chrono::seconds(2 * m_encoderFailCount);
                     }
                 }
             }
         }
 
         if (m_encoder && m_encoder->isRecording()) {
+            bool skipAudioAfterRecovery = false;
             if (frame) {
                 int64_t ts = std::chrono::duration_cast<std::chrono::nanoseconds>(
                     frame->timestamp - m_currentSegmentStart).count() / 100;
@@ -1678,35 +1826,46 @@ void ReplayManager::workerThreadFunc(ReplayConfig sessionConfig) {
                     // Encoder queue is saturated; drop frame cleanly to bound memory (#1, #7)
                     FrameGrabber::get()->recycleFrame(std::move(frame));
                     frame.reset();
-                } else if (m_encoder->writeVideoFrame(frame->buffer.get(), frame->width, frame->height, ts)) {
-                    m_lastVideoHns = ts;
-                    m_videoWriteErrors = 0;
-                    if (FrameGrabber::isMediaBufferUnique(frame->buffer.get())) {
-                        FrameGrabber::get()->recycleFrame(std::move(frame));
-                    } else {
-                        m_inFlightFrames.push_back(std::move(frame));
-                    }
-                    frame.reset();
                 } else {
-                    if (++m_videoWriteErrors >= MAX_CONSECUTIVE_WRITE_ERRORS) {
-                        FrameGrabber::get()->recycleFrame(std::move(frame));
+                    EncoderOpResult videoRes = m_encoder->writeVideoFrame(frame->buffer.get(), frame->width, frame->height, ts);
+                    if (videoRes) {
+                        m_lastVideoHns = ts;
+                        m_videoWriteErrors = 0;
+                        if (FrameGrabber::isMediaBufferUnique(frame->buffer.get())) {
+                            FrameGrabber::get()->recycleFrame(std::move(frame));
+                        } else {
+                            m_inFlightFrames.push_back(std::move(frame));
+                        }
                         frame.reset();
-                        hadFatalError = true;
-                        handleFatalRecordingError("Instant Replay stopped: video write error (TEMP drive may be full)");
-                        break;
+                    } else {
+                        std::string videoFatalErr;
+                        WriteCheckResult wc = handleEncoderWriteError("video", videoRes, m_videoWriteErrors, sessionConfig, videoFatalErr);
+                        if (wc == WriteCheckResult::Recovered) {
+                            FrameGrabber::get()->recycleFrame(std::move(frame));
+                            frame.reset();
+                            skipAudioAfterRecovery = true;
+                        } else if (wc == WriteCheckResult::Fatal) {
+                            FrameGrabber::get()->recycleFrame(std::move(frame));
+                            frame.reset();
+                            hadFatalError = true;
+                            handleFatalRecordingError(videoFatalErr);
+                            break;
+                        }
                     }
                 }
             }
 
-            std::string audioFatalErr;
-            if (!processPendingAudio(sessionConfig, gameAudioScratch, resampledGameAudioScratch, silenceScratch, audioFatalErr)) {
-                if (frame) {
-                    FrameGrabber::get()->recycleFrame(std::move(frame));
-                    frame.reset();
+            if (!skipAudioAfterRecovery) {
+                std::string audioFatalErr;
+                if (!processPendingAudio(sessionConfig, gameAudioScratch, resampledGameAudioScratch, silenceScratch, audioFatalErr)) {
+                    if (frame) {
+                        FrameGrabber::get()->recycleFrame(std::move(frame));
+                        frame.reset();
+                    }
+                    hadFatalError = true;
+                    handleFatalRecordingError(audioFatalErr);
+                    break;
                 }
-                hadFatalError = true;
-                handleFatalRecordingError(audioFatalErr);
-                break;
             }
         }
 

@@ -14,11 +14,19 @@ namespace replay {
 namespace {
 
 std::string hrToString(HRESULT hr) {
-    if (hr == HRESULT_FROM_WIN32(ERROR_DISK_FULL) || hr == HRESULT_FROM_WIN32(ERROR_HANDLE_DISK_FULL)) {
+    if (hr == HRESULT_FROM_WIN32(ERROR_DISK_FULL) ||
+        hr == HRESULT_FROM_WIN32(ERROR_HANDLE_DISK_FULL) ||
+        hr == STG_E_MEDIUMFULL) {
         return "disk is full";
     }
-    if (hr == HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED)) {
+    if (hr == HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED) ||
+        hr == E_ACCESSDENIED ||
+        hr == STG_E_ACCESSDENIED) {
         return "access denied";
+    }
+    if (hr == STG_E_DISKISWRITEPROTECTED ||
+        hr == HRESULT_FROM_WIN32(ERROR_WRITE_PROTECT)) {
+        return "drive is write-protected";
     }
     char buf[32];
     snprintf(buf, sizeof(buf), "HRESULT 0x%08X", static_cast<unsigned>(hr));
@@ -68,6 +76,26 @@ void MediaFoundationEncoder::resetCodecCache() {
     s_hasCachedCodec = false;
 }
 
+bool MediaFoundationEncoder::isFatalStorageError(HRESULT hr) noexcept {
+    return hr == HRESULT_FROM_WIN32(ERROR_DISK_FULL) ||
+           hr == HRESULT_FROM_WIN32(ERROR_HANDLE_DISK_FULL) ||
+           hr == HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED) ||
+           hr == HRESULT_FROM_WIN32(ERROR_WRITE_PROTECT) ||
+           hr == E_ACCESSDENIED ||
+           hr == STG_E_MEDIUMFULL ||
+           hr == STG_E_ACCESSDENIED ||
+           hr == STG_E_DISKISWRITEPROTECTED;
+}
+
+std::string MediaFoundationEncoder::formatHr(HRESULT hr) {
+    return hrToString(hr);
+}
+
+std::string MediaFoundationEncoder::activeCodecName() const {
+    if (m_activeSubtype == GUID_NULL) return "encoder";
+    return std::string(subtypeName(m_activeSubtype)) + (m_activeHardware ? " (HW)" : " (SW)");
+}
+
 MediaFoundationEncoder::MediaFoundationEncoder() {
     globalInitialize();
 }
@@ -76,7 +104,7 @@ MediaFoundationEncoder::~MediaFoundationEncoder() {
     finish();
 }
 
-bool MediaFoundationEncoder::start(
+EncoderOpResult MediaFoundationEncoder::start(
     const std::wstring& outputPath,
     int width,
     int height,
@@ -204,6 +232,8 @@ bool MediaFoundationEncoder::start(
 
     bool primaryFailedPermanently = false;
     bool syncedBeforeFallback = false;
+    HRESULT lastHr = E_FAIL;
+    std::string lastErrMsg;
 
     for (size_t i = 0; i < attempts.size(); ++i) {
         const auto& attempt = attempts[i];
@@ -216,7 +246,8 @@ bool MediaFoundationEncoder::start(
         // If the primary hardware codec fails transiently (e.g. concurrent NVENC session limit while
         // the previous segment is still finalizing in the background), wait for background finalization
         // to release the old encoder session and retry the primary codec before falling back (#9, #10).
-        if (!started && isPrimary && !isPermanentCodecUnsupported(failHr) && onBeforeFallback && !syncedBeforeFallback) {
+        if (!started && isPrimary && !isPermanentCodecUnsupported(failHr) && !isFatalStorageError(failHr) &&
+            onBeforeFallback && !syncedBeforeFallback) {
             syncedBeforeFallback = true;
             cleanupFailedAttempt();
             onBeforeFallback();
@@ -226,7 +257,7 @@ bool MediaFoundationEncoder::start(
         }
 
         if (started) {
-            std::string activeCodecName = std::string(subtypeName(attempt.subtype)) + (attempt.hardware ? " (HW)" : " (SW)");
+            std::string codecLabel = std::string(subtypeName(attempt.subtype)) + (attempt.hardware ? " (HW)" : " (SW)");
             char key[180];
             snprintf(key, sizeof(key), "%s|%s|%dx%d|%d|a%d|s%d",
                      subtypeName(attempt.subtype), attempt.hardware ? "hw" : "sw",
@@ -257,31 +288,41 @@ bool MediaFoundationEncoder::start(
                     }
                 }
 
-                std::string logKey = requestKey + "->" + activeCodecName;
+                std::string logKey = requestKey + "->" + codecLabel;
                 if (s_lastLoggedCodecKey != logKey) {
                     s_lastLoggedCodecKey = logKey;
                     if (!isPrimary && !hasForcedCodec) {
-                        geode::log::warn("Instant Replay: requested codec unavailable, fell back to {}", activeCodecName);
+                        geode::log::warn("Instant Replay: requested codec unavailable, fell back to {}", codecLabel);
                     } else {
-                        geode::log::info("Instant Replay: encoder started with {}", activeCodecName);
+                        geode::log::info("Instant Replay: encoder started with {}", codecLabel);
                     }
                 }
             }
-            return true;
+            return {true, S_OK, codecLabel};
         }
+
+        std::string attemptLabel = std::string(subtypeName(attempt.subtype)) + (attempt.hardware ? " (HW)" : " (SW)");
+        lastHr = failHr;
+        lastErrMsg = attemptLabel + ": " + error;
 
         if (isPrimary && isPermanentCodecUnsupported(failHr)) {
             primaryFailedPermanently = true;
         }
-        geode::log::warn("Instant Replay: {} encoder ({}) failed: {}",
-                         subtypeName(attempt.subtype), attempt.hardware ? "HW" : "SW", error);
+        geode::log::warn("Instant Replay: {} failed: {}", attemptLabel, error);
         cleanupFailedAttempt();
+
+        if (isFatalStorageError(failHr)) {
+            break;
+        }
     }
 
-    if (allowFallback) {
-        geode::log::error("Instant Replay: no usable video encoder found");
+    if (lastErrMsg.empty()) {
+        lastErrMsg = "no usable video encoder found";
     }
-    return false;
+    if (allowFallback) {
+        geode::log::error("Instant Replay: encoder start failed ({})", lastErrMsg);
+    }
+    return {false, lastHr, lastErrMsg};
 }
 
 // Performs one complete sink writer initialisation for the given codec.
@@ -434,11 +475,16 @@ bool MediaFoundationEncoder::tryStartLocked(
 bool MediaFoundationEncoder::createVideoSample(
     IMFMediaBuffer* videoBuffer,
     int64_t timestampHns,
-    IMFSample** ppSample
+    IMFSample** ppSample,
+    HRESULT& outHr
 ) {
-    if (!videoBuffer || !ppSample) return false;
+    if (!videoBuffer || !ppSample) {
+        outHr = E_INVALIDARG;
+        return false;
+    }
 
     HRESULT hr = MFCreateSample(ppSample);
+    outHr = hr;
     if (SUCCEEDED(hr) && *ppSample) {
         (*ppSample)->AddBuffer(videoBuffer);
         (*ppSample)->SetSampleTime(timestampHns);
@@ -454,13 +500,18 @@ bool MediaFoundationEncoder::createAudioSample(
     int channels,
     int sampleRate,
     int64_t timestampHns,
-    IMFSample** ppSample
+    IMFSample** ppSample,
+    HRESULT& outHr
 ) {
-    if (numSamples <= 0 || channels <= 0) return false;
+    if (numSamples <= 0 || channels <= 0 || !ppSample || !pcmFloat) {
+        outHr = E_INVALIDARG;
+        return false;
+    }
 
     DWORD bufferSize = static_cast<DWORD>(numSamples) * channels * sizeof(int16_t);
     ComRef<IMFMediaBuffer> buffer;
     HRESULT hr = MFCreateMemoryBuffer(bufferSize, buffer.put());
+    outHr = hr;
     if (FAILED(hr) || !buffer) return false;
 
     BYTE* pDst = nullptr;
@@ -476,6 +527,7 @@ bool MediaFoundationEncoder::createAudioSample(
         buffer->SetCurrentLength(bufferSize);
 
         hr = MFCreateSample(ppSample);
+        outHr = hr;
         if (SUCCEEDED(hr) && *ppSample) {
             (*ppSample)->AddBuffer(buffer.get());
             (*ppSample)->SetSampleTime(timestampHns);
@@ -484,29 +536,39 @@ bool MediaFoundationEncoder::createAudioSample(
             (*ppSample)->SetSampleDuration(durationHns);
             return true;
         }
+    } else {
+        outHr = FAILED(hr) ? hr : E_FAIL;
     }
     return false;
 }
 
-bool MediaFoundationEncoder::writeVideoFrame(
+EncoderOpResult MediaFoundationEncoder::writeVideoFrame(
     IMFMediaBuffer* videoBuffer,
     int width,
     int height,
     int64_t timestampHns
 ) {
     std::lock_guard<std::mutex> lock(m_mutex);
-    if (!m_recording || !m_sinkWriter || !videoBuffer) return false;
-    if (width != m_width || height != m_height) return false;
+    if (!m_recording || !m_sinkWriter || !videoBuffer) {
+        return {false, MF_E_NOT_INITIALIZED, "encoder not recording"};
+    }
+    if (width != m_width || height != m_height) {
+        return {false, E_INVALIDARG, "frame resolution mismatch"};
+    }
 
     ComRef<IMFSample> sample;
-    if (createVideoSample(videoBuffer, timestampHns, sample.put())) {
-        HRESULT hr = m_sinkWriter->WriteSample(m_videoStreamIndex, sample.get());
-        return SUCCEEDED(hr);
+    HRESULT hr = E_FAIL;
+    if (!createVideoSample(videoBuffer, timestampHns, sample.put(), hr)) {
+        return {false, hr, hrToString(hr)};
     }
-    return false;
+    hr = m_sinkWriter->WriteSample(m_videoStreamIndex, sample.get());
+    if (FAILED(hr)) {
+        return {false, hr, hrToString(hr)};
+    }
+    return {true, S_OK, {}};
 }
 
-bool MediaFoundationEncoder::writeGameAudio(
+EncoderOpResult MediaFoundationEncoder::writeGameAudio(
     const float* pcmFloat,
     int numSamples,
     int channels,
@@ -514,17 +576,23 @@ bool MediaFoundationEncoder::writeGameAudio(
     int64_t timestampHns
 ) {
     std::lock_guard<std::mutex> lock(m_mutex);
-    if (!m_recording || !m_sinkWriter) return false;
+    if (!m_recording || !m_sinkWriter) {
+        return {false, MF_E_NOT_INITIALIZED, "encoder not recording"};
+    }
 
     ComRef<IMFSample> sample;
-    if (createAudioSample(pcmFloat, numSamples, channels, sampleRate, timestampHns, sample.put())) {
-        HRESULT hr = m_sinkWriter->WriteSample(m_gameAudioStreamIndex, sample.get());
-        return SUCCEEDED(hr);
+    HRESULT hr = E_FAIL;
+    if (!createAudioSample(pcmFloat, numSamples, channels, sampleRate, timestampHns, sample.put(), hr)) {
+        return {false, hr, hrToString(hr)};
     }
-    return false;
+    hr = m_sinkWriter->WriteSample(m_gameAudioStreamIndex, sample.get());
+    if (FAILED(hr)) {
+        return {false, hr, hrToString(hr)};
+    }
+    return {true, S_OK, {}};
 }
 
-bool MediaFoundationEncoder::writeMicAudio(
+EncoderOpResult MediaFoundationEncoder::writeMicAudio(
     const float* pcmFloat,
     int numSamples,
     int channels,
@@ -532,14 +600,20 @@ bool MediaFoundationEncoder::writeMicAudio(
     int64_t timestampHns
 ) {
     std::lock_guard<std::mutex> lock(m_mutex);
-    if (!m_recording || !m_sinkWriter || !m_splitAudio) return false;
+    if (!m_recording || !m_sinkWriter || !m_splitAudio) {
+        return {false, MF_E_NOT_INITIALIZED, "encoder not recording"};
+    }
 
     ComRef<IMFSample> sample;
-    if (createAudioSample(pcmFloat, numSamples, channels, sampleRate, timestampHns, sample.put())) {
-        HRESULT hr = m_sinkWriter->WriteSample(m_micAudioStreamIndex, sample.get());
-        return SUCCEEDED(hr);
+    HRESULT hr = E_FAIL;
+    if (!createAudioSample(pcmFloat, numSamples, channels, sampleRate, timestampHns, sample.put(), hr)) {
+        return {false, hr, hrToString(hr)};
     }
-    return false;
+    hr = m_sinkWriter->WriteSample(m_micAudioStreamIndex, sample.get());
+    if (FAILED(hr)) {
+        return {false, hr, hrToString(hr)};
+    }
+    return {true, S_OK, {}};
 }
 
 bool MediaFoundationEncoder::finish() {

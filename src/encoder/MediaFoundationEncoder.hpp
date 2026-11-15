@@ -27,6 +27,15 @@ struct ConcatResult {
     double durationSeconds = 0.0; // Duration actually written to the output file
 };
 
+// Detailed result of encoder initialization or sample write operations.
+struct EncoderOpResult {
+    bool ok = false;
+    HRESULT hr = S_OK;
+    std::string message;
+
+    explicit operator bool() const noexcept { return ok; }
+};
+
 class MediaFoundationEncoder {
 public:
     MediaFoundationEncoder();
@@ -34,8 +43,10 @@ public:
 
     static void globalInitialize();
     static void resetCodecCache();
+    static bool isFatalStorageError(HRESULT hr) noexcept;
+    static std::string formatHr(HRESULT hr);
 
-    bool start(
+    EncoderOpResult start(
         const std::wstring& outputPath,
         int width,
         int height,
@@ -56,15 +67,16 @@ public:
         bool forcedHardware = true
     );
 
-    bool writeVideoFrame(IMFMediaBuffer* videoBuffer, int width, int height, int64_t timestampHns);
-    bool writeGameAudio(const float* pcmFloat, int numSamples, int channels, int sampleRate, int64_t timestampHns);
-    bool writeMicAudio(const float* pcmFloat, int numSamples, int channels, int sampleRate, int64_t timestampHns);
+    EncoderOpResult writeVideoFrame(IMFMediaBuffer* videoBuffer, int width, int height, int64_t timestampHns);
+    EncoderOpResult writeGameAudio(const float* pcmFloat, int numSamples, int channels, int sampleRate, int64_t timestampHns);
+    EncoderOpResult writeMicAudio(const float* pcmFloat, int numSamples, int channels, int sampleRate, int64_t timestampHns);
 
     bool finish();
     bool isRecording() const noexcept { return m_recording; }
     int encodedGameSampleRate() const noexcept { return m_gameSampleRate; }
     const GUID& activeSubtype() const noexcept { return m_activeSubtype; }
     bool activeHardware() const noexcept { return m_activeHardware; }
+    std::string activeCodecName() const;
 
     // Identifies the stream layout of the current segment. Segments with different keys
     // cannot be remuxed into one file without re-encoding.
@@ -96,9 +108,9 @@ private:
     bool tryStartLocked(const std::wstring& outputPath, const GUID& subtype, bool hardware,
                         const StartParams& params, HRESULT& outHr, std::string& error);
     bool finishLocked();
-    bool createVideoSample(IMFMediaBuffer* videoBuffer, int64_t timestampHns, IMFSample** ppSample);
+    bool createVideoSample(IMFMediaBuffer* videoBuffer, int64_t timestampHns, IMFSample** ppSample, HRESULT& outHr);
     bool createAudioSample(const float* pcmFloat, int numSamples, int channels, int sampleRate,
-                           int64_t timestampHns, IMFSample** ppSample);
+                           int64_t timestampHns, IMFSample** ppSample, HRESULT& outHr);
 
     IMFSinkWriter* m_sinkWriter = nullptr;
     DWORD m_videoStreamIndex = 0;
