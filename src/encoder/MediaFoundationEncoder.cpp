@@ -90,7 +90,11 @@ bool MediaFoundationEncoder::start(
     bool hardwareAcceleration,
     const std::string& customCodec,
     int gameSampleRate,
-    const std::function<void()>& onBeforeFallback
+    const std::function<void()>& onBeforeFallback,
+    bool allowFallback,
+    const GUID& forcedSubtype,
+    bool useForcedHardware,
+    bool forcedHardware
 ) {
     std::lock_guard<std::mutex> lock(m_mutex);
     finishLocked();
@@ -105,6 +109,8 @@ bool MediaFoundationEncoder::start(
     m_splitAudio = splitAudio;
     m_videoFrameDurationHns = 10000000LL / fps;
     m_formatKey.clear();
+    m_activeSubtype = GUID_NULL;
+    m_activeHardware = hardwareAcceleration;
 
     bool enableHardware = hardwareAcceleration;
     GUID targetSubtype = MFVideoFormat_H264;
@@ -137,6 +143,14 @@ bool MediaFoundationEncoder::start(
         targetSubtype = MFVideoFormat_H264;
     }
 
+    const bool hasForcedCodec = (forcedSubtype != GUID_NULL);
+    if (hasForcedCodec) {
+        targetSubtype = forcedSubtype;
+    }
+    if (useForcedHardware) {
+        enableHardware = forcedHardware;
+    }
+
     char reqKeyBuf[200];
     snprintf(reqKeyBuf, sizeof(reqKeyBuf), "%d|%d|%s|%dx%d@%d",
              static_cast<int>(codec), enableHardware ? 1 : 0, cname.c_str(), width, height, fps);
@@ -151,7 +165,7 @@ bool MediaFoundationEncoder::start(
         attempts.push_back({subtype, hw});
     };
 
-    {
+    if (!hasForcedCodec) {
         std::lock_guard<std::mutex> cacheLock(s_codecCacheMutex);
         if (s_hasCachedCodec && s_cachedRequestKey == requestKey && s_cachedHardware == enableHardware) {
             addAttempt(s_cachedSubtype, s_cachedHardware);
@@ -159,12 +173,14 @@ bool MediaFoundationEncoder::start(
     }
 
     addAttempt(targetSubtype, enableHardware);
-    if (targetSubtype == MFVideoFormat_AV1) {
-        addAttempt(MFVideoFormat_HEVC, enableHardware);
-    }
-    addAttempt(MFVideoFormat_H264, enableHardware);
-    if (enableHardware) {
-        addAttempt(MFVideoFormat_H264, false);
+    if (allowFallback && !hasForcedCodec) {
+        if (targetSubtype == MFVideoFormat_AV1) {
+            addAttempt(MFVideoFormat_HEVC, enableHardware);
+        }
+        addAttempt(MFVideoFormat_H264, enableHardware);
+        if (enableHardware) {
+            addAttempt(MFVideoFormat_H264, false);
+        }
     }
 
     StartParams params;
@@ -216,31 +232,35 @@ bool MediaFoundationEncoder::start(
                      subtypeName(attempt.subtype), attempt.hardware ? "hw" : "sw",
                      width, height, fps, params.gameSampleRate, splitAudio ? 1 : 0);
             m_formatKey = key;
+            m_activeSubtype = attempt.subtype;
+            m_activeHardware = attempt.hardware;
             m_recording = true;
 
             {
                 std::lock_guard<std::mutex> cacheLock(s_codecCacheMutex);
-                if (isPrimary) {
-                    s_cachedRequestKey = requestKey;
-                    s_confirmedPrimaryKey = requestKey;
-                    s_cachedSubtype = attempt.subtype;
-                    s_cachedHardware = attempt.hardware;
-                    s_hasCachedCodec = true;
-                } else if (attempt.hardware == enableHardware &&
-                           primaryFailedPermanently &&
-                           s_confirmedPrimaryKey != requestKey) {
-                    // Only cache a fallback codec (e.g. AV1 -> HEVC) when the primary codec is
-                    // genuinely unsupported on this GPU and has never succeeded in this session (#9).
-                    s_cachedRequestKey = requestKey;
-                    s_cachedSubtype = attempt.subtype;
-                    s_cachedHardware = attempt.hardware;
-                    s_hasCachedCodec = true;
+                if (!hasForcedCodec) {
+                    if (isPrimary) {
+                        s_cachedRequestKey = requestKey;
+                        s_confirmedPrimaryKey = requestKey;
+                        s_cachedSubtype = attempt.subtype;
+                        s_cachedHardware = attempt.hardware;
+                        s_hasCachedCodec = true;
+                    } else if (attempt.hardware == enableHardware &&
+                               primaryFailedPermanently &&
+                               s_confirmedPrimaryKey != requestKey) {
+                        // Only cache a fallback codec (e.g. AV1 -> HEVC) when the primary codec is
+                        // genuinely unsupported on this GPU and has never succeeded in this session (#9).
+                        s_cachedRequestKey = requestKey;
+                        s_cachedSubtype = attempt.subtype;
+                        s_cachedHardware = attempt.hardware;
+                        s_hasCachedCodec = true;
+                    }
                 }
 
                 std::string logKey = requestKey + "->" + activeCodecName;
                 if (s_lastLoggedCodecKey != logKey) {
                     s_lastLoggedCodecKey = logKey;
-                    if (!isPrimary) {
+                    if (!isPrimary && !hasForcedCodec) {
                         geode::log::warn("Instant Replay: requested codec unavailable, fell back to {}", activeCodecName);
                     } else {
                         geode::log::info("Instant Replay: encoder started with {}", activeCodecName);
@@ -258,7 +278,9 @@ bool MediaFoundationEncoder::start(
         cleanupFailedAttempt();
     }
 
-    geode::log::error("Instant Replay: no usable video encoder found");
+    if (allowFallback) {
+        geode::log::error("Instant Replay: no usable video encoder found");
+    }
     return false;
 }
 

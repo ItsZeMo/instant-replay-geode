@@ -49,7 +49,11 @@ public:
         bool hardwareAcceleration = true,
         const std::string& customCodec = "",
         int gameSampleRate = 48000,
-        const std::function<void()>& onBeforeFallback = nullptr
+        const std::function<void()>& onBeforeFallback = nullptr,
+        bool allowFallback = true,
+        const GUID& forcedSubtype = GUID_NULL,
+        bool useForcedHardware = false,
+        bool forcedHardware = true
     );
 
     bool writeVideoFrame(IMFMediaBuffer* videoBuffer, int width, int height, int64_t timestampHns);
@@ -59,6 +63,8 @@ public:
     bool finish();
     bool isRecording() const noexcept { return m_recording; }
     int encodedGameSampleRate() const noexcept { return m_gameSampleRate; }
+    const GUID& activeSubtype() const noexcept { return m_activeSubtype; }
+    bool activeHardware() const noexcept { return m_activeHardware; }
 
     // Identifies the stream layout of the current segment. Segments with different keys
     // cannot be remuxed into one file without re-encoding.
@@ -106,6 +112,8 @@ private:
     bool m_splitAudio = true;
     bool m_recording = false;
     std::string m_formatKey;
+    GUID m_activeSubtype = GUID_NULL;
+    bool m_activeHardware = true;
 
     int64_t m_videoFrameDurationHns = 0;
 

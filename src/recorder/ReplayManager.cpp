@@ -16,6 +16,9 @@
 namespace replay {
 
 static constexpr double SEGMENT_DURATION = 30.0; // 30-second rolling chunks
+static constexpr double SEGMENT_PREWARM_SECONDS = 25.0; // pre-warm next encoder 5s before rotation
+static constexpr double MAX_SEGMENT_DURATION = 120.0;   // safety fallback if prepare stalls
+static constexpr double SAVE_PENDING_SWITCH_TIMEOUT = 5.0; // safety fallback for non-blocking F6 switch
 static constexpr size_t MAX_QUEUED_VIDEO_BYTES = 64ull * 1024 * 1024;
 static constexpr size_t MAX_IN_FLIGHT_ENCODER_FRAMES = 16;
 static constexpr size_t MAX_MIC_MIX_SAMPLES = AudioGrabber::kMicSampleRate * 2 * 5; // ~5s stereo cap
@@ -45,10 +48,13 @@ ReplayManager::~ReplayManager() {
     // Do NOT touch other singletons or OpenGL here (static destruction order is unspecified).
     // Clean shutdown happens in ReplayManager::shutdown() hooked on $on_game(Exiting).
     m_running.store(false);
+    m_prepareCancel.store(true);
     m_cv.notify_all();
     if (m_workerThread.joinable()) {
         m_workerThread.join();
     }
+    joinPrepareThread();
+    discardPreparedEncoder();
     joinFinalizeThread();
     joinExportThread();
 }
@@ -120,11 +126,39 @@ void ReplayManager::releaseExportSegments(const std::vector<std::wstring>& paths
     flushDeferredDeletesLocked();
 }
 
+void ReplayManager::joinPrepareThread() {
+    std::lock_guard<std::mutex> lock(m_prepareMutex);
+    if (m_prepareThread.joinable()) {
+        m_prepareThread.join();
+    }
+    m_prepareInFlight.store(false);
+}
+
+void ReplayManager::discardPreparedEncoder() {
+    PreparedEncoder stale;
+    {
+        std::lock_guard<std::mutex> lock(m_prepareDataMutex);
+        stale = std::move(m_prepared);
+        m_prepared = {};
+    }
+    if (stale.encoder) {
+        if (stale.encoder->isRecording()) {
+            stale.encoder->finish();
+        }
+        stale.encoder.reset();
+    }
+    if (!stale.path.empty()) {
+        DeleteFileW(stale.path.c_str());
+    }
+}
+
 void ReplayManager::joinFinalizeThread() {
     std::lock_guard<std::mutex> lock(m_finalizeMutex);
     if (m_finalizeThread.joinable()) {
         m_finalizeThread.join();
     }
+    m_finalizeInFlight.store(false);
+    m_pendingFinalize = {};
 }
 
 void ReplayManager::joinExportThread() {
@@ -235,6 +269,9 @@ void ReplayManager::startReplay() {
     if (m_workerThread.joinable()) {
         m_workerThread.join();
     }
+    m_prepareCancel.store(true);
+    joinPrepareThread();
+    discardPreparedEncoder();
     joinFinalizeThread();
 
     {
@@ -263,6 +300,13 @@ void ReplayManager::startReplay() {
     m_gameAudioWriteErrors = 0;
     m_micAudioWriteErrors = 0;
     m_nextEncoderRetryTime = {};
+    m_prepareFailedCount = 0;
+    m_prepareFailedLastAttempt.store(false);
+    m_nextPrepareRetryTime = {};
+    m_savePendingSwitch = false;
+    m_savePendingSince = {};
+    m_carryGameAudio = {};
+    m_carryMicAudio.clear();
     m_currentSegmentPath.clear();
     m_currentFormatKey.clear();
     resetMicMixer();
@@ -298,6 +342,9 @@ void ReplayManager::stopReplay() {
     if (m_workerThread.joinable()) {
         m_workerThread.join();
     }
+    m_prepareCancel.store(true);
+    joinPrepareThread();
+    discardPreparedEncoder();
     joinFinalizeThread();
 
     // Always close the microphone when replay is stopped so the OS mic indicator turns off
@@ -312,6 +359,9 @@ void ReplayManager::stopReplay() {
         m_encoder.reset();
     }
     reclaimInFlightFrames(true);
+    m_carryGameAudio = {};
+    m_carryMicAudio.clear();
+    m_savePendingSwitch = false;
 
     {
         std::lock_guard<std::mutex> lock(m_queueMutex);
@@ -411,11 +461,12 @@ void ReplayManager::resetMicMixer() {
     m_micMixResampler.reset();
 }
 
-void ReplayManager::appendMicToMix(const AudioChunk& chunk, int targetRate, size_t startFrameOffset) {
+void ReplayManager::appendMicToMix(const AudioChunk& chunk, int targetRate, size_t startFrameOffset, size_t maxFrameCount) {
     if (chunk.samples.size() < 2 || targetRate <= 0) return;
     size_t totalFrames = chunk.samples.size() / 2;
     if (startFrameOffset >= totalFrames) return;
-    size_t srcFrames = totalFrames - startFrameOffset;
+    size_t srcFrames = std::min(totalFrames - startFrameOffset, maxFrameCount);
+    if (srcFrames == 0) return;
     const float* srcPtr = chunk.samples.data() + startFrameOffset * 2;
 
     if (m_micMixRate != targetRate) {
@@ -567,6 +618,78 @@ bool ReplayManager::writeAudioWithResync(
     return true;
 }
 
+void ReplayManager::feedMicChunkIntoMix(
+    const AudioChunk& chunk,
+    int encGameRate,
+    size_t startFrameOffset,
+    size_t maxFrameCount
+) {
+    if (chunk.samples.size() < 2 || maxFrameCount == 0) return;
+    constexpr int rate = AudioGrabber::kMicSampleRate;
+    size_t totalFrames = chunk.samples.size() / 2;
+    if (startFrameOffset >= totalFrames) return;
+    size_t availFrames = std::min(totalFrames - startFrameOffset, maxFrameCount);
+
+    int64_t chunkStartHns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        chunk.timestamp - m_currentSegmentStart).count() / 100;
+    chunkStartHns += (static_cast<int64_t>(startFrameOffset) * 10000000LL) / rate;
+    int64_t chunkDurationHns = (static_cast<int64_t>(availFrames) * 10000000LL) / rate;
+
+    size_t trim = 0;
+    if (chunkStartHns < 0 && (!m_isContinuationSegment || chunkStartHns < -1000000LL)) {
+        if (chunkStartHns + chunkDurationHns <= 0) return;
+        int64_t trimSamples = ((-chunkStartHns) * rate) / 10000000LL;
+        if (trimSamples >= static_cast<int64_t>(availFrames)) return;
+        if (trimSamples > 0) trim = static_cast<size_t>(trimSamples);
+    }
+    appendMicToMix(chunk, encGameRate, startFrameOffset + trim, availFrames - trim);
+}
+
+bool ReplayManager::writeKeepAliveSilence(
+    const ReplayConfig& sessionConfig,
+    int encGameRate,
+    std::vector<float>& silenceScratch,
+    std::string& outFatalError
+) {
+    // Synthesize continuous keep-alive silence on any idle audio stream lagging >200ms behind video (#1).
+    // Keeps MP4 muxer streams interleaved without buffering unbounded packets when e.g. no mic is connected.
+    if (m_lastVideoHns < 0) return true;
+
+    int64_t gameAudioHns = (m_gameAudioSamples * 10000000LL) / encGameRate;
+    if (m_lastVideoHns - gameAudioHns > 2000000LL) {
+        int keepAliveSamples = std::max(480, encGameRate / 10); // 100ms
+        silenceScratch.assign(static_cast<size_t>(keepAliveSamples) * 2, 0.0f);
+        if (m_mixMicIntoGame) {
+            mixMicInto(silenceScratch.data(), static_cast<size_t>(keepAliveSamples));
+        }
+        if (m_encoder->writeGameAudio(silenceScratch.data(), keepAliveSamples, 2, encGameRate, gameAudioHns)) {
+            m_gameAudioSamples += keepAliveSamples;
+            m_gameAudioWriteErrors = 0;
+        } else if (++m_gameAudioWriteErrors >= MAX_CONSECUTIVE_WRITE_ERRORS) {
+            outFatalError = "Instant Replay stopped: audio write error (TEMP drive may be full)";
+            return false;
+        }
+    }
+
+    if (sessionConfig.recordMic.load() && sessionConfig.splitAudioTracks.load()) {
+        constexpr int kMicRate = AudioGrabber::kMicSampleRate;
+        int64_t micAudioHns = (m_micAudioSamples * 10000000LL) / kMicRate;
+        if (m_lastVideoHns - micAudioHns > 2000000LL) {
+            constexpr int kKeepAliveMicSamples = kMicRate / 10; // 4800 stereo frames (100ms)
+            silenceScratch.assign(static_cast<size_t>(kKeepAliveMicSamples) * 2, 0.0f);
+            if (m_encoder->writeMicAudio(silenceScratch.data(), kKeepAliveMicSamples, 2, kMicRate, micAudioHns)) {
+                m_micAudioSamples += kKeepAliveMicSamples;
+                m_micAudioWriteErrors = 0;
+            } else if (++m_micAudioWriteErrors >= MAX_CONSECUTIVE_WRITE_ERRORS) {
+                outFatalError = "Instant Replay stopped: microphone audio write error (TEMP drive may be full)";
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
 bool ReplayManager::processPendingAudio(
     const ReplayConfig& sessionConfig,
     std::vector<float>& gameAudioScratch,
@@ -595,20 +718,7 @@ bool ReplayManager::processPendingAudio(
     if (m_mixMicIntoGame) {
         for (const auto& micAudio : pendingMicAudio) {
             if (!micAudio || micAudio->samples.size() < 2) continue;
-            constexpr int rate = AudioGrabber::kMicSampleRate;
-            int numSamples = static_cast<int>(micAudio->samples.size() / 2);
-            int64_t chunkStartHns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                micAudio->timestamp - m_currentSegmentStart).count() / 100;
-            int64_t chunkDurationHns = (static_cast<int64_t>(numSamples) * 10000000LL) / rate;
-
-            size_t startOffset = 0;
-            if (chunkStartHns < 0 && (!m_isContinuationSegment || chunkStartHns < -1000000LL)) {
-                if (chunkStartHns + chunkDurationHns <= 0) continue;
-                int64_t trim = ((-chunkStartHns) * rate) / 10000000LL;
-                if (trim >= numSamples) continue;
-                if (trim > 0) startOffset = static_cast<size_t>(trim);
-            }
-            appendMicToMix(*micAudio, encGameRate, startOffset);
+            feedMicChunkIntoMix(*micAudio, encGameRate);
         }
         pendingMicAudio.clear();
     }
@@ -655,52 +765,176 @@ bool ReplayManager::processPendingAudio(
         }
     }
 
-    // 4. Synthesize continuous keep-alive silence on any idle audio stream lagging >200ms behind video (#1).
-    //    Keeps MP4 muxer streams interleaved without buffering unbounded packets when e.g. no mic is connected.
-    if (m_lastVideoHns >= 0) {
-        int64_t gameAudioHns = (m_gameAudioSamples * 10000000LL) / encGameRate;
-        if (m_lastVideoHns - gameAudioHns > 2000000LL) {
-            int keepAliveSamples = std::max(480, encGameRate / 10); // 100ms
-            silenceScratch.assign(static_cast<size_t>(keepAliveSamples) * 2, 0.0f);
+    return writeKeepAliveSilence(sessionConfig, encGameRate, silenceScratch, outFatalError);
+}
+
+bool ReplayManager::splitAudioAtBoundary(
+    std::chrono::steady_clock::time_point boundaryTime,
+    const ReplayConfig& cfg,
+    std::vector<float>& gameAudioScratch,
+    std::vector<float>& resampledGameAudioScratch,
+    std::vector<float>& silenceScratch,
+    std::string& outFatalError
+) {
+    if (!m_encoder || !m_encoder->isRecording()) return true;
+
+    std::vector<std::shared_ptr<AudioChunk>> pendingMicAudio;
+    {
+        std::lock_guard<std::mutex> lock(m_queueMutex);
+        while (!m_micAudioQueue.empty()) {
+            pendingMicAudio.push_back(std::move(m_micAudioQueue.front()));
+            m_micAudioQueue.pop_front();
+        }
+    }
+
+    int gameSampleRate = 48000;
+    std::chrono::steady_clock::time_point gameAudioTime{};
+    size_t gameAudioFrames = AudioGrabber::get()->drainGameAudio(gameAudioScratch, gameSampleRate, gameAudioTime);
+
+    const int encGameRate = (m_segmentGameSampleRate > 0) ? m_segmentGameSampleRate : 48000;
+    constexpr int kMicRate = AudioGrabber::kMicSampleRate;
+
+    // Split mic packets across boundaryTime: frames before boundaryTime close segment A,
+    // remaining frames stay buffered for segment B.
+    std::vector<std::shared_ptr<AudioChunk>> closingMicChunks;
+    for (const auto& micAudio : pendingMicAudio) {
+        if (!micAudio || micAudio->samples.size() < 2) continue;
+        int64_t totalMicFrames = static_cast<int64_t>(micAudio->samples.size() / 2);
+        double offsetSec = std::chrono::duration<double>(boundaryTime - micAudio->timestamp).count();
+        int64_t splitMic = std::clamp<int64_t>(static_cast<int64_t>(std::llround(offsetSec * kMicRate)), 0, totalMicFrames);
+
+        if (splitMic > 0) {
             if (m_mixMicIntoGame) {
-                mixMicInto(silenceScratch.data(), static_cast<size_t>(keepAliveSamples));
+                feedMicChunkIntoMix(*micAudio, encGameRate, 0, static_cast<size_t>(splitMic));
+            } else {
+                closingMicChunks.push_back(micAudio);
+                if (splitMic < totalMicFrames) {
+                    auto head = std::make_shared<AudioChunk>();
+                    head->samples.assign(micAudio->samples.begin(), micAudio->samples.begin() + static_cast<std::ptrdiff_t>(splitMic * 2));
+                    head->timestamp = micAudio->timestamp;
+                    closingMicChunks.back() = std::move(head);
+                }
             }
-            if (m_encoder->writeGameAudio(silenceScratch.data(), keepAliveSamples, 2, encGameRate, gameAudioHns)) {
-                m_gameAudioSamples += keepAliveSamples;
-                m_gameAudioWriteErrors = 0;
-            } else if (++m_gameAudioWriteErrors >= MAX_CONSECUTIVE_WRITE_ERRORS) {
+        }
+        if (splitMic < totalMicFrames) {
+            auto tail = std::make_shared<AudioChunk>();
+            tail->samples.assign(micAudio->samples.begin() + static_cast<std::ptrdiff_t>(splitMic * 2), micAudio->samples.end());
+            int64_t deltaNs = (splitMic * 1000000000LL) / kMicRate;
+            tail->timestamp = micAudio->timestamp + std::chrono::nanoseconds(deltaNs);
+            m_carryMicAudio.push_back(std::move(tail));
+        }
+    }
+
+    // Resample drained game audio once before splitting to avoid resampler reset clicks at segment join.
+    if (gameAudioFrames > 0) {
+        int srcRate = (gameSampleRate > 0) ? gameSampleRate : 48000;
+        float* samplesPtr = gameAudioScratch.data();
+        int64_t totalGameFrames = static_cast<int64_t>(gameAudioFrames);
+
+        if (srcRate != encGameRate) {
+            resampledGameAudioScratch.clear();
+            m_gameResampler.process(gameAudioScratch.data(), gameAudioFrames,
+                                    srcRate, encGameRate, resampledGameAudioScratch);
+            samplesPtr = resampledGameAudioScratch.data();
+            totalGameFrames = static_cast<int64_t>(resampledGameAudioScratch.size() / 2);
+        }
+
+        double offsetSec = std::chrono::duration<double>(boundaryTime - gameAudioTime).count();
+        int64_t splitGame = std::clamp<int64_t>(static_cast<int64_t>(std::llround(offsetSec * encGameRate)), 0, totalGameFrames);
+
+        if (splitGame > 0) {
+            if (!writeAudioWithResync(true, samplesPtr, static_cast<int>(splitGame), encGameRate, gameAudioTime, silenceScratch)) {
                 outFatalError = "Instant Replay stopped: audio write error (TEMP drive may be full)";
                 return false;
             }
         }
-
-        if (sessionConfig.recordMic.load() && sessionConfig.splitAudioTracks.load()) {
-            constexpr int kMicRate = AudioGrabber::kMicSampleRate;
-            int64_t micAudioHns = (m_micAudioSamples * 10000000LL) / kMicRate;
-            if (m_lastVideoHns - micAudioHns > 2000000LL) {
-                constexpr int kKeepAliveMicSamples = kMicRate / 10; // 4800 stereo frames (100ms)
-                silenceScratch.assign(static_cast<size_t>(kKeepAliveMicSamples) * 2, 0.0f);
-                if (m_encoder->writeMicAudio(silenceScratch.data(), kKeepAliveMicSamples, 2, kMicRate, micAudioHns)) {
-                    m_micAudioSamples += kKeepAliveMicSamples;
-                    m_micAudioWriteErrors = 0;
-                } else if (++m_micAudioWriteErrors >= MAX_CONSECUTIVE_WRITE_ERRORS) {
-                    outFatalError = "Instant Replay stopped: microphone audio write error (TEMP drive may be full)";
-                    return false;
-                }
+        if (splitGame < totalGameFrames) {
+            m_carryGameAudio.rate = encGameRate;
+            int64_t deltaNs = (splitGame * 1000000000LL) / encGameRate;
+            m_carryGameAudio.timestamp = gameAudioTime + std::chrono::nanoseconds(deltaNs);
+            m_carryGameAudio.samples.assign(samplesPtr + splitGame * 2, samplesPtr + totalGameFrames * 2);
+        }
+    } else if (m_mixMicIntoGame) {
+        size_t thresholdSamples = static_cast<size_t>(encGameRate / 10) * 2;
+        if ((m_micMixFifo.size() - m_micMixReadPos) >= thresholdSamples) {
+            if (!flushMicMixFifo(encGameRate, true)) {
+                outFatalError = "Instant Replay stopped: audio write error (TEMP drive may be full)";
+                return false;
             }
         }
     }
 
+    for (const auto& micAudio : closingMicChunks) {
+        int numSamples = static_cast<int>(micAudio->samples.size() / 2);
+        if (numSamples > 0 && !writeAudioWithResync(false, micAudio->samples.data(), numSamples,
+                                                   kMicRate, micAudio->timestamp, silenceScratch)) {
+            outFatalError = "Instant Replay stopped: microphone audio write error (TEMP drive may be full)";
+            return false;
+        }
+    }
+
+    return writeKeepAliveSilence(cfg, encGameRate, silenceScratch, outFatalError);
+}
+
+bool ReplayManager::flushCarryAudio(
+    const ReplayConfig& cfg,
+    std::vector<float>& resampledScratch,
+    std::vector<float>& silenceScratch,
+    std::string& outFatalError
+) {
+    if (!m_encoder || !m_encoder->isRecording()) {
+        m_carryGameAudio = {};
+        m_carryMicAudio.clear();
+        return true;
+    }
+
+    const int encGameRate = (m_segmentGameSampleRate > 0) ? m_segmentGameSampleRate : 48000;
+
+    if (m_mixMicIntoGame) {
+        for (const auto& micAudio : m_carryMicAudio) {
+            if (!micAudio || micAudio->samples.size() < 2) continue;
+            feedMicChunkIntoMix(*micAudio, encGameRate);
+        }
+    }
+
+    if (m_carryGameAudio.samples.size() >= 2) {
+        float* ptr = m_carryGameAudio.samples.data();
+        int numSamples = static_cast<int>(m_carryGameAudio.samples.size() / 2);
+        if (m_carryGameAudio.rate != encGameRate && m_carryGameAudio.rate > 0) {
+            resampledScratch.clear();
+            m_gameResampler.process(ptr, static_cast<size_t>(numSamples),
+                                    m_carryGameAudio.rate, encGameRate, resampledScratch);
+            ptr = resampledScratch.data();
+            numSamples = static_cast<int>(resampledScratch.size() / 2);
+        }
+        if (numSamples > 0 && !writeAudioWithResync(true, ptr, numSamples, encGameRate, m_carryGameAudio.timestamp, silenceScratch)) {
+            outFatalError = "Instant Replay stopped: audio write error (TEMP drive may be full)";
+            m_carryGameAudio = {};
+            m_carryMicAudio.clear();
+            return false;
+        }
+    }
+
+    if (!m_mixMicIntoGame && cfg.recordMic.load() && cfg.splitAudioTracks.load()) {
+        for (const auto& micAudio : m_carryMicAudio) {
+            if (!micAudio || micAudio->samples.size() < 2) continue;
+            int numSamples = static_cast<int>(micAudio->samples.size() / 2);
+            if (!writeAudioWithResync(false, micAudio->samples.data(), numSamples,
+                                      AudioGrabber::kMicSampleRate, micAudio->timestamp, silenceScratch)) {
+                outFatalError = "Instant Replay stopped: microphone audio write error (TEMP drive may be full)";
+                m_carryGameAudio = {};
+                m_carryMicAudio.clear();
+                return false;
+            }
+        }
+    }
+
+    m_carryGameAudio = {};
+    m_carryMicAudio.clear();
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// Segment handling (worker thread only)
-// ---------------------------------------------------------------------------
-
-void ReplayManager::finalizeCurrentSegment(bool syncForExport, const ReplayConfig& cfg) {
-    if (!m_encoder || !m_encoder->isRecording()) return;
-
+void ReplayManager::flushTrailingSilenceForClose(const ReplayConfig& cfg) {
     const int gameRate = (m_segmentGameSampleRate > 0) ? m_segmentGameSampleRate : 48000;
 
     // Ensure short segments (<200ms) never close with completely empty audio tracks
@@ -724,6 +958,16 @@ void ReplayManager::finalizeCurrentSegment(bool syncForExport, const ReplayConfi
         std::vector<float> silence(static_cast<size_t>(silenceSamples) * 2, 0.0f);
         m_encoder->writeMicAudio(silence.data(), silenceSamples, 2, kMicRate, 0);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Segment handling (worker thread only)
+// ---------------------------------------------------------------------------
+
+ReplayManager::PendingFinalizeInfo ReplayManager::finalizeCurrentSegment(bool syncForExport, const ReplayConfig& cfg) {
+    if (!m_encoder || !m_encoder->isRecording()) return {};
+
+    flushTrailingSilenceForClose(cfg);
 
     auto oldEncoder = std::move(m_encoder);
     std::wstring segPath = std::move(m_currentSegmentPath);
@@ -749,26 +993,40 @@ void ReplayManager::finalizeCurrentSegment(bool syncForExport, const ReplayConfi
         } else {
             deleteSegmentFileLocked(segPath);
         }
-    } else {
-        std::lock_guard<std::mutex> lock(m_finalizeMutex);
-        m_finalizeThread = std::thread([this, enc = std::move(oldEncoder), segPath = std::move(segPath),
-                                        segStart, segDuration, segFormat = std::move(segFormat), hasVideo, cfg]() mutable {
-            HRESULT coHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-            bool ok = enc->finish();
-            enc.reset();
-            if (SUCCEEDED(coHr)) CoUninitialize();
-
-            {
-                std::lock_guard<std::mutex> segLock(m_segmentMutex);
-                if (ok && hasVideo && segDuration > 0.25) {
-                    m_activeSegments.push_back({segPath, segStart, segDuration, segFormat});
-                } else {
-                    deleteSegmentFileLocked(segPath);
-                }
-            }
-            purgeOldSegments(cfg);
-        });
+        return {};
     }
+
+    auto prom = std::make_shared<std::promise<bool>>();
+    std::shared_future<bool> fut = prom->get_future().share();
+    PendingFinalizeInfo info{{segPath, segStart, segDuration, segFormat}, fut};
+
+    std::lock_guard<std::mutex> lock(m_finalizeMutex);
+    m_pendingFinalize = info;
+    m_finalizeInFlight.store(true);
+    m_finalizeThread = std::thread([this, enc = std::move(oldEncoder), segPath = std::move(segPath),
+                                    segStart, segDuration, segFormat = std::move(segFormat),
+                                    hasVideo, cfg, prom = std::move(prom)]() mutable {
+        HRESULT coHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        bool ok = enc->finish();
+        enc.reset();
+        if (SUCCEEDED(coHr)) CoUninitialize();
+
+        bool keep = (ok && hasVideo && segDuration > 0.25);
+        {
+            std::lock_guard<std::mutex> segLock(m_segmentMutex);
+            if (keep) {
+                m_activeSegments.push_back({segPath, segStart, segDuration, segFormat});
+            } else {
+                deleteSegmentFileLocked(segPath);
+            }
+        }
+        prom->set_value(keep);
+        m_finalizeInFlight.store(false);
+        purgeOldSegments(cfg);
+        m_cv.notify_one();
+    });
+
+    return info;
 }
 
 bool ReplayManager::startNewSegment(
@@ -795,7 +1053,7 @@ bool ReplayManager::startNewSegment(
     m_currentSegmentPath = segFile.wstring();
 
     m_mixMicIntoGame = cfg.recordMic.load() && !cfg.splitAudioTracks.load();
-    if (!m_mixMicIntoGame) {
+    if (!m_mixMicIntoGame || !isContinuation) {
         resetMicMixer();
     }
 
@@ -831,6 +1089,9 @@ bool ReplayManager::startNewSegment(
         m_videoWriteErrors = 0;
         m_gameAudioWriteErrors = 0;
         m_micAudioWriteErrors = 0;
+        m_prepareFailedCount = 0;
+        m_prepareFailedLastAttempt.store(false);
+        m_nextPrepareRetryTime = {};
         return true;
     }
 
@@ -841,6 +1102,154 @@ bool ReplayManager::startNewSegment(
     return false;
 }
 
+bool ReplayManager::activatePreparedOrStartNew(
+    const ReplayConfig& cfg,
+    std::chrono::steady_clock::time_point nextSegStart,
+    bool isContinuation,
+    bool allowSyncFallback
+) {
+    PreparedEncoder prepared;
+    {
+        std::lock_guard<std::mutex> lock(m_prepareDataMutex);
+        if (m_prepared.encoder && m_prepared.encoder->isRecording() &&
+            m_prepared.width == m_videoWidth && m_prepared.height == m_videoHeight) {
+            prepared = std::move(m_prepared);
+            m_prepared = {};
+        }
+    }
+
+    if (prepared.encoder) {
+        m_encoder = std::move(prepared.encoder);
+        m_currentSegmentPath = std::move(prepared.path);
+        m_currentFormatKey = std::move(prepared.formatKey);
+        m_segmentGameSampleRate = prepared.gameSampleRate;
+        {
+            std::lock_guard<std::mutex> segLock(m_segmentMutex);
+            m_lastTempDir = prepared.tempDir;
+        }
+        m_mixMicIntoGame = cfg.recordMic.load() && !cfg.splitAudioTracks.load();
+        if (!m_mixMicIntoGame || !isContinuation) {
+            resetMicMixer();
+        }
+        m_lastVideoHns = -1;
+        m_gameAudioSamples = 0;
+        m_micAudioSamples = 0;
+        m_currentSegmentStart = nextSegStart;
+        m_isContinuationSegment = isContinuation;
+        m_encoderFailCount = 0;
+        m_videoWriteErrors = 0;
+        m_gameAudioWriteErrors = 0;
+        m_micAudioWriteErrors = 0;
+        m_prepareFailedCount = 0;
+        m_prepareFailedLastAttempt.store(false);
+        m_nextPrepareRetryTime = {};
+        return true;
+    }
+
+    // Any mismatched stale prepared encoder should be torn down cleanly
+    discardPreparedEncoder();
+
+    if (!allowSyncFallback) {
+        return false;
+    }
+    return startNewSegment(cfg, nextSegStart, isContinuation);
+}
+
+void ReplayManager::startPrepareNextSegment(const ReplayConfig& cfg) {
+    if (!m_encoder || !m_encoder->isRecording()) return;
+    if (m_videoWidth <= 0 || m_videoHeight <= 0) return;
+    // Never keep more than 2 live encoders (current + finalizing OR current + preparing)
+    if (m_prepareInFlight.load() || m_finalizeInFlight.load()) return;
+
+    {
+        std::lock_guard<std::mutex> lock(m_prepareDataMutex);
+        if (m_prepared.encoder && m_prepared.width == m_videoWidth && m_prepared.height == m_videoHeight) {
+            return;
+        }
+    }
+    discardPreparedEncoder();
+
+    joinPrepareThread();
+
+    int segIdx = ++m_segmentIndex;
+    int width = m_videoWidth;
+    int height = m_videoHeight;
+    int gameSampleRate = AudioGrabber::get()->getEncodedGameSampleRate();
+    GUID forcedSubtype = m_encoder->activeSubtype();
+    bool forcedHardware = m_encoder->activeHardware();
+    bool useForcedHardware = (forcedSubtype != GUID_NULL);
+    bool allowFallback = (forcedSubtype == GUID_NULL);
+
+    m_prepareFailedLastAttempt.store(false);
+    m_prepareCancel.store(false);
+    m_prepareInFlight.store(true);
+
+    std::lock_guard<std::mutex> lock(m_prepareMutex);
+    m_prepareThread = std::thread([this, cfg, segIdx, width, height, gameSampleRate,
+                                   forcedSubtype, useForcedHardware, forcedHardware, allowFallback]() {
+        HRESULT coHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+
+        auto tempDir = cfg.getTempDirectory(true);
+        auto segFile = tempDir / (L"seg_" + std::to_wstring(segIdx) + L".mp4");
+        std::wstring segPath = segFile.wstring();
+
+        auto enc = std::make_unique<MediaFoundationEncoder>();
+        int effBitrate = cfg.getEffectiveBitrateMbps();
+        int effMaxBitrate = std::max(cfg.getEffectiveMaxBitrateMbps(), effBitrate);
+
+        bool ok = false;
+        if (!m_prepareCancel.load()) {
+            ok = enc->start(
+                segPath,
+                width,
+                height,
+                cfg.targetFps.load(),
+                effBitrate,
+                effMaxBitrate,
+                cfg.qualityLevel.load(),
+                cfg.rateControl.load(),
+                cfg.recordMic.load() && cfg.splitAudioTracks.load(),
+                cfg.codec.load(),
+                cfg.hardwareAcceleration.load(),
+                cfg.getCustomCodec(),
+                gameSampleRate,
+                nullptr,
+                allowFallback,
+                forcedSubtype,
+                useForcedHardware,
+                forcedHardware
+            );
+        }
+
+        if (ok && !m_prepareCancel.load()) {
+            std::lock_guard<std::mutex> dataLock(m_prepareDataMutex);
+            m_prepared.encoder = std::move(enc);
+            m_prepared.path = std::move(segPath);
+            m_prepared.formatKey = m_prepared.encoder->formatKey();
+            m_prepared.gameSampleRate = m_prepared.encoder->encodedGameSampleRate();
+            m_prepared.tempDir = std::move(tempDir);
+            m_prepared.width = width;
+            m_prepared.height = height;
+            m_prepareFailedLastAttempt.store(false);
+        } else {
+            if (enc) {
+                if (enc->isRecording()) {
+                    enc->finish();
+                }
+                enc.reset();
+            }
+            DeleteFileW(segPath.c_str());
+            if (!ok && !m_prepareCancel.load()) {
+                m_prepareFailedLastAttempt.store(true);
+            }
+        }
+
+        if (SUCCEEDED(coHr)) CoUninitialize();
+        m_prepareInFlight.store(false);
+        m_cv.notify_one();
+    });
+}
+
 bool ReplayManager::rotateSegment(bool syncForExport, const ReplayConfig& cfg,
                                   std::chrono::steady_clock::time_point nextSegStart) {
     bool wasRecording = (m_encoder && m_encoder->isRecording());
@@ -848,10 +1257,11 @@ bool ReplayManager::rotateSegment(bool syncForExport, const ReplayConfig& cfg,
     if (syncForExport) {
         purgeOldSegments(cfg);
     }
-    return startNewSegment(cfg, nextSegStart, wasRecording);
+    return activatePreparedOrStartNew(cfg, nextSegStart, wasRecording, true);
 }
 
 void ReplayManager::purgeOldSegments(const ReplayConfig& cfg) {
+    if (m_saving.load()) return;
     std::lock_guard<std::mutex> lock(m_segmentMutex);
     auto now = std::chrono::steady_clock::now();
     double maxAge = static_cast<double>(cfg.durationSeconds.load()) + SEGMENT_DURATION * 2.0;
@@ -871,53 +1281,95 @@ void ReplayManager::purgeOldSegments(const ReplayConfig& cfg) {
 void ReplayManager::handleSaveRequest(
     bool continueRecording,
     const ReplayConfig& cfg,
+    std::chrono::steady_clock::time_point boundaryTime,
     std::vector<float>& gameAudioScratch,
     std::vector<float>& resampledGameAudioScratch,
     std::vector<float>& silenceScratch
 ) {
+    PendingFinalizeInfo extraPending{};
     bool wasRecording = (m_encoder && m_encoder->isRecording());
-    if (wasRecording) {
+
+    if (continueRecording && wasRecording) {
         std::string ignoredErr;
-        processPendingAudio(cfg, gameAudioScratch, resampledGameAudioScratch, silenceScratch, ignoredErr);
+        splitAudioAtBoundary(boundaryTime, cfg, gameAudioScratch, resampledGameAudioScratch, silenceScratch, ignoredErr);
+
+        bool canHotSwap = false;
+        {
+            std::lock_guard<std::mutex> lock(m_prepareDataMutex);
+            canHotSwap = (m_prepared.encoder && m_prepared.encoder->isRecording() &&
+                          m_prepared.width == m_videoWidth && m_prepared.height == m_videoHeight);
+        }
+
+        if (canHotSwap && !m_finalizeInFlight.load()) {
+            extraPending = finalizeCurrentSegment(false, cfg);
+            if (activatePreparedOrStartNew(cfg, boundaryTime, true, false)) {
+                flushCarryAudio(cfg, resampledGameAudioScratch, silenceScratch, ignoredErr);
+            } else {
+                m_carryGameAudio = {};
+                m_carryMicAudio.clear();
+            }
+        } else {
+            m_prepareCancel.store(true);
+            joinPrepareThread();
+            discardPreparedEncoder();
+
+            finalizeCurrentSegment(true, cfg);
+            purgeOldSegments(cfg);
+            if (m_running.load()) {
+                if (startNewSegment(cfg, boundaryTime, true)) {
+                    flushCarryAudio(cfg, resampledGameAudioScratch, silenceScratch, ignoredErr);
+                } else {
+                    m_carryGameAudio = {};
+                    m_carryMicAudio.clear();
+                    m_encoderFailCount++;
+                    m_nextEncoderRetryTime = std::chrono::steady_clock::now() + std::chrono::seconds(2 * m_encoderFailCount);
+                }
+            } else {
+                m_carryGameAudio = {};
+                m_carryMicAudio.clear();
+            }
+        }
+    } else if (!continueRecording) {
+        m_prepareCancel.store(true);
+        joinPrepareThread();
+        discardPreparedEncoder();
+        if (wasRecording) {
+            std::string ignoredErr;
+            processPendingAudio(cfg, gameAudioScratch, resampledGameAudioScratch, silenceScratch, ignoredErr);
+            finalizeCurrentSegment(true, cfg);
+        } else {
+            std::lock_guard<std::mutex> lock(m_finalizeMutex);
+            if (m_finalizeInFlight.load() && m_pendingFinalize.future.valid()) {
+                extraPending = m_pendingFinalize;
+            }
+        }
+    } else {
+        // B4: Not currently recording (e.g. during encoder-start backoff or waiting for first frame);
+        // pass any in-flight background finalization future to export so completed segments are never missed.
+        std::lock_guard<std::mutex> lock(m_finalizeMutex);
+        if (m_finalizeInFlight.load() && m_pendingFinalize.future.valid()) {
+            extraPending = m_pendingFinalize;
+        }
     }
-    auto nextSegStart = std::chrono::steady_clock::now();
 
-    // 1. Synchronously close the running segment so it becomes a valid MP4
-    finalizeCurrentSegment(true, cfg);
-
-    // 2. Pick the newest compatible segments covering the requested duration,
-    //    and lock their files so stopReplay/purgeOldSegments cannot delete them
-    //    while the background export thread is reading them.
-    std::vector<std::wstring> segsToMerge;
-    double totalSeconds = 0.0;
-    double maxDuration = static_cast<double>(std::max(1, cfg.durationSeconds.load()));
+    // Snapshot candidate segments and lock their files immediately under m_segmentMutex so neither
+    // purgeOldSegments nor stopReplay can delete them while background finalization or export runs.
+    std::vector<SegmentInfo> candidateSegments;
+    std::vector<std::wstring> preLockedPaths;
     {
         std::lock_guard<std::mutex> lock(m_segmentMutex);
-        std::string requiredFormat;
-        for (auto it = m_activeSegments.rbegin(); it != m_activeSegments.rend(); ++it) {
-            if (requiredFormat.empty()) {
-                requiredFormat = it->formatKey;
-            } else if (!it->formatKey.empty() && it->formatKey != requiredFormat) {
-                // Stop before a segment recorded with incompatible stream settings
-                break;
-            }
-            segsToMerge.insert(segsToMerge.begin(), it->filePath);
-            totalSeconds += it->durationSeconds;
-            if (totalSeconds >= maxDuration) break;
+        candidateSegments = m_activeSegments;
+        for (const auto& seg : candidateSegments) {
+            m_exportLockedSegments.insert(seg.filePath);
+            preLockedPaths.push_back(seg.filePath);
         }
-        for (const auto& p : segsToMerge) {
-            m_exportLockedSegments.insert(p);
+        if (extraPending.future.valid() && !extraPending.segment.filePath.empty()) {
+            m_exportLockedSegments.insert(extraPending.segment.filePath);
+            preLockedPaths.push_back(extraPending.segment.filePath);
         }
     }
 
-    double trimStartSeconds = std::max(0.0, totalSeconds - maxDuration);
-
-    // 3. Immediately keep recording into a fresh segment (unless we are stopping)
-    if (continueRecording && m_running.load()) {
-        startNewSegment(cfg, nextSegStart, wasRecording);
-    }
-
-    if (segsToMerge.empty()) {
+    if (candidateSegments.empty() && !extraPending.future.valid()) {
         m_saving.store(false);
         geode::Loader::get()->queueInMainThread([]() {
             geode::Notification::create("Instant Replay: replay is empty", geode::NotificationIcon::Warning)->show();
@@ -925,25 +1377,86 @@ void ReplayManager::handleSaveRequest(
         return;
     }
 
-    uint64_t freeMB = 0, neededMB = 0;
-    bool isTempLow = false;
-    if (cfg.isLowDiskSpace(&freeMB, &neededMB, &isTempLow)) {
-        geode::Loader::get()->queueInMainThread([freeMB, isTempLow]() {
-            char buf[112];
-            snprintf(buf, sizeof(buf), "Warning: Low %s disk space! (%llu MB free)",
-                     isTempLow ? "TEMP" : "save", static_cast<unsigned long long>(freeMB));
-            geode::Notification::create(buf, geode::NotificationIcon::Warning, 3.0f)->show();
-        });
-    }
-
-    // 4. Merge in the background. Join any previous finished export thread first.
+    // Wait for any previous finished export thread, then run finalization wait, disk checks, and merge off worker thread.
     joinExportThread();
-    std::filesystem::path saveDir = cfg.getRecordingsDirectory(true);
     bool showNotif = ReplayConfig::get().showNotification.load();
+    ReplayConfig cfgCopy = cfg;
 
     std::lock_guard<std::mutex> exportLock(m_exportMutex);
-    m_exportThread = std::thread([this, segsToMerge = std::move(segsToMerge), saveDir = std::move(saveDir),
-                                  totalSeconds, trimStartSeconds, showNotif]() {
+    m_exportThread = std::thread([this,
+                                  candidateSegments = std::move(candidateSegments),
+                                  preLockedPaths = std::move(preLockedPaths),
+                                  extraPending = std::move(extraPending),
+                                  cfgCopy,
+                                  showNotif]() mutable {
+        if (extraPending.future.valid()) {
+            bool keepExtra = extraPending.future.get();
+            if (keepExtra && !extraPending.segment.filePath.empty()) {
+                bool alreadyPresent = false;
+                for (const auto& s : candidateSegments) {
+                    if (s.filePath == extraPending.segment.filePath) {
+                        alreadyPresent = true;
+                        break;
+                    }
+                }
+                if (!alreadyPresent) {
+                    candidateSegments.push_back(extraPending.segment);
+                }
+            }
+        }
+
+        std::vector<std::wstring> segsToMerge;
+        double totalSeconds = 0.0;
+        double maxDuration = static_cast<double>(std::max(1, cfgCopy.durationSeconds.load()));
+        std::string requiredFormat;
+        for (auto it = candidateSegments.rbegin(); it != candidateSegments.rend(); ++it) {
+            if (requiredFormat.empty()) {
+                requiredFormat = it->formatKey;
+            } else if (!it->formatKey.empty() && it->formatKey != requiredFormat) {
+                break;
+            }
+            segsToMerge.insert(segsToMerge.begin(), it->filePath);
+            totalSeconds += it->durationSeconds;
+            if (totalSeconds >= maxDuration) break;
+        }
+        double trimStartSeconds = std::max(0.0, totalSeconds - maxDuration);
+
+        // Shrink export locks down to only the segments selected for merging
+        {
+            std::lock_guard<std::mutex> lock(m_segmentMutex);
+            for (const auto& p : segsToMerge) {
+                m_exportLockedSegments.insert(p);
+            }
+            for (const auto& p : preLockedPaths) {
+                auto it = m_exportLockedSegments.find(p);
+                if (it != m_exportLockedSegments.end()) {
+                    m_exportLockedSegments.erase(it);
+                }
+            }
+            flushDeferredDeletesLocked();
+        }
+
+        if (segsToMerge.empty()) {
+            m_saving.store(false);
+            geode::Loader::get()->queueInMainThread([]() {
+                geode::Notification::create("Instant Replay: replay is empty", geode::NotificationIcon::Warning)->show();
+            });
+            return;
+        }
+
+        uint64_t freeMB = 0, neededMB = 0;
+        bool isTempLow = false;
+        if (cfgCopy.isLowDiskSpace(&freeMB, &neededMB, &isTempLow)) {
+            geode::Loader::get()->queueInMainThread([freeMB, isTempLow]() {
+                char buf[112];
+                snprintf(buf, sizeof(buf), "Warning: Low %s disk space! (%llu MB free)",
+                         isTempLow ? "TEMP" : "save", static_cast<unsigned long long>(freeMB));
+                geode::Notification::create(buf, geode::NotificationIcon::Warning, 3.0f)->show();
+            });
+        }
+
+        std::filesystem::path saveDir = cfgCopy.getRecordingsDirectory(true);
+
         auto sysNow = std::chrono::system_clock::now();
         auto t = std::chrono::system_clock::to_time_t(sysNow);
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(sysNow.time_since_epoch()).count() % 1000;
@@ -1007,8 +1520,10 @@ void ReplayManager::workerThreadFunc(ReplayConfig sessionConfig) {
         {
             std::unique_lock<std::mutex> lock(m_queueMutex);
             m_cv.wait_for(lock, std::chrono::milliseconds(10), [this] {
-                return !m_running.load() || m_saveRequested.load() || !m_frameQueue.empty() ||
-                       !m_micAudioQueue.empty() || AudioGrabber::get()->hasPendingGameAudio();
+                return !m_running.load() || m_saveRequested.load() ||
+                       (m_savePendingSwitch && !m_prepareInFlight.load()) ||
+                       !m_frameQueue.empty() || !m_micAudioQueue.empty() ||
+                       AudioGrabber::get()->hasPendingGameAudio();
             });
 
             if (!m_frameQueue.empty()) {
@@ -1019,18 +1534,39 @@ void ReplayManager::workerThreadFunc(ReplayConfig sessionConfig) {
 
         reclaimInFlightFrames(false);
 
+        auto now = std::chrono::steady_clock::now();
+        if (!m_savePendingSwitch && m_prepareFailedLastAttempt.exchange(false)) {
+            m_prepareFailedCount++;
+            m_nextPrepareRetryTime = now + std::chrono::seconds(2 * m_prepareFailedCount);
+        }
+
         // (Re)start encoder when the first frame arrives or the output size changes
         if (frame && (frame->width != m_videoWidth || frame->height != m_videoHeight ||
                       !m_encoder || !m_encoder->isRecording())) {
-            auto now = std::chrono::steady_clock::now();
+            if (frame->width != m_videoWidth || frame->height != m_videoHeight) {
+                m_prepareCancel.store(true);
+                joinPrepareThread();
+                discardPreparedEncoder();
+                m_prepareFailedCount = 0;
+                m_prepareFailedLastAttempt.store(false);
+            }
+
             if (now >= m_nextEncoderRetryTime) {
-                if (m_encoder && m_encoder->isRecording()) {
+                bool hadActiveEnc = (m_encoder && m_encoder->isRecording());
+                if (hadActiveEnc) {
                     std::string ignoredErr;
-                    processPendingAudio(sessionConfig, gameAudioScratch, resampledGameAudioScratch, silenceScratch, ignoredErr);
+                    splitAudioAtBoundary(frame->timestamp, sessionConfig, gameAudioScratch, resampledGameAudioScratch, silenceScratch, ignoredErr);
                 }
                 m_videoWidth = frame->width;
                 m_videoHeight = frame->height;
-                if (!rotateSegment(false, sessionConfig, frame->timestamp)) {
+                if (rotateSegment(false, sessionConfig, frame->timestamp)) {
+                    if (hadActiveEnc) {
+                        std::string ignoredErr;
+                        flushCarryAudio(sessionConfig, resampledGameAudioScratch, silenceScratch, ignoredErr);
+                    }
+                } else {
+                    m_carryGameAudio = {};
+                    m_carryMicAudio.clear();
                     m_encoderFailCount++;
                     if (m_encoderFailCount >= MAX_ENCODER_START_FAILURES) {
                         FrameGrabber::get()->recycleFrame(std::move(frame));
@@ -1041,6 +1577,81 @@ void ReplayManager::workerThreadFunc(ReplayConfig sessionConfig) {
                     }
                     // Exponential backoff before retrying so we never retry-storm on every frame
                     m_nextEncoderRetryTime = now + std::chrono::seconds(2 * m_encoderFailCount);
+                }
+            }
+        }
+
+        // Pre-warm next encoder ahead of the 30s rotation mark and rotate cleanly on time boundary
+        if (m_encoder && m_encoder->isRecording()) {
+            double elapsed = std::chrono::duration<double>(now - m_currentSegmentStart).count();
+            if (elapsed >= SEGMENT_PREWARM_SECONDS && !m_prepareInFlight.load() && !m_finalizeInFlight.load() &&
+                m_prepareFailedCount < 2 && now >= m_nextPrepareRetryTime) {
+                startPrepareNextSegment(sessionConfig);
+            }
+
+            if (elapsed >= SEGMENT_DURATION) {
+                bool hasPreparedReady = false;
+                {
+                    std::lock_guard<std::mutex> lock(m_prepareDataMutex);
+                    hasPreparedReady = (m_prepared.encoder && m_prepared.encoder->isRecording() &&
+                                        m_prepared.width == m_videoWidth && m_prepared.height == m_videoHeight);
+                }
+                bool prepareExhausted = (!m_prepareInFlight.load() && m_prepareFailedCount >= 2);
+                bool hitMaxDuration = (elapsed >= MAX_SEGMENT_DURATION);
+
+                if (hasPreparedReady || prepareExhausted || hitMaxDuration) {
+                    if (hitMaxDuration && !hasPreparedReady) {
+                        m_prepareCancel.store(true);
+                        joinPrepareThread();
+                        discardPreparedEncoder();
+                    }
+
+                    auto boundaryTime = frame ? frame->timestamp : now;
+                    std::string audioFatalErr;
+                    if (!splitAudioAtBoundary(boundaryTime, sessionConfig, gameAudioScratch, resampledGameAudioScratch, silenceScratch, audioFatalErr)) {
+                        if (frame) {
+                            FrameGrabber::get()->recycleFrame(std::move(frame));
+                            frame.reset();
+                        }
+                        hadFatalError = true;
+                        handleFatalRecordingError(audioFatalErr);
+                        break;
+                    }
+
+                    bool rotated = false;
+                    if (hasPreparedReady && !m_finalizeInFlight.load()) {
+                        finalizeCurrentSegment(false, sessionConfig);
+                        rotated = activatePreparedOrStartNew(sessionConfig, boundaryTime, true, true);
+                    } else {
+                        finalizeCurrentSegment(true, sessionConfig);
+                        rotated = activatePreparedOrStartNew(sessionConfig, boundaryTime, true, true);
+                    }
+
+                    if (rotated) {
+                        if (!flushCarryAudio(sessionConfig, resampledGameAudioScratch, silenceScratch, audioFatalErr)) {
+                            if (frame) {
+                                FrameGrabber::get()->recycleFrame(std::move(frame));
+                                frame.reset();
+                            }
+                            hadFatalError = true;
+                            handleFatalRecordingError(audioFatalErr);
+                            break;
+                        }
+                    } else {
+                        m_carryGameAudio = {};
+                        m_carryMicAudio.clear();
+                        m_encoderFailCount++;
+                        if (m_encoderFailCount >= MAX_ENCODER_START_FAILURES) {
+                            if (frame) {
+                                FrameGrabber::get()->recycleFrame(std::move(frame));
+                                frame.reset();
+                            }
+                            hadFatalError = true;
+                            handleFatalRecordingError("Instant Replay stopped: encoder failed to initialize (check disk space or GPU drivers)");
+                            break;
+                        }
+                        m_nextEncoderRetryTime = now + std::chrono::seconds(2 * m_encoderFailCount);
+                    }
                 }
             }
         }
@@ -1094,29 +1705,52 @@ void ReplayManager::workerThreadFunc(ReplayConfig sessionConfig) {
         }
 
         if (m_saveRequested.exchange(false)) {
-            handleSaveRequest(true, sessionConfig, gameAudioScratch, resampledGameAudioScratch, silenceScratch);
+            if (!m_savePendingSwitch) {
+                m_savePendingSwitch = true;
+                m_savePendingSince = std::chrono::steady_clock::now();
+            }
         }
 
-        // Time-based rotation (drain latest audio into closing segment first so splice is seamless, #4)
-        auto now = std::chrono::steady_clock::now();
-        double elapsed = std::chrono::duration<double>(now - m_currentSegmentStart).count();
-        if (elapsed >= SEGMENT_DURATION && m_encoder && m_encoder->isRecording()) {
-            std::string audioFatalErr;
-            if (!processPendingAudio(sessionConfig, gameAudioScratch, resampledGameAudioScratch, silenceScratch, audioFatalErr)) {
-                hadFatalError = true;
-                handleFatalRecordingError(audioFatalErr);
-                break;
+        if (m_savePendingSwitch) {
+            bool activeEnc = (m_encoder && m_encoder->isRecording());
+            bool preparedReady = false;
+            {
+                std::lock_guard<std::mutex> lock(m_prepareDataMutex);
+                preparedReady = (m_prepared.encoder && m_prepared.encoder->isRecording() &&
+                                 m_prepared.width == m_videoWidth && m_prepared.height == m_videoHeight);
             }
-            rotateSegment(false, sessionConfig, std::chrono::steady_clock::now());
+            auto saveNow = std::chrono::steady_clock::now();
+            double waitSec = std::chrono::duration<double>(saveNow - m_savePendingSince).count();
+
+            bool readyToExecute = false;
+            if (!activeEnc) {
+                readyToExecute = true;
+            } else if (preparedReady && !m_finalizeInFlight.load()) {
+                readyToExecute = true;
+            } else if (m_prepareFailedLastAttempt.exchange(false) || waitSec >= SAVE_PENDING_SWITCH_TIMEOUT) {
+                readyToExecute = true;
+            } else if (!m_prepareInFlight.load() && !m_finalizeInFlight.load()) {
+                startPrepareNextSegment(sessionConfig);
+            }
+
+            if (readyToExecute) {
+                m_savePendingSwitch = false;
+                handleSaveRequest(true, sessionConfig, saveNow, gameAudioScratch, resampledGameAudioScratch, silenceScratch);
+            }
         }
     }
 
     // If a save was requested right before stopReplay() woke us up, fulfill it before tearing down
-    if (!hadFatalError && m_saveRequested.exchange(false)) {
-        handleSaveRequest(false, sessionConfig, gameAudioScratch, resampledGameAudioScratch, silenceScratch);
+    if (!hadFatalError && (m_saveRequested.exchange(false) || m_savePendingSwitch)) {
+        m_savePendingSwitch = false;
+        handleSaveRequest(false, sessionConfig, std::chrono::steady_clock::now(),
+                          gameAudioScratch, resampledGameAudioScratch, silenceScratch);
     }
 
     // Release all COM objects held on this thread BEFORE CoUninitialize (#20)
+    m_prepareCancel.store(true);
+    joinPrepareThread();
+    discardPreparedEncoder();
     joinFinalizeThread();
     if (m_encoder) {
         if (m_encoder->isRecording()) {

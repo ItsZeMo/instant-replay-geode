@@ -18,6 +18,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <filesystem>
+#include <future>
 
 namespace replay {
 
@@ -56,6 +57,27 @@ private:
     void startReplay();
     void stopReplay();
 
+    struct PreparedEncoder {
+        std::unique_ptr<MediaFoundationEncoder> encoder;
+        std::wstring path;
+        std::string formatKey;
+        std::filesystem::path tempDir;
+        int gameSampleRate = 48000;
+        int width = 0;
+        int height = 0;
+    };
+
+    struct PendingFinalizeInfo {
+        SegmentInfo segment;
+        std::shared_future<bool> future;
+    };
+
+    struct CarryGameAudio {
+        std::vector<float> samples;
+        int rate = 48000;
+        std::chrono::steady_clock::time_point timestamp{};
+    };
+
     void workerThreadFunc(ReplayConfig sessionConfig);
     void reclaimInFlightFrames(bool forceClear = false);
     bool processPendingAudio(
@@ -65,13 +87,52 @@ private:
         std::vector<float>& silenceScratch,
         std::string& outFatalError
     );
-    void finalizeCurrentSegment(bool syncForExport, const ReplayConfig& cfg);
+    bool writeKeepAliveSilence(
+        const ReplayConfig& sessionConfig,
+        int encGameRate,
+        std::vector<float>& silenceScratch,
+        std::string& outFatalError
+    );
+    void feedMicChunkIntoMix(
+        const AudioChunk& chunk,
+        int encGameRate,
+        size_t startFrameOffset = 0,
+        size_t maxFrameCount = SIZE_MAX
+    );
+    bool splitAudioAtBoundary(
+        std::chrono::steady_clock::time_point boundaryTime,
+        const ReplayConfig& cfg,
+        std::vector<float>& gameAudioScratch,
+        std::vector<float>& resampledGameAudioScratch,
+        std::vector<float>& silenceScratch,
+        std::string& outFatalError
+    );
+    bool flushCarryAudio(
+        const ReplayConfig& cfg,
+        std::vector<float>& resampledScratch,
+        std::vector<float>& silenceScratch,
+        std::string& outFatalError
+    );
+    void flushTrailingSilenceForClose(const ReplayConfig& cfg);
+
+    PendingFinalizeInfo finalizeCurrentSegment(bool syncForExport, const ReplayConfig& cfg);
     bool startNewSegment(const ReplayConfig& cfg, std::chrono::steady_clock::time_point segStart, bool isContinuation);
+    bool activatePreparedOrStartNew(
+        const ReplayConfig& cfg,
+        std::chrono::steady_clock::time_point nextSegStart,
+        bool isContinuation,
+        bool allowSyncFallback
+    );
+    void startPrepareNextSegment(const ReplayConfig& cfg);
+    void joinPrepareThread();
+    void discardPreparedEncoder();
+
     bool rotateSegment(bool syncForExport, const ReplayConfig& cfg,
                        std::chrono::steady_clock::time_point nextSegStart = std::chrono::steady_clock::now());
     void handleSaveRequest(
         bool continueRecording,
         const ReplayConfig& cfg,
+        std::chrono::steady_clock::time_point boundaryTime,
         std::vector<float>& gameAudioScratch,
         std::vector<float>& resampledGameAudioScratch,
         std::vector<float>& silenceScratch
@@ -91,7 +152,7 @@ private:
 
     // Single-track microphone mixer (recordMic && !splitAudioTracks)
     void resetMicMixer();
-    void appendMicToMix(const AudioChunk& chunk, int targetRate, size_t startFrameOffset = 0);
+    void appendMicToMix(const AudioChunk& chunk, int targetRate, size_t startFrameOffset = 0, size_t maxFrameCount = SIZE_MAX);
     void mixMicInto(float* stereoSamples, size_t numFrames);
     bool flushMicMixFifo(int rate, bool checkErrors);
 
@@ -119,6 +180,25 @@ private:
     int m_segmentGameSampleRate = 48000;
     int m_segmentIndex = 0; // monotonic across sessions so names never collide with in-flight exports
 
+    // Pre-warmed next segment encoder (background m_prepareThread -> worker handoff)
+    PreparedEncoder m_prepared;
+    std::thread m_prepareThread;
+    std::mutex m_prepareMutex;
+    std::mutex m_prepareDataMutex;
+    std::atomic<bool> m_prepareInFlight{false};
+    std::atomic<bool> m_prepareCancel{false};
+    std::atomic<bool> m_prepareFailedLastAttempt{false};
+    int m_prepareFailedCount = 0;
+    std::chrono::steady_clock::time_point m_nextPrepareRetryTime{};
+
+    // Non-blocking F6 switch state (worker thread only)
+    bool m_savePendingSwitch = false;
+    std::chrono::steady_clock::time_point m_savePendingSince{};
+
+    // Audio split across segment rotation boundary (worker thread only)
+    CarryGameAudio m_carryGameAudio;
+    std::vector<std::shared_ptr<AudioChunk>> m_carryMicAudio;
+
     // Encoder video size = size of the frames actually delivered by FrameGrabber
     int m_videoWidth = 0;
     int m_videoHeight = 0;
@@ -142,6 +222,8 @@ private:
     // Asynchronous segment finalizer thread (prevents 30s rotation from stalling worker thread)
     std::thread m_finalizeThread;
     std::mutex m_finalizeMutex;
+    std::atomic<bool> m_finalizeInFlight{false};
+    PendingFinalizeInfo m_pendingFinalize{};
 
     // Export (merge) thread - owned, joined before a new export and on shutdown
     std::thread m_exportThread;
