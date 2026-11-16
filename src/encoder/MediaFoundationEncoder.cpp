@@ -165,33 +165,19 @@ EncoderOpResult MediaFoundationEncoder::start(
     bool enableHardware = hardwareAcceleration;
     GUID targetSubtype = MFVideoFormat_H264;
 
+    const CodecTargetSpec resolvedSpec = resolveRequestedCodecSpec(
+        static_cast<int>(codec), hardwareAcceleration, customCodec);
+    enableHardware = resolvedSpec.hardware;
+    switch (resolvedSpec.family) {
+        case VideoCodecFamily::AV1:  targetSubtype = MFVideoFormat_AV1; break;
+        case VideoCodecFamily::HEVC: targetSubtype = MFVideoFormat_HEVC; break;
+        case VideoCodecFamily::VP9:  targetSubtype = MFVideoFormat_VP90; break;
+        case VideoCodecFamily::H264:
+        default:                     targetSubtype = MFVideoFormat_H264; break;
+    }
+
     std::string cname = customCodec;
     std::transform(cname.begin(), cname.end(), cname.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-
-    if (codec == CodecType::CUSTOM && !cname.empty()) {
-        if (cname.find("cpu") != std::string::npos ||
-            cname.find("software") != std::string::npos ||
-            cname.find("sw") != std::string::npos) {
-            enableHardware = false;
-        }
-        if (cname.find("av1") != std::string::npos) {
-            targetSubtype = MFVideoFormat_AV1;
-        } else if (cname.find("hevc") != std::string::npos ||
-                   cname.find("h265") != std::string::npos ||
-                   cname.find("265") != std::string::npos) {
-            targetSubtype = MFVideoFormat_HEVC;
-        } else if (cname.find("vp9") != std::string::npos) {
-            targetSubtype = MFVideoFormat_VP90;
-        } else {
-            targetSubtype = MFVideoFormat_H264;
-        }
-    } else if (codec == CodecType::AV1) {
-        targetSubtype = MFVideoFormat_AV1;
-    } else if (codec == CodecType::HEVC) {
-        targetSubtype = MFVideoFormat_HEVC;
-    } else {
-        targetSubtype = MFVideoFormat_H264;
-    }
 
     const bool hasForcedCodec = (forcedSubtype != GUID_NULL);
     if (hasForcedCodec) {
@@ -311,13 +297,16 @@ EncoderOpResult MediaFoundationEncoder::start(
                 }
 
                 std::string logKey = requestKey + "->" + codecLabel;
-                if (s_lastLoggedCodecKey != logKey) {
+                if (!isPrimary && !hasForcedCodec && s_lastLoggedCodecKey != logKey) {
                     s_lastLoggedCodecKey = logKey;
-                    if (!isPrimary && !hasForcedCodec) {
-                        geode::log::warn("Instant Replay: requested codec unavailable, fell back to {}", codecLabel);
-                    } else {
-                        geode::log::info("Instant Replay: encoder started with {}", codecLabel);
-                    }
+                    geode::log::warn(
+                        "Instant Replay: requested codec unavailable, fell back to {} ({}x{} @ {} FPS, effBitrate={} Mbps, effMaxBitrate={} Mbps)",
+                        codecLabel, width, height, fps, params.bitrateMbps, params.maxBitrateMbps);
+                } else {
+                    s_lastLoggedCodecKey = logKey;
+                    geode::log::info(
+                        "Instant Replay: encoder started with {} ({}x{} @ {} FPS, effBitrate={} Mbps, effMaxBitrate={} Mbps)",
+                        codecLabel, width, height, fps, params.bitrateMbps, params.maxBitrateMbps);
                 }
             }
             return {true, S_OK, codecLabel};
@@ -338,7 +327,21 @@ EncoderOpResult MediaFoundationEncoder::start(
         }
     }
 
-    if (lastErrMsg.empty()) {
+    bool fellBackToOversizedH264 = false;
+    if (targetSubtype != MFVideoFormat_H264 && (width > kH264MaxWidth || height > kH264MaxHeight)) {
+        for (const auto& attempt : attempts) {
+            if (attempt.subtype == MFVideoFormat_H264) {
+                fellBackToOversizedH264 = true;
+                break;
+            }
+        }
+    }
+
+    if (fellBackToOversizedH264) {
+        lastErrMsg = "AV1/HEVC unavailable and " + std::to_string(width) + "x" + std::to_string(height) +
+                     " exceeds H.264 " + std::to_string(kH264MaxWidth) + "x" + std::to_string(kH264MaxHeight) +
+                     " limit (select HEVC/AV1 or a lower resolution preset)";
+    } else if (lastErrMsg.empty()) {
         lastErrMsg = "no usable video encoder found";
     }
     if (allowFallback) {
@@ -768,6 +771,7 @@ ConcatResult concatenateImpl(
     // 1. Discover the stream layout from the first segment
     struct StreamInfo { DWORD readerIndex; DWORD writerIndex; bool isVideo; };
     std::vector<StreamInfo> streams;
+    LONGLONG videoFrameDurationHns = 0;
 
     ComRef<IMFSinkWriter> writer;
     {
@@ -791,13 +795,21 @@ ConcatResult concatenateImpl(
 
             GUID major = GUID_NULL;
             type->GetGUID(MF_MT_MAJOR_TYPE, &major);
+            const bool isVideo = (major == MFMediaType_Video);
+            if (isVideo && videoFrameDurationHns == 0) {
+                UINT32 fpsNum = 0, fpsDen = 1;
+                if (SUCCEEDED(MFGetAttributeRatio(type.get(), MF_MT_FRAME_RATE, &fpsNum, &fpsDen)) &&
+                    fpsNum > 0 && fpsDen > 0) {
+                    videoFrameDurationHns = (10000000LL * static_cast<LONGLONG>(fpsDen)) / static_cast<LONGLONG>(fpsNum);
+                }
+            }
 
             DWORD outIndex = 0;
             hr = writer->AddStream(type.get(), &outIndex);
             if (FAILED(hr)) return fail("cannot add output stream: " + hrToString(hr));
             hr = writer->SetInputMediaType(outIndex, type.get(), NULL);
             if (FAILED(hr)) return fail("cannot configure output stream: " + hrToString(hr));
-            streams.push_back({s, outIndex, major == MFMediaType_Video});
+            streams.push_back({s, outIndex, isVideo});
         }
         if (streams.empty()) return fail("first segment has no streams");
 
@@ -985,7 +997,14 @@ ConcatResult concatenateImpl(
             }
         }
 
-        concatState.endSegment();
+        bool anomalyWarn = false;
+        int64_t excessOverAudioHns = 0;
+        concatState.endSegment(videoFrameDurationHns, &anomalyWarn, &excessOverAudioHns);
+        if (anomalyWarn) {
+            geode::log::warn(
+                "MediaFoundationEncoder: video end exceeded primary audio end by {:.2f} ms (>1.5 frames) in {}, falling back to max segment end",
+                static_cast<double>(excessOverAudioHns) / 10000.0, segLabel);
+        }
     }
 
     if (samplesWritten == 0) return fail("no media samples were written");

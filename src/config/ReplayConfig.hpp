@@ -4,6 +4,7 @@
 
 #ifdef GEODE_IS_WINDOWS
 
+#include "CodecUtils.hpp"
 #include <Geode/loader/SettingV3.hpp>
 #include <Geode/utils/string.hpp>
 #include <windows.h>
@@ -277,23 +278,27 @@ struct ReplayConfig {
         customTempFolder = val;
     }
 
-    // Thread-safe: reads only atomic state, never touches CCEGLView on worker threads (#18).
-    double getResolutionMultiplier() const noexcept {
-        switch (resolution.load()) {
+    static double resolutionMultiplierForHeight(ResolutionType res, int sessionFrameHeight) noexcept {
+        switch (res) {
             case ResolutionType::HD_720P:   return 0.50;
             case ResolutionType::FHD_1080P: return 1.00;
             case ResolutionType::QHD_1440P: return 1.60;
             case ResolutionType::UHD_4K:    return 2.40;
             case ResolutionType::NATIVE: {
-                int frameH = s_nativeFrameHeight.load(std::memory_order_relaxed);
-                if (frameH > 0) {
-                    double factor = static_cast<double>(frameH) / 1080.0;
+                if (sessionFrameHeight > 0) {
+                    double factor = static_cast<double>(sessionFrameHeight) / 1080.0;
                     return std::clamp(factor, 0.50, 2.50);
                 }
                 return 1.00;
             }
             default: return 1.00;
         }
+    }
+
+    // Thread-safe: reads only atomic state, never touches CCEGLView on worker threads (#18).
+    double getResolutionMultiplier() const noexcept {
+        return resolutionMultiplierForHeight(
+            resolution.load(), s_nativeFrameHeight.load(std::memory_order_relaxed));
     }
 
     double getFpsMultiplier() const noexcept {
@@ -313,13 +318,15 @@ struct ReplayConfig {
         }
     }
 
-    int getEffectiveBitrateMbps() const noexcept {
+    int getEffectiveBitrateMbpsForHeight(int sessionFrameHeight) const noexcept {
         RateControlMode rc = rateControl.load();
         int br = bitrateMbps.load();
         if (rc == RateControlMode::CONSTANT_CBR) {
             return std::clamp(br, 5, 250);
         }
-        double mult = getResolutionMultiplier() * getFpsMultiplier() * getCodecMultiplier();
+        double mult = resolutionMultiplierForHeight(resolution.load(), sessionFrameHeight)
+                    * getFpsMultiplier()
+                    * getCodecMultiplier();
         if (rc == RateControlMode::CONSTANT_QUALITY) {
             double qMult = static_cast<double>(std::clamp(qualityLevel.load(), 20, 100)) / 80.0;
             int val = static_cast<int>(br * mult * qMult + 0.5);
@@ -329,13 +336,23 @@ struct ReplayConfig {
         return std::clamp(val, 5, 250);
     }
 
-    int getEffectiveMaxBitrateMbps() const noexcept {
+    int getEffectiveMaxBitrateMbpsForHeight(int sessionFrameHeight) const noexcept {
         if (rateControl.load() == RateControlMode::CONSTANT_CBR) {
-            return getEffectiveBitrateMbps();
+            return getEffectiveBitrateMbpsForHeight(sessionFrameHeight);
         }
-        double mult = getResolutionMultiplier() * getFpsMultiplier() * getCodecMultiplier();
+        double mult = resolutionMultiplierForHeight(resolution.load(), sessionFrameHeight)
+                    * getFpsMultiplier()
+                    * getCodecMultiplier();
         int val = static_cast<int>(maxBitrateMbps.load() * mult + 0.5);
         return std::clamp(val, 10, 300);
+    }
+
+    int getEffectiveBitrateMbps() const noexcept {
+        return getEffectiveBitrateMbpsForHeight(s_nativeFrameHeight.load(std::memory_order_relaxed));
+    }
+
+    int getEffectiveMaxBitrateMbps() const noexcept {
+        return getEffectiveMaxBitrateMbpsForHeight(s_nativeFrameHeight.load(std::memory_order_relaxed));
     }
 
     // Cached GPU vendor string (populated on the main/GL thread).
@@ -642,6 +659,27 @@ struct ReplayConfig {
         w &= ~1;
         h &= ~1;
         return {std::max(64, w), std::max(64, h)};
+    }
+
+    // Resolves the session output dimensions, clamping requested H.264 sessions to <= 4096x2304
+    // with aspect ratio preserved and even dimensions (so ultrawide 21:9/32:9 presets work with H.264).
+    std::pair<int, int> getSessionResolutionDimensions(
+        int nativeW,
+        int nativeH,
+        bool* outClampedForH264 = nullptr
+    ) const {
+        if (outClampedForH264) *outClampedForH264 = false;
+        auto [w, h] = getResolutionDimensions(nativeW, nativeH);
+        const CodecTargetSpec spec = resolveRequestedCodecSpec(
+            static_cast<int>(codec.load()), hardwareAcceleration.load(), getCustomCodec());
+        if (spec.family == VideoCodecFamily::H264) {
+            VideoDimensions clamped = clampDimensionsToBounds(w, h, kH264MaxWidth, kH264MaxHeight);
+            if (clamped.clamped) {
+                if (outClampedForH264) *outClampedForH264 = true;
+                return {clamped.width, clamped.height};
+            }
+        }
+        return {w, h};
     }
 
     // Pure lexical normalization: strips surrounding whitespace/quotes, validates syntax,

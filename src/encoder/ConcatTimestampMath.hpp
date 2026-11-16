@@ -10,14 +10,22 @@ namespace replay {
 struct ConcatTimestampState {
     int64_t outputBase = 0;
     int64_t segMaxEnd = 0;
+    int64_t segMaxVideoPts = -1;
+    int64_t segMaxVideoEnd = 0;
+    int64_t segLastVideoFrameDurHns = 0;
     int64_t lastVideoDts = -1;
     std::map<uint32_t, int64_t> lastAudioEndByWriterStream;
+    std::map<uint32_t, int64_t> segAudioEndByWriterStream;
 
     explicit ConcatTimestampState(int64_t initialShift = 0) noexcept
-        : outputBase(initialShift), segMaxEnd(initialShift) {}
+        : outputBase(initialShift), segMaxEnd(initialShift), segMaxVideoEnd(initialShift) {}
 
     void beginSegment() noexcept {
         segMaxEnd = outputBase;
+        segMaxVideoPts = -1;
+        segMaxVideoEnd = outputBase;
+        segLastVideoFrameDurHns = 0;
+        segAudioEndByWriterStream.clear();
     }
 
     int64_t computeSampleTime(int64_t srcPts, int64_t segCut) const noexcept {
@@ -48,7 +56,13 @@ struct ConcatTimestampState {
         const int64_t dur = std::max<int64_t>(sampleDuration, 1LL);
         const int64_t sampleEnd = sampleTime + dur;
         bool overlap = false;
-        if (!isVideo) {
+        if (isVideo) {
+            segMaxVideoPts = std::max(segMaxVideoPts, sampleTime);
+            segMaxVideoEnd = std::max(segMaxVideoEnd, sampleEnd);
+            if (sampleDuration > 0) {
+                segLastVideoFrameDurHns = sampleDuration;
+            }
+        } else {
             auto it = lastAudioEndByWriterStream.find(writerIndex);
             if (it != lastAudioEndByWriterStream.end()) {
                 if (sampleTime < it->second) {
@@ -59,14 +73,53 @@ struct ConcatTimestampState {
             } else {
                 lastAudioEndByWriterStream[writerIndex] = sampleEnd;
             }
+
+            auto segIt = segAudioEndByWriterStream.find(writerIndex);
+            if (segIt != segAudioEndByWriterStream.end()) {
+                segIt->second = std::max(segIt->second, sampleEnd);
+            } else {
+                segAudioEndByWriterStream[writerIndex] = sampleEnd;
+            }
         }
         segMaxEnd = std::max(segMaxEnd, sampleEnd);
         return !overlap;
     }
 
-    void endSegment() noexcept {
-        // Next segment base must never precede the end of any video or audio sample already written.
-        outputBase = segMaxEnd;
+    // Advances outputBase to the end of the primary audio track (smallest audio writerIndex),
+    // clamped >= last video PTS + 1 to keep video monotonically ordered across the join.
+    // Falls back to segMaxEnd (and signals *outAnomalyWarn) if video outlasts audio by > 1.5 frames.
+    void endSegment(
+        int64_t expectedVideoFrameDurHns = 0,
+        bool* outAnomalyWarn = nullptr,
+        int64_t* outExcessOverAudioHns = nullptr
+    ) noexcept {
+        if (outAnomalyWarn) *outAnomalyWarn = false;
+        if (outExcessOverAudioHns) *outExcessOverAudioHns = 0;
+
+        if (segAudioEndByWriterStream.empty()) {
+            outputBase = segMaxEnd;
+            return;
+        }
+
+        const int64_t primaryAudioEnd = segAudioEndByWriterStream.begin()->second;
+        const int64_t frameDur = (expectedVideoFrameDurHns > 0)
+            ? expectedVideoFrameDurHns
+            : segLastVideoFrameDurHns;
+
+        if (segMaxVideoPts >= 0 && frameDur > 0) {
+            const int64_t excess = segMaxVideoEnd - primaryAudioEnd;
+            const int64_t anomalyThreshold = (frameDur * 3) / 2;
+            if (excess > anomalyThreshold) {
+                if (outAnomalyWarn) *outAnomalyWarn = true;
+                if (outExcessOverAudioHns) *outExcessOverAudioHns = excess;
+                outputBase = segMaxEnd;
+                return;
+            }
+        }
+
+        outputBase = (segMaxVideoPts >= 0)
+            ? std::max(primaryAudioEnd, segMaxVideoPts + 1)
+            : primaryAudioEnd;
     }
 };
 

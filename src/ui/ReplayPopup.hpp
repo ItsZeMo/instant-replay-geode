@@ -49,6 +49,9 @@ private:
 
     bool guardLocked() const;
     void applyLockState(bool locked);
+    void defocusAllInputs();
+    void updateInputStates();
+    void syncUnfocusedInputsToConfig();
     void markSettingsDirty(bool flushToDisk = false);
     void finalizePendingBitrateClamp();
 
@@ -139,6 +142,7 @@ private:
     uint64_t m_browseRequestId = 0;
 
     // Settings dirty tracking & lock state (#17, #24, #31)
+    int m_activeTab = 0;
     bool m_settingsDirty = false;
     bool m_hasAppliedLockState = false;
     bool m_isLocked = false;

@@ -417,11 +417,17 @@ void FrameGrabber::captureCurrentFrame() {
     int dstW = m_sessionTargetW.load(std::memory_order_acquire);
     int dstH = m_sessionTargetH.load(std::memory_order_acquire);
     if (dstW <= 0 || dstH <= 0) {
-        auto [w, h] = config.getResolutionDimensions(srcW, srcH);
+        bool clamped = false;
+        auto [w, h] = config.getSessionResolutionDimensions(srcW, srcH, &clamped);
         dstW = w;
         dstH = h;
         m_sessionTargetW.store(dstW, std::memory_order_release);
         m_sessionTargetH.store(dstH, std::memory_order_release);
+        if (clamped) {
+            geode::log::info(
+                "FrameGrabber: clamped H.264 output size from {}x{} to {}x{} (max {}x{})",
+                srcW, srcH, dstW, dstH, kH264MaxWidth, kH264MaxHeight);
+        }
     }
 
     GLint prevRead = 0, prevDraw = 0, prevPack = 4;

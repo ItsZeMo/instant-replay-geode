@@ -26,17 +26,25 @@ instant-replay-geode/
 ├── README.md                            # Repository overview & build guide
 ├── AGENTS.md                            # LLM/agent architecture & invariant guide
 ├── CLAUDE.md                            # Pointer to AGENTS.md for Claude Code
+├── tests/
+│   └── host/
+│       └── test_host.cpp                # Standalone Windows host unit/MF integration tests (clang-cl /std:c++latest)
 └── src/
     ├── main.cpp                         # Hooks ($on_game(Exiting), CCEGLView, FMODAudioEngine, MenuLayer, PauseLayer), keybinds, settings listener
     ├── config/
+    │   ├── CodecUtils.hpp               # Pure codec parsing (resolveRequestedCodecSpec) & H.264 4096x2304 aspect clamping
     │   └── ReplayConfig.hpp             # Thread-safe singleton configuration, snapshots, disk space checks & mod.json sync
     ├── capture/
+    │   ├── FrameBudget.hpp              # Dynamic byte-budgeted pool/queue/in-flight frame helpers
     │   ├── FrameGrabber.hpp / .cpp      # OpenGL FBO scaling + double-buffered async PBO readback + pooled IMFMediaBuffer frames
-    │   └── AudioGrabber.hpp / .cpp      # Lock-free SPSC ring buffer FMOD DSP tap + stateful WASAPI mic capture
+    │   ├── GameAudioRing.hpp            # Lock-free SPSC ring buffer + packet metadata ring for FMOD audio
+    │   └── AudioGrabber.hpp / .cpp      # FMOD DSP capture (+ Master HEAD save-sound bypass) + stateful WASAPI mic capture
     ├── encoder/
+    │   ├── ConcatTimestampMath.hpp      # Audio-driven cross-segment timestamp state & B-frame monotonic DTS math
     │   └── MediaFoundationEncoder.hpp / .cpp # IMFSinkWriter encoding (with session codec cache) + IMFSourceReader MP4 remuxing
     ├── recorder/
-    │   └── ReplayManager.hpp / .cpp     # Rolling segment lifecycle, async segment finalizer, worker thread, audio mixer, export thread
+    │   ├── MicMixFifo.hpp               # Timeline-anchored stereo mic mixing FIFO (drift/pause/overlap/rebase)
+    │   └── ReplayManager.hpp / .cpp     # Rolling segment lifecycle, async finalizer, worker thread, audio horizon & export thread
     └── ui/
         ├── ReplayPopup.hpp / .cpp       # 4-tab in-game dashboard & settings popup (F9)
         ├── CodecGuidePopup.hpp / .cpp   # GPU codec recommendation modal
@@ -59,23 +67,23 @@ instant-replay-geode/
    - **Microphone Audio:** Event-driven WASAPI capture thread (`micCaptureThreadFunc`), started only when both `enabled` and `recordMic` are true, and stopped immediately in `ReplayManager::stopReplay()`. Uses `eConsole` first (falling back to `eCommunications`), computes overflow-safe 64-bit QPC packet timestamps, maintains a stateful fractional-phase linear resampler (`StereoResampler`) to `48000 Hz` across packet boundaries, and automatically recovers from device invalidation (`AUDCLNT_E_DEVICE_INVALIDATED`).
 
 3. **Worker Thread & Rolling Segments (`src/recorder/ReplayManager.cpp`)**
-   - Takes an immutable `ReplayConfig` snapshot (`m_sessionConfig`) at `startReplay()` and locks the session output resolution (`FrameGrabber::setTargetResolution`).
+   - Takes an immutable `ReplayConfig` snapshot (`m_sessionConfig`) at `startReplay()`, locks the session output resolution (`FrameGrabber::setTargetResolution`, clamping H.264/custom-H.264 sizes into `4096x2304` with preserved aspect and even sides), and locks session video bitrates (`m_sessionEffBitrateMbps`, `m_sessionEffMaxBitrateMbps`) once from fixed `m_videoHeight`.
    - Encodes into rolling 30-second MP4 segments (`SEGMENT_DURATION = 30.0`, `MAX_SEGMENT_DURATION = 120.0`) inside `getTempDirectory() / seg_<N>.mp4`, where `getTempDirectory()` resolves to `<base>/pid_<PID>` protected by an exclusive `session.lock` handle (`ensureSessionLock` / `releaseSessionLock`).
-   - **Pre-Warming, Async Rotation & Non-Blocking Export:** Pre-warms the next segment's `MediaFoundationEncoder` on `m_prepareThread` after `25 s` (never keeping more than 2 live encoders), drains/splits boundary FMOD/WASAPI audio cleanly across continuation segments, offloads `Finalize()` on `m_finalizeThread`, and hands off `F6` saves cleanly to `m_exportThread` without blocking the worker or main thread. Stop teardown (`m_stopThread`) also runs asynchronously off the UI thread.
+   - **Pre-Warming, Async Rotation & Seam Audio Rules:** Pre-warms the next segment's `MediaFoundationEncoder` on `m_prepareThread` after `25 s` (never keeping more than 2 live encoders). While video frames arrive normally (`< 200 ms`), both game audio and split mic are written only up to the session-wide timestamp of the last encoded video frame (`m_lastWrittenVideoCaptureTime`); newer PCM waits in carry queues (`m_carryGameChunks`, `m_carryMicAudio`) and flushes whenever video catches up, video idles `> 200 ms`, on `stopReplay()`, or on non-continuing save. At every seam `S`, `splitAudioAtBoundary()` writes PCM strictly `< S` (clamped by `targetSamples`), closes every track cleanly up to exact `S` with silence if needed, and leaves `>= S` in carry; continuation segments trim `< S - 1 ms` uniformly. Offloads `Finalize()` on `m_finalizeThread` and exports on `m_exportThread`.
    - **Audio Timestamp Resync & Keep-Alive:** Compares sample-counter timestamps against wall-clock capture timestamps; bridges any positive gap (`> 40 ms`, capped to `<= MAX_SEGMENT_DURATION` total) with chunked (`<= 1 s`) silence samples (mixing single-track mic via timestamp-anchored `MicMixFifo`), trims negative overlaps (`< -40 ms`, advancing `MicMixFifo` to match), and synthesizes continuous silence on idle audio streams (`> 200 ms` behind video).
    - **Per-Stream Error & Recovery Handling:** Stops immediately on fatal storage errors (`ERROR_DISK_FULL`, `ERROR_ACCESS_DENIED`, `ERROR_WRITE_PROTECT`), attempts 1 encoder recreation/fallback on repeated non-storage write failures, tracks encoder start failures with exponential backoff, and stops replay cleanly on the main thread guarded by session ID.
 
 4. **Media Foundation Encoder & Fallback Cascade (`src/encoder/MediaFoundationEncoder.cpp`)**
    - `IMFSinkWriter` runs with `MF_SINK_WRITER_DISABLE_THROTTLING = TRUE` so `WriteSample` never blocks/deadlocks when an audio stream is idle; `ReplayManager` bounds in-flight uncompressed video frames (`MAX_IN_FLIGHT_ENCODER_FRAMES = 16` and `<= max(256 MB, 4 * frameBytes)` via both `m_inFlightFrames` and `IMFSinkWriter::GetStatistics` queue backpressure).
-   - `MediaFoundationEncoder::start()` builds a fallback list:
+   - `MediaFoundationEncoder::start()` uses shared `CodecUtils::resolveRequestedCodecSpec()` and builds a fallback list:
      `Cached Working Codec -> Requested Codec (HW) -> HEVC (HW) -> H.264 (HW) -> H.264 (SW)`.
    - Joins any background segment finalization (`onBeforeFallback`) and retries the primary hardware codec before falling back, and only caches fallback codecs on permanent codec-unsupported errors when the primary codec has never succeeded in the current session.
    - Wraps the caller's `IMFMediaBuffer` directly in an `IMFSample` with zero additional pixel copies.
 
 5. **Saving & Lossless Segment Remuxing (`ReplayManager::handleSaveRequest` & `MediaFoundationEncoder::concatenateSegments`)**
-   - Synchronously finalizes the active segment, selects the newest segments with matching `formatKey` covering `durationSeconds`, and computes `trimStartSeconds = std::max(0.0, totalSeconds - maxDuration)`.
+   - On `F6` (`continueRecording = true`), performs a non-blocking hot-swap onto the pre-warmed encoder (offloading active segment finalization asynchronously to `m_finalizeThread`), falling back to synchronous `Finalize()` only when no prepared encoder is ready or an asynchronous finalization is still in flight. Then selects the newest segments with matching `formatKey` covering `durationSeconds` (`trimStartSeconds = max(0.0, totalSeconds - maxDuration)`).
    - Locks the selected segment file paths in `m_exportLockedSegments` so `stopReplay()`, `purgeOldSegments()`, or `cleanupTempDir()` cannot delete them while `m_exportThread` is reading them.
-   - `concatenateSegments()` scans the first segment for a keyframe near `trimStartSeconds` (and shifts initial PTS by any B-frame decode lead so negative initial DTS is never clamped together at `0`), remuxes all compressed video/audio samples without re-encoding, checks every `ReadSample`, `WriteSample`, and `Finalize` call, and removes any partial output file on failure.
+   - `concatenateSegments()` scans the first segment for a keyframe near `trimStartSeconds` (and shifts initial PTS by any B-frame decode lead so negative initial DTS is never clamped together at `0`), remuxes all compressed video/audio samples without re-encoding, and advances `ConcatTimestampState::outputBase` to the primary game-audio stream end (`>= segMaxVideoPts + 1`, falling back to max segment end with a warning only if video outlasts primary audio by `> 1.5` frames) while preserving monotonic video DTS. Checks every `ReadSample`, `WriteSample`, and `Finalize` call and removes any partial output file on failure.
 
 ---
 
@@ -88,18 +96,20 @@ instant-replay-geode/
 3. **Settings Clamping & Re-entrancy Guard (`ReplayConfig::s_isSavingSettings`):**
    In Geode 5.10+, `IntSettingV3::setValue` resets to `defaultValue` if a value exceeds `min`/`max` in `mod.json`. Always write integer/float settings through `setClampedSetting` and keep `s_isSavingSettings = true` while saving.
 4. **Do Not Overwrite Focused `geode::TextInput`:**
-   In `ReplayPopup::refreshUI()` and `updateFolderDisplay()`, always check `!isInputFocused(input)` before calling `input->setString(...)`, otherwise typing multi-digit numbers (like `"35"` or `"100"`) will clobber the user's input mid-keystroke.
+   In `ReplayPopup::refreshUI()`, `updateFolderDisplay()`, and `syncUnfocusedInputsToConfig()`, always check `!isInputFocused(input)` before calling `input->setString(...)`, otherwise typing multi-digit numbers (like `"35"` or `"100"`) will clobber the user's input mid-keystroke.
 5. **Clean Shutdown & COM Lifetime:**
-   `ReplayManager::shutdown()` is hooked on `$on_game(Exiting)` in `src/main.cpp` so OpenGL FBOs/PBOs and FMOD DSPs are released while the GL context and FMOD system are still valid. All `ComRef` wrappers on worker/WASAPI threads must be destroyed before `CoUninitialize()`.
+   `ReplayManager::shutdown()` is hooked on `$on_game(Exiting)` in `src/main.cpp` so OpenGL FBOs/PBOs and FMOD DSPs/bypass ChannelGroups are released while the GL context and FMOD system are still valid. All `ComRef` wrappers on worker/WASAPI threads must be destroyed before `CoUninitialize()`.
 6. **Main-Thread-Only Cocos2d / GD APIs, `Notification`, and `FMODAudioEngine`:**
    Never call cocos2d-x APIs, Geometry Dash classes, `geode::Notification` / `ReplayNotification`, or `FMODAudioEngine` from worker, finalize, prepare, export, WASAPI, or FMOD mixer threads. Marshal all UI/notification/audio-engine actions via `geode::queueInMainThread`.
 
 ---
 
-## 5. Building the Mod
+## 5. Building & Testing
+
+> **Platform Note:** This mod is Windows x64 only (`WIN32` + Media Foundation + WASAPI + OpenGL) and **does not build on Linux** (`CMakeLists.txt` intentionally errors on non-`WIN32`). Full build verification runs natively on Windows or via GitHub Actions on `windows-latest` (`.github/workflows/build.yml`).
 
 ### Option A: Geode CLI (Recommended)
-Requires [Geode CLI](https://github.com/geode-sdk/cli), Geode SDK (`GEODE_SDK` env var), CMake, Ninja, and clang-cl / MSVC:
+Requires [Geode CLI](https://github.com/geode-sdk/cli), Geode SDK (`GEODE_SDK` env var), CMake, Ninja, and clang-cl / MSVC on Windows:
 ```powershell
 geode build --ninja
 ```
@@ -109,4 +119,11 @@ The packaged mod is written to `build/zemo.instant-replay.geode`.
 ```powershell
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build build --config RelWithDebInfo
+```
+
+### Host Unit & Media Foundation Integration Tests (`tests/host/`)
+Standalone C++23 tests (no Geode/GD runtime required, links Windows Media Foundation directly) live in `tests/host/test_host.cpp`. Run on Windows with `clang-cl` or MSVC (`cl`):
+```powershell
+clang-cl /std:c++latest /EHsc /O2 /I src tests/host/test_host.cpp /Fe:build/test_host.exe mfplat.lib mfreadwrite.lib mfuuid.lib ole32.lib
+.\build\test_host.exe
 ```

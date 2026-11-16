@@ -288,6 +288,8 @@ void ReplayPopup::markSettingsDirty(bool flushToDisk) {
 }
 
 void ReplayPopup::onClose(CCObject* sender) {
+    defocusAllInputs();
+    syncUnfocusedInputsToConfig();
     cancelAsyncTasks();
     if (s_instance == this) {
         s_instance = nullptr;
@@ -323,15 +325,53 @@ bool ReplayPopup::guardLocked() const {
     return false;
 }
 
+void ReplayPopup::defocusAllInputs() {
+    TextInput* inputs[] = {m_durationInput, m_customCodecInput, m_customBitrateInput, m_saveFolderInput};
+    for (TextInput* input : inputs) {
+        if (input) {
+            input->defocus();
+        }
+    }
+}
+
+void ReplayPopup::updateInputStates() {
+    struct TabInput {
+        TextInput* input;
+        int tab;
+    } entries[] = {
+        {m_durationInput, 0},
+        {m_customCodecInput, 1},
+        {m_customBitrateInput, 2},
+        {m_saveFolderInput, 3}
+    };
+    for (const auto& entry : entries) {
+        const bool enabled = !m_isLocked && (m_activeTab == entry.tab);
+        setTextInputLocked(entry.input, !enabled);
+    }
+}
+
+void ReplayPopup::syncUnfocusedInputsToConfig() {
+    const auto& cfg = ReplayConfig::get();
+    auto syncNumeric = [](TextInput* input, int val) {
+        if (!input || isInputFocused(input)) return;
+        std::string expected = std::to_string(val);
+        if (input->getString() != expected) {
+            input->setString(expected);
+        }
+    };
+    syncNumeric(m_durationInput, cfg.durationSeconds.load());
+    syncNumeric(m_customBitrateInput, cfg.bitrateMbps.load());
+}
+
 void ReplayPopup::applyLockState(bool locked) {
-    if (m_hasAppliedLockState && m_isLocked == locked) return;
+    if (m_hasAppliedLockState && m_isLocked == locked) {
+        updateInputStates();
+        return;
+    }
     m_hasAppliedLockState = true;
     m_isLocked = locked;
 
-    setTextInputLocked(m_durationInput, locked);
-    setTextInputLocked(m_customCodecInput, locked);
-    setTextInputLocked(m_customBitrateInput, locked);
-    setTextInputLocked(m_saveFolderInput, locked);
+    updateInputStates();
 
     setTogglerLocked(m_hwAccelToggle, locked);
     setTogglerLocked(m_splitAudioToggle, locked);
@@ -468,7 +508,7 @@ void ReplayPopup::setup() {
     setupAudioStorageTab(m_pages[3], winSize, centerX);
 
     switchTab(0);
-    this->schedule(schedule_selector(ReplayPopup::updateStatusDisplay), 0.5f);
+    this->schedule(schedule_selector(ReplayPopup::updateStatusDisplay), 0.25f);
     refreshUI();
     updateStatusDisplay(0.0f);
     updateFolderDisplay();
@@ -518,6 +558,8 @@ void ReplayPopup::setupDashboardTab(CCNode* page, CCSize const& winSize, float c
 
     auto toggleSpr = ButtonSprite::create("Toggle Replay", "goldFont.fnt", "GJ_button_04.png", 0.75f);
     m_toggleBtn = CCMenuItemExt::createSpriteExtra(toggleSpr, [this](auto*) {
+        this->defocusAllInputs();
+        this->syncUnfocusedInputsToConfig();
         if (!ReplayManager::get()->isReplayActive()) {
             this->finalizePendingBitrateClamp();
             if (m_settingsDirty) {
@@ -1102,16 +1144,20 @@ void ReplayPopup::setupAudioStorageTab(CCNode* page, CCSize const& winSize, floa
 }
 
 void ReplayPopup::switchTab(int tabIndex) {
+    m_activeTab = std::clamp(tabIndex, 0, 3);
+    defocusAllInputs();
     for (int i = 0; i < 4; ++i) {
         if (m_pages[i]) {
-            m_pages[i]->setVisible(i == tabIndex);
+            m_pages[i]->setVisible(i == m_activeTab);
         }
         if (m_tabButtons[i]) {
             if (auto spr = typeinfo_cast<ButtonSprite*>(m_tabButtons[i]->getNormalImage())) {
-                spr->updateBGImage((i == tabIndex) ? "GJ_button_01.png" : "GJ_button_04.png");
+                spr->updateBGImage((i == m_activeTab) ? "GJ_button_01.png" : "GJ_button_04.png");
             }
         }
     }
+    updateInputStates();
+    syncUnfocusedInputsToConfig();
 }
 
 void ReplayPopup::updateFolderDisplay() {
@@ -1204,6 +1250,7 @@ void ReplayPopup::updateStatusDisplay(float dt) {
     bool isStopping = mgr->isStopping();
     bool locked = mgr->isReplayLocked();
     applyLockState(locked);
+    syncUnfocusedInputsToConfig();
 
     if (dt > 0.0f) {
         m_diskCheckTimer += dt;

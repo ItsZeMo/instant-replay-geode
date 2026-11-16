@@ -5,6 +5,7 @@
 #include "../config/ReplayConfig.hpp"
 #include "../recorder/ReplayManager.hpp"
 #include <Geode/binding/FMODAudioEngine.hpp>
+#include <Geode/binding/FMODSound.hpp>
 #include <Geode/utils/string.hpp>
 #include <windows.h>
 #include <timeapi.h>
@@ -119,8 +120,101 @@ void AudioGrabber::cleanup() {
     if (!m_initialized) return;
 
     m_initialized = false;
+    cleanupSaveBypass();
     removeFmodDSP();
     stopMicCapture();
+}
+
+void AudioGrabber::cleanupSaveBypass() {
+    if (m_saveBypassGroup) {
+        FMOD::DSP* bypassHead = nullptr;
+        if (m_saveBypassGroup->getDSP(FMOD_CHANNELCONTROL_DSP_HEAD, &bypassHead) == FMOD_OK && bypassHead) {
+            bypassHead->disconnectAll(false, true);
+        }
+        m_saveBypassGroup->release();
+        m_saveBypassGroup = nullptr;
+    }
+    if (m_cachedSaveSound) {
+        m_cachedSaveSound->release();
+        m_cachedSaveSound = nullptr;
+    }
+}
+
+bool AudioGrabber::playSaveSoundBypass(const char* soundPath) {
+    if (!soundPath || !soundPath[0]) return false;
+    auto engine = FMODAudioEngine::sharedEngine();
+    if (!engine || !engine->m_system) return false;
+
+    const float sfxVol = std::clamp(engine->m_sfxVolume, 0.0f, 1.0f);
+    if (sfxVol <= 0.001f) {
+        return true;
+    }
+
+    FMOD::ChannelGroup* masterGroup = nullptr;
+    if (engine->m_system->getMasterChannelGroup(&masterGroup) != FMOD_OK || !masterGroup) {
+        return false;
+    }
+    FMOD::DSP* masterHead = nullptr;
+    if (masterGroup->getDSP(FMOD_CHANNELCONTROL_DSP_HEAD, &masterHead) != FMOD_OK || !masterHead) {
+        return false;
+    }
+    if (m_fmodDSP && masterHead == m_fmodDSP) {
+        return false;
+    }
+
+    if (!m_saveBypassGroup) {
+        if (engine->m_system->createChannelGroup("IR_SaveSoundBypass", &m_saveBypassGroup) != FMOD_OK || !m_saveBypassGroup) {
+            m_saveBypassGroup = nullptr;
+            return false;
+        }
+    }
+
+    FMOD::DSP* bypassHead = nullptr;
+    if (m_saveBypassGroup->getDSP(FMOD_CHANNELCONTROL_DSP_HEAD, &bypassHead) != FMOD_OK || !bypassHead) {
+        return false;
+    }
+
+    bool alreadyWired = false;
+    int numOut = 0;
+    if (bypassHead->getNumOutputs(&numOut) == FMOD_OK && numOut == 1) {
+        FMOD::DSP* outDsp = nullptr;
+        if (bypassHead->getOutput(0, &outDsp, nullptr) == FMOD_OK && outDsp == masterHead) {
+            alreadyWired = true;
+        }
+    }
+    if (!alreadyWired) {
+        bypassHead->disconnectAll(false, true);
+        if (masterHead->addInput(bypassHead, nullptr, FMOD_DSPCONNECTION_TYPE_STANDARD) != FMOD_OK) {
+            return false;
+        }
+    }
+
+    FMOD::Sound* sound = nullptr;
+    if (FMODSound* fs = engine->preloadEffect(soundPath)) {
+        sound = fs->m_sound;
+    }
+    if (!sound) {
+        if (!m_cachedSaveSound) {
+            std::string fullPath = cocos2d::CCFileUtils::sharedFileUtils()->fullPathForFilename(soundPath, false);
+            if (!fullPath.empty()) {
+                if (engine->m_system->createSound(fullPath.c_str(), FMOD_DEFAULT, nullptr, &m_cachedSaveSound) != FMOD_OK) {
+                    m_cachedSaveSound = nullptr;
+                }
+            }
+        }
+        sound = m_cachedSaveSound;
+    }
+    if (!sound) {
+        return false;
+    }
+
+    FMOD::Channel* channel = nullptr;
+    if (engine->m_system->playSound(sound, m_saveBypassGroup, true, &channel) != FMOD_OK || !channel) {
+        return false;
+    }
+    channel->setVolume(sfxVol);
+    channel->setPaused(false);
+    return true;
 }
 
 void AudioGrabber::setMicAudioCallback(AudioCallback cb) {

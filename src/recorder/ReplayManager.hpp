@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 #include <deque>
+#include <optional>
 #include <set>
 #include <memory>
 #include <mutex>
@@ -114,12 +115,25 @@ private:
         const ReplayConfig& cfg,
         std::string& outFatalError
     );
+    bool consumeAudioQueuesUpTo(
+        std::optional<std::chrono::steady_clock::time_point> cutoffTime,
+        const ReplayConfig& cfg,
+        std::vector<float>& gameAudioScratch,
+        std::vector<float>& resampledGameAudioScratch,
+        std::vector<float>& silenceScratch,
+        bool& outRecovered,
+        std::string& outFatalError,
+        std::optional<int64_t> maxGameSamplesCap = std::nullopt,
+        std::optional<int64_t> maxMicSamplesCap = std::nullopt
+    );
     bool processPendingAudio(
         const ReplayConfig& sessionConfig,
         std::vector<float>& gameAudioScratch,
         std::vector<float>& resampledGameAudioScratch,
         std::vector<float>& silenceScratch,
-        std::string& outFatalError
+        std::string& outFatalError,
+        std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now(),
+        bool bypassHorizon = false
     );
     bool writeKeepAliveSilence(
         const ReplayConfig& sessionConfig,
@@ -152,6 +166,7 @@ private:
     void flushTrailingSilenceForClose(const ReplayConfig& cfg);
 
     PendingFinalizeInfo finalizeCurrentSegment(bool syncForExport, const ReplayConfig& cfg);
+    void ensureSessionBitrates(const ReplayConfig& cfg);
     bool startNewSegment(const ReplayConfig& cfg, std::chrono::steady_clock::time_point segStart, bool isContinuation);
     bool activatePreparedOrStartNew(
         const ReplayConfig& cfg,
@@ -221,7 +236,8 @@ private:
     void mixMicInto(float* stereoSamples, size_t numFrames, int64_t targetSamplePos);
     bool flushMicMixFifo(int rate, bool checkErrors, const ReplayConfig& cfg,
                          std::vector<float>& silenceScratch,
-                         bool& outRecovered, std::string& outFatalError);
+                         bool& outRecovered, std::string& outFatalError,
+                         int64_t maxEndSample = -1);
 
     // Shared timestamp resync + encoder write for game and mic audio streams
     bool writeAudioWithResync(bool isGameAudio, float* samples, int numSamples, int rate,
@@ -255,6 +271,7 @@ private:
     std::string m_currentFormatKey;
     std::chrono::steady_clock::time_point m_currentSegmentStart{};
     std::chrono::steady_clock::time_point m_lastVideoCaptureTime{};
+    std::chrono::steady_clock::time_point m_lastWrittenVideoCaptureTime{}; // session-wide horizon (not reset on rotation)
     bool m_isContinuationSegment = false;
     int m_segmentGameSampleRate = 48000;
     int m_segmentIndex = 0; // monotonic across sessions so names never collide with in-flight exports
@@ -274,16 +291,20 @@ private:
     bool m_savePendingSwitch = false;
     std::chrono::steady_clock::time_point m_savePendingSince{};
 
-    // Audio split across segment rotation boundary (worker thread only)
-    CarryGameAudio m_carryGameAudio;
-    std::vector<std::shared_ptr<AudioChunk>> m_carryMicAudio;
+    // Audio buffered past the video capture horizon / split across segment boundaries (worker thread only)
+    std::deque<CarryGameAudio> m_carryGameChunks;
+    std::deque<std::shared_ptr<AudioChunk>> m_carryMicAudio;
 
-    // Encoder video size = size of the frames actually delivered by FrameGrabber
+    // Encoder video size & session-locked video bitrate (worker thread only)
     int m_videoWidth = 0;
     int m_videoHeight = 0;
+    int m_sessionEffBitrateMbps = 0;
+    int m_sessionEffMaxBitrateMbps = 0;
     int64_t m_lastVideoHns = -1;
     int64_t m_gameAudioSamples = 0;
     int64_t m_micAudioSamples = 0;
+    int64_t m_seamTrimmedGameSamples = 0;
+    int64_t m_seamTrimmedMicSamples = 0;
 
     // Encoder start backoff & per-stream write failure tracking (worker thread only, #3)
     int m_encoderFailCount = 0;

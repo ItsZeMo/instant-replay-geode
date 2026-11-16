@@ -131,6 +131,9 @@ public:
                       std::chrono::steady_clock::time_point captureTime);
 
     void ensureDSPAttached();
+    // Plays an FMOD SFX through a dedicated ChannelGroup wired to Master HEAD DSP,
+    // bypassing the tail capture DSP so notification sounds never enter future replays.
+    bool playSaveSoundBypass(const char* soundPath);
     // Microsoft's AAC MFT only accepts 44100 or 48000 Hz
     int getEncodedGameSampleRate() const noexcept {
         int rate = m_gameSampleRate.load(std::memory_order_relaxed);
@@ -146,11 +149,14 @@ private:
 
     void setupFmodDSP();
     void removeFmodDSP();
+    void cleanupSaveBypass();
 
     void micCaptureThreadFunc();
 
     bool m_initialized = false;
     FMOD::DSP* m_fmodDSP = nullptr;
+    FMOD::ChannelGroup* m_saveBypassGroup = nullptr;
+    FMOD::Sound* m_cachedSaveSound = nullptr;
     std::chrono::steady_clock::time_point m_nextDspRetryTime{};
 
     // Lock-free SPSC ring buffer + per-packet metadata descriptors for FMOD game audio
