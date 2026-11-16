@@ -703,6 +703,21 @@ EncoderOpResult MediaFoundationEncoder::writeMicAudio(
     return {true, S_OK, {}};
 }
 
+bool MediaFoundationEncoder::isVideoQueueSaturated(size_t maxPendingFrames, size_t maxQueuedBytes) const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_recording || !m_sinkWriter) return false;
+    MF_SINK_WRITER_STATISTICS stats{};
+    stats.cb = sizeof(stats);
+    if (FAILED(m_sinkWriter->GetStatistics(m_videoStreamIndex, &stats))) {
+        return false;
+    }
+    const uint64_t pendingFrames = (stats.qwNumSamplesReceived >= stats.qwNumSamplesEncoded)
+        ? (stats.qwNumSamplesReceived - stats.qwNumSamplesEncoded)
+        : 0;
+    return pendingFrames >= maxPendingFrames ||
+           static_cast<size_t>(stats.dwByteCountQueued) >= maxQueuedBytes;
+}
+
 bool MediaFoundationEncoder::finish() {
     std::lock_guard<std::mutex> lock(m_mutex);
     return finishLocked();

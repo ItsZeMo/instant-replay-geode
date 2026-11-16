@@ -73,6 +73,7 @@ public:
 
     bool finish();
     bool isRecording() const noexcept { return m_recording; }
+    bool isVideoQueueSaturated(size_t maxPendingFrames, size_t maxQueuedBytes) const;
     int encodedGameSampleRate() const noexcept { return m_gameSampleRate; }
     const GUID& activeSubtype() const noexcept { return m_activeSubtype; }
     bool activeHardware() const noexcept { return m_activeHardware; }
@@ -129,7 +130,7 @@ private:
 
     int64_t m_videoFrameDurationHns = 0;
 
-    std::mutex m_mutex;
+    mutable std::mutex m_mutex;
 };
 
 } // namespace replay

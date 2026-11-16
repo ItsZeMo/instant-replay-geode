@@ -698,6 +698,32 @@ struct ReplayConfig {
         return resolveTempDirectory(createIfMissing, createIfMissing);
     }
 
+    // Returns all candidate temp base folders (custom, %TEMP%, and Geode fallback) without disk I/O,
+    // so startup cleanup finds orphaned pid_* directories even after temp-folder changes or fallback.
+    std::vector<std::filesystem::path> getAllCandidateTempBaseDirectories() const {
+        std::vector<std::filesystem::path> bases;
+        auto addUnique = [&bases](const std::filesystem::path& p) {
+            if (p.empty()) return;
+            auto norm = p.lexically_normal();
+            for (const auto& existing : bases) {
+                if (existing == norm) return;
+            }
+            bases.push_back(std::move(norm));
+        };
+
+        std::filesystem::path customPath = normalizeCustomDirPath(getCustomTempFolder());
+        if (!customPath.empty()) {
+            auto fname = customPath.filename().wstring();
+            if (fname != L"GeometryDash_InstantReplay" && fname != L"InstantReplay") {
+                customPath /= L"GeometryDash_InstantReplay";
+            }
+            addUnique(customPath);
+        }
+        addUnique(cachedDefaultTempDir());
+        addUnique(geode::dirs::getTempDir() / L"InstantReplay");
+        return bases;
+    }
+
     std::filesystem::path getTempDirectory(bool createIfMissing = false) const {
         auto base = resolveTempDirectory(createIfMissing, createIfMissing);
         if (base.empty()) return {};

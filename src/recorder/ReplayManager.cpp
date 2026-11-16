@@ -22,9 +22,13 @@ static constexpr double SEGMENT_PREWARM_SECONDS = 25.0; // pre-warm next encoder
 static constexpr double MAX_SEGMENT_DURATION = 120.0;   // safety fallback if prepare stalls
 static constexpr double SAVE_PENDING_SWITCH_TIMEOUT = 5.0; // safety fallback for non-blocking F6 switch
 static constexpr size_t MAX_QUEUED_VIDEO_FRAMES = 16;
-static constexpr size_t MAX_QUEUED_VIDEO_BYTES = 64ull * 1024 * 1024;
+static constexpr size_t MIN_QUEUED_VIDEO_FRAMES = 4;
+static constexpr size_t BASE_QUEUED_VIDEO_BYTES = 64ull * 1024 * 1024;
+static constexpr size_t HARD_MAX_QUEUED_VIDEO_BYTES = 256ull * 1024 * 1024;
 static constexpr size_t MAX_IN_FLIGHT_ENCODER_FRAMES = 16;
-static constexpr size_t MAX_MIC_MIX_SAMPLES = AudioGrabber::kMicSampleRate * 2 * 5; // ~5s stereo cap
+static constexpr size_t MIN_IN_FLIGHT_ENCODER_FRAMES = 4;
+static constexpr size_t MAX_IN_FLIGHT_ENCODER_BYTES = 256ull * 1024 * 1024;
+static constexpr size_t MAX_MIC_MIX_FRAMES = static_cast<size_t>(AudioGrabber::kMicSampleRate) * 5; // ~5s stereo cap
 static constexpr int MAX_ENCODER_START_FAILURES = 3;
 static constexpr int MAX_CONSECUTIVE_WRITE_ERRORS = 5;
 
@@ -94,38 +98,56 @@ bool isPidProcessAlive(DWORD pid) {
 
 void ReplayManager::ensureSessionLock(const std::filesystem::path& pidTempDir) {
     if (pidTempDir.empty()) return;
-    std::lock_guard<std::mutex> lock(m_sessionLockMutex);
-    if (m_sessionLockHandle != INVALID_HANDLE_VALUE && m_sessionLockDir == pidTempDir) {
-        return;
-    }
+    std::filesystem::path baseToPersist;
+    {
+        std::lock_guard<std::mutex> lock(m_sessionLockMutex);
+        if (m_sessionLockHandle != INVALID_HANDLE_VALUE && m_sessionLockDir == pidTempDir) {
+            return;
+        }
 
-    auto lockPath = pidTempDir / L"session.lock";
-    HANDLE hNew = CreateFileW(
-        lockPath.c_str(),
-        GENERIC_READ | GENERIC_WRITE,
-        0, // exclusive lock so live instances are never cleaned by another process
-        nullptr,
-        OPEN_ALWAYS,
-        FILE_ATTRIBUTE_NORMAL,
-        nullptr
-    );
-    if (hNew == INVALID_HANDLE_VALUE) {
-        geode::log::warn("ReplayManager: failed to lock session file '{}': err={}",
-            geode::utils::string::pathToString(lockPath), GetLastError());
-        return;
-    }
+        auto lockPath = pidTempDir / L"session.lock";
+        HANDLE hNew = CreateFileW(
+            lockPath.c_str(),
+            GENERIC_READ | GENERIC_WRITE,
+            0, // exclusive lock so live instances are never cleaned by another process
+            nullptr,
+            OPEN_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+            nullptr
+        );
+        if (hNew == INVALID_HANDLE_VALUE) {
+            geode::log::warn("ReplayManager: failed to lock session file '{}': err={}",
+                geode::utils::string::pathToString(lockPath), GetLastError());
+            return;
+        }
 
-    if (m_sessionLockHandle != INVALID_HANDLE_VALUE) {
-        CloseHandle(m_sessionLockHandle);
-        m_sessionLockHandle = INVALID_HANDLE_VALUE;
-        if (!m_sessionLockDir.empty()) {
-            std::error_code ec;
-            std::filesystem::remove(m_sessionLockDir / L"session.lock", ec);
-            std::filesystem::remove(m_sessionLockDir, ec);
+        if (m_sessionLockHandle != INVALID_HANDLE_VALUE) {
+            CloseHandle(m_sessionLockHandle);
+            m_sessionLockHandle = INVALID_HANDLE_VALUE;
+            if (!m_sessionLockDir.empty()) {
+                std::error_code ec;
+                std::filesystem::remove(m_sessionLockDir / L"session.lock", ec);
+                std::filesystem::remove(m_sessionLockDir, ec);
+            }
+        }
+        m_sessionLockHandle = hNew;
+        m_sessionLockDir = pidTempDir;
+
+        auto baseDir = pidTempDir.parent_path().lexically_normal();
+        if (!baseDir.empty() && baseDir != m_persistedTempBase) {
+            m_persistedTempBase = baseDir;
+            baseToPersist = baseDir;
         }
     }
-    m_sessionLockHandle = hNew;
-    m_sessionLockDir = pidTempDir;
+
+    if (!baseToPersist.empty()) {
+        std::string baseUtf8 = geode::utils::string::pathToString(baseToPersist);
+        geode::Loader::get()->queueInMainThread([baseUtf8]() {
+            if (auto* mod = geode::Mod::get()) {
+                mod->setSavedValue<std::string>("last-temp-base", baseUtf8);
+            }
+        });
+    }
 }
 
 void ReplayManager::releaseSessionLock(bool removeFiles) {
@@ -147,6 +169,12 @@ std::filesystem::path ReplayManager::getTempDir(bool createIfMissing) const {
 }
 
 void ReplayManager::cleanupTempDir() {
+    std::filesystem::path persistedBaseCopy;
+    {
+        std::lock_guard<std::mutex> slLock(m_sessionLockMutex);
+        persistedBaseCopy = m_persistedTempBase;
+    }
+
     std::lock_guard<std::mutex> lock(m_segmentMutex);
 
     auto cleanSegmentsInDir = [this](const std::filesystem::path& dir) {
@@ -230,13 +258,25 @@ void ReplayManager::cleanupTempDir() {
         cleanSegmentsInDir(m_lastTempDir);
     }
 
-    auto curBaseDir = ReplayConfig::get().getTempBaseDirectory(false);
-    cleanOrphanedPidDirs(curBaseDir);
-    if (!m_lastTempDir.empty()) {
-        auto lastBaseDir = m_lastTempDir.parent_path();
-        if (!lastBaseDir.empty() && lastBaseDir != curBaseDir) {
-            cleanOrphanedPidDirs(lastBaseDir);
+    // Collect every candidate base folder (custom, %TEMP%, Geode fallback, persisted previous base)
+    // so crashed sessions are cleaned up even if the user changed temp folders or hit disk fallback.
+    std::vector<std::filesystem::path> candidateBases = ReplayConfig::get().getAllCandidateTempBaseDirectories();
+    auto addBase = [&candidateBases](const std::filesystem::path& p) {
+        if (p.empty()) return;
+        auto norm = p.lexically_normal();
+        for (const auto& existing : candidateBases) {
+            if (existing == norm) return;
         }
+        candidateBases.push_back(std::move(norm));
+    };
+    addBase(curTempDir.parent_path());
+    if (!m_lastTempDir.empty()) {
+        addBase(m_lastTempDir.parent_path());
+    }
+    addBase(persistedBaseCopy);
+
+    for (const auto& baseDir : candidateBases) {
+        cleanOrphanedPidDirs(baseDir);
     }
 }
 
@@ -357,24 +397,39 @@ void ReplayManager::initialize() {
     ReplayConfig::refreshNativeFrameHeight();
     ReplayConfig::get().loadFromSettings();
     m_sessionConfig = ReplayConfig::get().snapshot();
+    if (auto* mod = geode::Mod::get()) {
+        std::string savedBase = mod->getSavedValue<std::string>("last-temp-base");
+        if (!savedBase.empty()) {
+            std::lock_guard<std::mutex> slLock(m_sessionLockMutex);
+            m_persistedTempBase = std::filesystem::path(geode::utils::string::utf8ToWide(savedBase)).lexically_normal();
+        }
+    }
     cleanupTempDir();
 
     // Frame grabber callback (render thread -> worker queue)
     FrameGrabber::get()->setFrameCallback([this](std::shared_ptr<CapturedFrame> frame) {
         if (!frame) return;
         std::shared_ptr<CapturedFrame> dropped;
+        bool droppedActiveOverflow = false;
         {
             std::lock_guard<std::mutex> lock(m_queueMutex);
             if (!m_running.load(std::memory_order_relaxed)) {
                 dropped = std::move(frame);
             } else {
                 const size_t queuedBytes = sumFrameBufferBytes(m_frameQueue, [](const CapturedFrame& f) { return f.byteSize; });
-                if (canEnqueueVideoFrameBytes(m_frameQueue.size(), queuedBytes, frame->byteSize, MAX_QUEUED_VIDEO_FRAMES, MAX_QUEUED_VIDEO_BYTES)) {
+                const size_t effectiveQueueBudget = effectiveFrameByteBudget(
+                    BASE_QUEUED_VIDEO_BYTES, frame->byteSize, MIN_QUEUED_VIDEO_FRAMES, HARD_MAX_QUEUED_VIDEO_BYTES);
+                if (canEnqueueVideoFrameBytes(m_frameQueue.size(), queuedBytes, frame->byteSize,
+                                              MAX_QUEUED_VIDEO_FRAMES, effectiveQueueBudget)) {
                     m_frameQueue.push_back(std::move(frame));
                 } else {
                     dropped = std::move(frame);
+                    droppedActiveOverflow = true;
                 }
             }
+        }
+        if (droppedActiveOverflow) {
+            m_queueDropCount.fetch_add(1, std::memory_order_relaxed);
         }
         if (dropped) {
             FrameGrabber::get()->recycleFrame(std::move(dropped));
@@ -469,6 +524,12 @@ void ReplayManager::startReplay() {
     // collide with files still being read by an in-flight export thread.
     m_lastVideoHns = -1;
     m_lastVideoCaptureTime = {};
+    m_staleDropCount.store(0, std::memory_order_relaxed);
+    m_queueDropCount.store(0, std::memory_order_relaxed);
+    m_inFlightDropCount.store(0, std::memory_order_relaxed);
+    m_lastDropLogTime = {};
+    m_lastLoggedQueueDrops = 0;
+    m_lastLoggedInFlightDrops = 0;
     m_gameAudioSamples = 0;
     m_micAudioSamples = 0;
     m_isContinuationSegment = false;
@@ -716,13 +777,25 @@ void ReplayManager::handleFatalRecordingError(const std::string& reason) {
 // ---------------------------------------------------------------------------
 
 void ReplayManager::resetMicMixer() {
-    m_micMixFifo.clear();
-    m_micMixReadPos = 0;
-    m_micMixRate = 0;
+    m_micMix.reset();
+    m_micMixResampleScratch.clear();
     m_micMixResampler.reset();
 }
 
-void ReplayManager::appendMicToMix(const AudioChunk& chunk, int targetRate, size_t startFrameOffset, size_t maxFrameCount) {
+void ReplayManager::rebaseMicMixerForNewSegment(
+    std::chrono::steady_clock::time_point prevSegStart,
+    std::chrono::steady_clock::time_point nextSegStart
+) {
+    m_micMix.rebaseSegmentOrigin(prevSegStart, nextSegStart);
+}
+
+void ReplayManager::appendMicToMix(
+    const AudioChunk& chunk,
+    int targetRate,
+    std::chrono::steady_clock::time_point captureStartTime,
+    size_t startFrameOffset,
+    size_t maxFrameCount
+) {
     if (chunk.samples.size() < 2 || targetRate <= 0) return;
     size_t totalFrames = chunk.samples.size() / 2;
     if (startFrameOffset >= totalFrames) return;
@@ -730,44 +803,24 @@ void ReplayManager::appendMicToMix(const AudioChunk& chunk, int targetRate, size
     if (srcFrames == 0) return;
     const float* srcPtr = chunk.samples.data() + startFrameOffset * 2;
 
-    if (m_micMixRate != targetRate) {
+    if (m_micMix.rate != targetRate) {
         resetMicMixer();
-        m_micMixRate = targetRate;
+        m_micMix.rate = targetRate;
     }
 
-    m_micMixResampler.process(srcPtr, srcFrames, AudioGrabber::kMicSampleRate, targetRate, m_micMixFifo);
+    m_micMixResampleScratch.clear();
+    m_micMixResampler.process(srcPtr, srcFrames, AudioGrabber::kMicSampleRate, targetRate, m_micMixResampleScratch);
+    const size_t resampledFrames = m_micMixResampleScratch.size() / 2;
+    if (resampledFrames == 0) return;
 
-    size_t avail = m_micMixFifo.size() - m_micMixReadPos;
-    if (avail > MAX_MIC_MIX_SAMPLES) {
-        size_t excess = (avail - MAX_MIC_MIX_SAMPLES) & ~static_cast<size_t>(1);
-        m_micMixReadPos += excess;
-    }
-    if (m_micMixReadPos >= 16384 && m_micMixReadPos >= m_micMixFifo.size() / 2) {
-        m_micMixFifo.erase(m_micMixFifo.begin(), m_micMixFifo.begin() + static_cast<std::ptrdiff_t>(m_micMixReadPos));
-        m_micMixReadPos = 0;
-    }
+    const double offsetSec = std::chrono::duration<double>(captureStartTime - m_currentSegmentStart).count();
+    const int64_t chunkStartSample = static_cast<int64_t>(std::llround(offsetSec * targetRate));
+    m_micMix.appendResampled(
+        m_micMixResampleScratch.data(), resampledFrames, targetRate, chunkStartSample, MAX_MIC_MIX_FRAMES);
 }
 
-void ReplayManager::mixMicInto(float* stereoSamples, size_t numFrames) {
-    size_t availSamples = m_micMixFifo.size() - m_micMixReadPos;
-    if (availSamples < 2 || !stereoSamples || numFrames == 0) return;
-    size_t availFrames = availSamples / 2;
-    size_t mixFrames = std::min(numFrames, availFrames);
-
-    const float* micPtr = m_micMixFifo.data() + m_micMixReadPos;
-    for (size_t i = 0; i < mixFrames; ++i) {
-        size_t base = i * 2;
-        stereoSamples[base] = std::clamp(stereoSamples[base] + micPtr[base], -1.0f, 1.0f);
-        stereoSamples[base + 1] = std::clamp(stereoSamples[base + 1] + micPtr[base + 1], -1.0f, 1.0f);
-    }
-    m_micMixReadPos += mixFrames * 2;
-    if (m_micMixReadPos >= m_micMixFifo.size()) {
-        m_micMixFifo.clear();
-        m_micMixReadPos = 0;
-    } else if (m_micMixReadPos >= 16384 && m_micMixReadPos >= m_micMixFifo.size() / 2) {
-        m_micMixFifo.erase(m_micMixFifo.begin(), m_micMixFifo.begin() + static_cast<std::ptrdiff_t>(m_micMixReadPos));
-        m_micMixReadPos = 0;
-    }
+void ReplayManager::mixMicInto(float* stereoSamples, size_t numFrames, int64_t targetSamplePos) {
+    m_micMix.mixInto(stereoSamples, numFrames, targetSamplePos);
 }
 
 ReplayManager::WriteCheckResult ReplayManager::handleEncoderWriteError(
@@ -827,18 +880,60 @@ bool ReplayManager::flushMicMixFifo(
     int rate,
     bool checkErrors,
     const ReplayConfig& cfg,
+    std::vector<float>& silenceScratch,
     bool& outRecovered,
     std::string& outFatalError
 ) {
     outRecovered = false;
-    size_t availSamples = m_micMixFifo.size() - m_micMixReadPos;
-    if (availSamples < 2 || !m_encoder || rate <= 0) return true;
-    int numSamples = static_cast<int>(availSamples / 2);
-    const float* dataPtr = m_micMixFifo.data() + m_micMixReadPos;
+    if (!m_encoder || rate <= 0) return true;
+
+    m_micMix.discardStaleBefore(m_gameAudioSamples);
+    size_t availFrames = m_micMix.availFrames();
+    if (availFrames == 0) return true;
+
+    const int64_t maxSegmentSamples = static_cast<int64_t>(MAX_SEGMENT_DURATION * rate);
+    if (m_micMix.hasAnchor && m_micMix.headSample > m_gameAudioSamples) {
+        const int64_t gapTarget = std::min(m_micMix.headSample, maxSegmentSamples);
+        if (!checkErrors && (gapTarget - m_gameAudioSamples) > static_cast<int64_t>(rate) * 2) {
+            m_micMix.reset();
+            return true;
+        }
+        while (m_gameAudioSamples < gapTarget) {
+            int chunk = static_cast<int>(std::min<int64_t>(gapTarget - m_gameAudioSamples, rate));
+            silenceScratch.assign(static_cast<size_t>(chunk) * 2, 0.0f);
+            int64_t chunkHns = (m_gameAudioSamples * 10000000LL) / rate;
+            EncoderOpResult gapRes = m_encoder->writeGameAudio(silenceScratch.data(), chunk, 2, rate, chunkHns);
+            if (gapRes) {
+                m_gameAudioSamples += chunk;
+                if (checkErrors) m_gameAudioWriteErrors = 0;
+            } else {
+                if (!checkErrors) {
+                    m_micMix.reset();
+                    return true;
+                }
+                WriteCheckResult wc = handleEncoderWriteError("game audio", gapRes, m_gameAudioWriteErrors, cfg, outFatalError);
+                if (wc == WriteCheckResult::Recovered) {
+                    m_micMix.reset();
+                    outRecovered = true;
+                    return false;
+                }
+                if (wc == WriteCheckResult::Fatal) {
+                    m_micMix.reset();
+                    return false;
+                }
+                break;
+            }
+        }
+    }
+
+    int numSamples = static_cast<int>(availFrames);
+    const float* dataPtr = m_micMix.samples.data() + m_micMix.readPos;
     int64_t ts = (m_gameAudioSamples * 10000000LL) / rate;
     EncoderOpResult res = m_encoder->writeGameAudio(dataPtr, numSamples, 2, rate, ts);
-    m_micMixFifo.clear();
-    m_micMixReadPos = 0;
+    m_micMix.samples.clear();
+    m_micMix.readPos = 0;
+    m_micMix.headSample = 0;
+    m_micMix.hasAnchor = false;
     if (res) {
         m_gameAudioSamples += numSamples;
         if (checkErrors) m_gameAudioWriteErrors = 0;
@@ -895,36 +990,38 @@ bool ReplayManager::writeAudioWithResync(
     int64_t expectedHns = (sampleCounter * 10000000LL) / rate;
     int64_t gapHns = chunkStartHns - expectedHns;
 
-    if (gapHns > 400000LL) { // > 40ms positive gap
-        if (gapHns <= 5000000LL) { // <= 500ms: bridge with silence
-            int silenceSamples = static_cast<int>((gapHns * rate) / 10000000LL);
-            if (silenceSamples > 0) {
-                silenceScratch.assign(static_cast<size_t>(silenceSamples) * kChannels, 0.0f);
-                if (isGameAudio && m_mixMicIntoGame) {
-                    mixMicInto(silenceScratch.data(), static_cast<size_t>(silenceSamples));
-                }
-                EncoderOpResult silenceRes = isGameAudio
-                    ? m_encoder->writeGameAudio(silenceScratch.data(), silenceSamples, kChannels, rate, expectedHns)
-                    : m_encoder->writeMicAudio(silenceScratch.data(), silenceSamples, kChannels, rate, expectedHns);
-                if (silenceRes) {
-                    sampleCounter += silenceSamples;
-                } else if (MediaFoundationEncoder::isFatalStorageError(silenceRes.hr)) {
-                    std::string codec = m_encoder ? m_encoder->activeCodecName() : "encoder";
-                    outFatalError = "Instant Replay stopped: " + codec + " failed writing " +
-                                    streamLabel + " (" + silenceRes.message + ")";
+    if (gapHns > 400000LL) { // > 40ms positive gap: always fill with chunked silence so timeline never jumps
+        const int64_t targetSample = (std::max<int64_t>(0, chunkStartHns) * rate) / 10000000LL;
+        const int64_t maxSegmentSamples = static_cast<int64_t>(MAX_SEGMENT_DURATION * rate);
+        const int64_t clampedTarget = std::min(targetSample, maxSegmentSamples);
+        while (sampleCounter < clampedTarget) {
+            const int silenceSamples = static_cast<int>(std::min<int64_t>(clampedTarget - sampleCounter, rate));
+            silenceScratch.assign(static_cast<size_t>(silenceSamples) * kChannels, 0.0f);
+            if (isGameAudio && m_mixMicIntoGame) {
+                mixMicInto(silenceScratch.data(), static_cast<size_t>(silenceSamples), sampleCounter);
+            }
+            const int64_t chunkHns = (sampleCounter * 10000000LL) / rate;
+            EncoderOpResult silenceRes = isGameAudio
+                ? m_encoder->writeGameAudio(silenceScratch.data(), silenceSamples, kChannels, rate, chunkHns)
+                : m_encoder->writeMicAudio(silenceScratch.data(), silenceSamples, kChannels, rate, chunkHns);
+            if (silenceRes) {
+                sampleCounter += silenceSamples;
+                errorCounter = 0;
+            } else {
+                WriteCheckResult wc = handleEncoderWriteError(streamLabel, silenceRes, errorCounter, cfg, outFatalError);
+                if (wc == WriteCheckResult::Recovered) {
+                    outRecovered = true;
                     return false;
                 }
-            }
-        } else {
-            // > 500ms gap: jump sample counter directly to real capture timestamp
-            sampleCounter = ( std::max<int64_t>(0, chunkStartHns) * rate ) / 10000000LL;
-            if (isGameAudio && m_mixMicIntoGame) {
-                m_micMixFifo.clear();
-                m_micMixReadPos = 0;
+                if (wc == WriteCheckResult::Fatal) return false;
+                break;
             }
         }
     } else if (gapHns < -400000LL) { // < -40ms negative gap: sampleCounter is ahead of real time
         int64_t overlapSamples = ((-gapHns) * rate) / 10000000LL;
+        if (isGameAudio && m_mixMicIntoGame && overlapSamples > 0) {
+            m_micMix.advanceOnGameOverlap(sampleCounter, overlapSamples);
+        }
         if (overlapSamples >= numSamples) return true;
         if (overlapSamples > 0) {
             samples += static_cast<size_t>(overlapSamples) * kChannels;
@@ -934,7 +1031,7 @@ bool ReplayManager::writeAudioWithResync(
 
     int64_t ts = (sampleCounter * 10000000LL) / rate;
     if (isGameAudio && m_mixMicIntoGame) {
-        mixMicInto(samples, static_cast<size_t>(numSamples));
+        mixMicInto(samples, static_cast<size_t>(numSamples), sampleCounter);
     }
 
     EncoderOpResult res = isGameAudio
@@ -978,7 +1075,10 @@ void ReplayManager::feedMicChunkIntoMix(
         if (trimSamples >= static_cast<int64_t>(availFrames)) return;
         if (trimSamples > 0) trim = static_cast<size_t>(trimSamples);
     }
-    appendMicToMix(chunk, encGameRate, startFrameOffset + trim, availFrames - trim);
+
+    const int64_t srcDeltaNs = ((static_cast<int64_t>(startFrameOffset + trim)) * 1000000000LL) / rate;
+    const auto micCaptureStart = chunk.timestamp + std::chrono::nanoseconds(srcDeltaNs);
+    appendMicToMix(chunk, encGameRate, micCaptureStart, startFrameOffset + trim, availFrames - trim);
 }
 
 bool ReplayManager::writeKeepAliveSilence(
@@ -998,7 +1098,7 @@ bool ReplayManager::writeKeepAliveSilence(
         int keepAliveSamples = std::max(480, encGameRate / 10); // 100ms
         silenceScratch.assign(static_cast<size_t>(keepAliveSamples) * 2, 0.0f);
         if (m_mixMicIntoGame) {
-            mixMicInto(silenceScratch.data(), static_cast<size_t>(keepAliveSamples));
+            mixMicInto(silenceScratch.data(), static_cast<size_t>(keepAliveSamples), m_gameAudioSamples);
         }
         EncoderOpResult res = m_encoder->writeGameAudio(silenceScratch.data(), keepAliveSamples, 2, encGameRate, gameAudioHns);
         if (res) {
@@ -1094,9 +1194,8 @@ bool ReplayManager::processPendingAudio(
         }
     } else if (m_mixMicIntoGame) {
         // If no game audio arrived for >=100ms in single-track mode, flush queued mic audio directly
-        size_t thresholdSamples = static_cast<size_t>(encGameRate / 10) * 2;
-        if ((m_micMixFifo.size() - m_micMixReadPos) >= thresholdSamples) {
-            if (!flushMicMixFifo(encGameRate, true, sessionConfig, recovered, outFatalError)) {
+        if (m_micMix.availFrames() >= static_cast<size_t>(encGameRate / 10)) {
+            if (!flushMicMixFifo(encGameRate, true, sessionConfig, silenceScratch, recovered, outFatalError)) {
                 return recovered;
             }
         }
@@ -1219,10 +1318,9 @@ bool ReplayManager::splitAudioAtBoundary(
             m_carryGameAudio.samples.assign(samplesPtr + splitGame * 2, samplesPtr + totalGameFrames * 2);
         }
     } else if (m_mixMicIntoGame) {
-        size_t thresholdSamples = static_cast<size_t>(encGameRate / 10) * 2;
-        if ((m_micMixFifo.size() - m_micMixReadPos) >= thresholdSamples) {
+        if (m_micMix.availFrames() >= static_cast<size_t>(encGameRate / 10)) {
             bool rec = false;
-            if (!flushMicMixFifo(encGameRate, true, cfg, rec, outFatalError)) {
+            if (!flushMicMixFifo(encGameRate, true, cfg, silenceScratch, rec, outFatalError)) {
                 if (rec) {
                     clearCarryOnRecover();
                     return true;
@@ -1323,10 +1421,11 @@ void ReplayManager::flushTrailingSilenceForClose(const ReplayConfig& cfg) {
 
     // Ensure short segments (<200ms) never close with completely empty audio tracks
     if (m_gameAudioSamples == 0 && m_lastVideoHns >= 0) {
-        if (m_mixMicIntoGame && (m_micMixFifo.size() - m_micMixReadPos) >= 2) {
+        if (m_mixMicIntoGame && m_micMix.availFrames() > 0) {
             bool ignoredRec = false;
             std::string ignoredErr;
-            flushMicMixFifo(gameRate, false, cfg, ignoredRec, ignoredErr);
+            std::vector<float> trailingSilence;
+            flushMicMixFifo(gameRate, false, cfg, trailingSilence, ignoredRec, ignoredErr);
         } else {
             int silenceSamples = std::clamp<int>(
                 static_cast<int>((std::max<int64_t>(m_lastVideoHns, 1000000LL) * gameRate) / 10000000LL),
@@ -1423,8 +1522,15 @@ bool ReplayManager::startNewSegment(
     std::chrono::steady_clock::time_point segStart,
     bool isContinuation
 ) {
+    const auto prevSegStart = m_currentSegmentStart;
     m_lastVideoHns = -1;
     m_lastVideoCaptureTime = {};
+    m_staleDropCount.store(0, std::memory_order_relaxed);
+    m_queueDropCount.store(0, std::memory_order_relaxed);
+    m_inFlightDropCount.store(0, std::memory_order_relaxed);
+    m_lastDropLogTime = {};
+    m_lastLoggedQueueDrops = 0;
+    m_lastLoggedInFlightDrops = 0;
     m_gameAudioSamples = 0;
     m_micAudioSamples = 0;
     m_currentSegmentStart = segStart;
@@ -1446,6 +1552,8 @@ bool ReplayManager::startNewSegment(
     m_mixMicIntoGame = cfg.recordMic.load() && !cfg.splitAudioTracks.load();
     if (!m_mixMicIntoGame || !isContinuation) {
         resetMicMixer();
+    } else {
+        rebaseMicMixerForNewSegment(prevSegStart, segStart);
     }
 
     if (!m_encoder) {
@@ -1519,9 +1627,12 @@ bool ReplayManager::activatePreparedOrStartNew(
             std::lock_guard<std::mutex> segLock(m_segmentMutex);
             m_lastTempDir = prepared.tempDir;
         }
+        const auto prevSegStart = m_currentSegmentStart;
         m_mixMicIntoGame = cfg.recordMic.load() && !cfg.splitAudioTracks.load();
         if (!m_mixMicIntoGame || !isContinuation) {
             resetMicMixer();
+        } else {
+            rebaseMicMixerForNewSegment(prevSegStart, nextSegStart);
         }
         m_lastVideoHns = -1;
         m_lastVideoCaptureTime = {};
@@ -1681,6 +1792,21 @@ void ReplayManager::abortPendingSave() {
     m_savePending.store(false);
 }
 
+bool ReplayManager::canAcceptEncoderFrame(size_t frameBytes) const {
+    const size_t inFlightBytes = sumFrameBufferBytes(m_inFlightFrames, [](const CapturedFrame& f) { return f.byteSize; });
+    if (!canAcceptInFlightFrameBytes(
+            m_inFlightFrames.size(), inFlightBytes, frameBytes,
+            MAX_IN_FLIGHT_ENCODER_FRAMES, MAX_IN_FLIGHT_ENCODER_BYTES, MIN_IN_FLIGHT_ENCODER_FRAMES)) {
+        return false;
+    }
+    const size_t writerByteLimit = std::max<size_t>(
+        MAX_IN_FLIGHT_ENCODER_BYTES, frameBytes * MIN_IN_FLIGHT_ENCODER_FRAMES);
+    if (m_encoder && m_encoder->isVideoQueueSaturated(MAX_IN_FLIGHT_ENCODER_FRAMES, writerByteLimit)) {
+        return false;
+    }
+    return true;
+}
+
 bool ReplayManager::writeEncodedVideoFrame(
     std::shared_ptr<CapturedFrame> frame,
     const ReplayConfig& cfg,
@@ -1697,12 +1823,18 @@ bool ReplayManager::writeEncodedVideoFrame(
 
     if (frame->timestamp < m_currentSegmentStart) {
         // Stale frame captured before the current segment started; recycle instead of clamping to 0/0.1ms
+        auto drops = m_staleDropCount.fetch_add(1, std::memory_order_relaxed) + 1;
+        geode::log::debug(
+            "ReplayManager: dropped stale video frame ({} us before segment start, total={})",
+            std::chrono::duration_cast<std::chrono::microseconds>(m_currentSegmentStart - frame->timestamp).count(),
+            drops);
         FrameGrabber::get()->recycleFrame(std::move(frame));
         return true;
     }
 
-    if (m_inFlightFrames.size() >= MAX_IN_FLIGHT_ENCODER_FRAMES) {
-        // Encoder queue is saturated; drop frame cleanly to bound memory (#1, #7)
+    if (!canAcceptEncoderFrame(frame->byteSize)) {
+        // Encoder in-flight queue or MF SinkWriter internal queue is saturated; drop cleanly to bound memory (#1, #7)
+        m_inFlightDropCount.fetch_add(1, std::memory_order_relaxed);
         FrameGrabber::get()->recycleFrame(std::move(frame));
         return true;
     }
@@ -1743,20 +1875,20 @@ bool ReplayManager::drainPreBoundaryVideoFrames(
     while (m_encoder && m_encoder->isRecording() && !m_shuttingDown.load()) {
         std::shared_ptr<CapturedFrame> qFrame;
         std::chrono::steady_clock::time_point frontTs{};
+        size_t frontBytes = 0;
         bool hasFront = false;
         {
             std::lock_guard<std::mutex> lock(m_queueMutex);
             if (!m_frameQueue.empty()) {
                 frontTs = m_frameQueue.front()->timestamp;
+                frontBytes = m_frameQueue.front()->byteSize;
                 hasFront = true;
                 if (frontTs <= boundaryTime &&
                     m_frameQueue.front()->width == m_videoWidth &&
-                    m_frameQueue.front()->height == m_videoHeight) {
-                    // Only pop once encoder has capacity so unencoded frames never strand
-                    if (m_inFlightFrames.size() < MAX_IN_FLIGHT_ENCODER_FRAMES) {
-                        qFrame = std::move(m_frameQueue.front());
-                        m_frameQueue.pop_front();
-                    }
+                    m_frameQueue.front()->height == m_videoHeight &&
+                    canAcceptEncoderFrame(frontBytes)) {
+                    qFrame = std::move(m_frameQueue.front());
+                    m_frameQueue.pop_front();
                 }
             }
         }
@@ -1780,12 +1912,12 @@ bool ReplayManager::drainPreBoundaryVideoFrames(
             }
             // Wait briefly for Media Foundation to release an in-flight buffer
             reclaimInFlightFrames(false);
-            if (m_inFlightFrames.size() >= MAX_IN_FLIGHT_ENCODER_FRAMES) {
+            if (!canAcceptEncoderFrame(frontBytes)) {
                 bool freed = false;
                 for (int attempt = 0; attempt < 50 && !m_shuttingDown.load(); ++attempt) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(2));
                     reclaimInFlightFrames(false);
-                    if (m_inFlightFrames.size() < MAX_IN_FLIGHT_ENCODER_FRAMES) {
+                    if (canAcceptEncoderFrame(frontBytes)) {
                         freed = true;
                         break;
                     }
@@ -2197,6 +2329,23 @@ void ReplayManager::workerThreadFunc(ReplayConfig sessionConfig) {
         }
 
         auto now = std::chrono::steady_clock::now();
+        if (m_lastDropLogTime == std::chrono::steady_clock::time_point{}) {
+            m_lastDropLogTime = now;
+        } else if (now - m_lastDropLogTime >= std::chrono::seconds(5)) {
+            uint64_t qDrops = m_queueDropCount.load(std::memory_order_relaxed);
+            uint64_t fDrops = m_inFlightDropCount.load(std::memory_order_relaxed);
+            uint64_t sDrops = m_staleDropCount.load(std::memory_order_relaxed);
+            uint64_t dq = qDrops - m_lastLoggedQueueDrops;
+            uint64_t df = fDrops - m_lastLoggedInFlightDrops;
+            if (dq > 0 || df > 0 || sDrops > 0) {
+                geode::log::debug(
+                    "ReplayManager: 5s drops queue={} inFlight={} (totals: queue={}, inFlight={}, stale={})",
+                    dq, df, qDrops, fDrops, sDrops);
+            }
+            m_lastLoggedQueueDrops = qDrops;
+            m_lastLoggedInFlightDrops = fDrops;
+            m_lastDropLogTime = now;
+        }
         if (!m_savePendingSwitch && m_prepareFailedLastAttempt.exchange(false)) {
             m_prepareFailedCount++;
             m_nextPrepareRetryTime = now + std::chrono::seconds(2 * m_prepareFailedCount);
@@ -2284,14 +2433,23 @@ void ReplayManager::workerThreadFunc(ReplayConfig sessionConfig) {
                     auto boundaryTime = frame ? frame->timestamp : now;
                     std::string audioFatalErr;
                     bool splitRecovered = false;
-                    if (!splitAudioAtBoundary(boundaryTime, sessionConfig, gameAudioScratch, resampledGameAudioScratch, silenceScratch, splitRecovered, audioFatalErr)) {
-                        if (frame) {
-                            FrameGrabber::get()->recycleFrame(std::move(frame));
-                            frame.reset();
+                    if (!frame) {
+                        if (!drainPreBoundaryVideoFrames(boundaryTime, sessionConfig, splitRecovered, audioFatalErr)) {
+                            hadFatalError = true;
+                            handleFatalRecordingError(audioFatalErr);
+                            break;
                         }
-                        hadFatalError = true;
-                        handleFatalRecordingError(audioFatalErr);
-                        break;
+                    }
+                    if (!splitRecovered) {
+                        if (!splitAudioAtBoundary(boundaryTime, sessionConfig, gameAudioScratch, resampledGameAudioScratch, silenceScratch, splitRecovered, audioFatalErr)) {
+                            if (frame) {
+                                FrameGrabber::get()->recycleFrame(std::move(frame));
+                                frame.reset();
+                            }
+                            hadFatalError = true;
+                            handleFatalRecordingError(audioFatalErr);
+                            break;
+                        }
                     }
 
                     if (!splitRecovered) {

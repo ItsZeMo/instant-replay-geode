@@ -99,6 +99,11 @@ private:
     std::vector<std::shared_ptr<CapturedFrame>> m_framePool;
     std::vector<uint8_t> m_syncScratch;
 
+    // Frame allocation stats (render thread / debug logging)
+    uint64_t m_allocCount = 0;
+    uint64_t m_lastLoggedAllocCount = 0;
+    std::chrono::steady_clock::time_point m_lastAllocLogTime{};
+
     // Frame pacing state (render thread only, #5)
     std::chrono::steady_clock::time_point m_nextCaptureTime{};
     std::chrono::steady_clock::time_point m_lastSwapTime{};

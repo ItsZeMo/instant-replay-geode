@@ -13,10 +13,12 @@ using namespace cocos2d;
 
 namespace replay {
 
-// Steady-state pool holds just enough frames for 2x PBO + worker + encoder (~4-6 frames),
-// releasing any temporary burst allocations immediately instead of hoarding ~270 MB (#7).
+// Steady-state pool guarantees >=4 frames even at 4K (126.56 MB), while capping smaller resolutions
+// at 50 MB / 6 frames instead of hoarding excessive idle buffers (#7).
 static constexpr size_t kMaxPooledFrames = 6;
-static constexpr size_t kMaxPooledBytes = 50ull * 1024 * 1024;
+static constexpr size_t kMinPooledFrames = 4;
+static constexpr size_t kBasePooledBytes = 50ull * 1024 * 1024;
+static constexpr size_t kHardMaxPooledBytes = 256ull * 1024 * 1024;
 
 bool FrameGrabber::isMediaBufferUnique(IMFMediaBuffer* buf) noexcept {
     if (!buf) return false;
@@ -45,6 +47,9 @@ void FrameGrabber::resetRenderThreadState() noexcept {
     m_lastCapturedTime = {};
     m_avgSwapIntervalNs = 0.0;
     m_lastTargetFps = 0;
+    m_allocCount = 0;
+    m_lastLoggedAllocCount = 0;
+    m_lastAllocLogTime = {};
 }
 
 void FrameGrabber::initialize() {
@@ -140,6 +145,7 @@ void FrameGrabber::setFrameCallback(FrameCallback callback) {
 
 std::shared_ptr<CapturedFrame> FrameGrabber::acquireFrame(size_t requiredBytes) {
     std::shared_ptr<CapturedFrame> frame;
+    size_t poolSizeAfter = 0;
     {
         std::lock_guard<std::mutex> lock(m_poolMutex);
         for (size_t i = m_framePool.size(); i > 0; --i) {
@@ -161,6 +167,7 @@ std::shared_ptr<CapturedFrame> FrameGrabber::acquireFrame(size_t requiredBytes) 
                 break;
             }
         }
+        poolSizeAfter = m_framePool.size();
     }
     if (!frame) {
         frame = std::make_shared<CapturedFrame>();
@@ -168,6 +175,20 @@ std::shared_ptr<CapturedFrame> FrameGrabber::acquireFrame(size_t requiredBytes) 
             return nullptr;
         }
         frame->byteSize = requiredBytes;
+        ++m_allocCount;
+    }
+
+    auto now = std::chrono::steady_clock::now();
+    if (m_lastAllocLogTime == std::chrono::steady_clock::time_point{}) {
+        m_lastAllocLogTime = now;
+        m_lastLoggedAllocCount = m_allocCount;
+    } else if (now - m_lastAllocLogTime >= std::chrono::seconds(5)) {
+        uint64_t delta = m_allocCount - m_lastLoggedAllocCount;
+        m_lastLoggedAllocCount = m_allocCount;
+        m_lastAllocLogTime = now;
+        geode::log::debug(
+            "FrameGrabber: {} new buffer allocs in last 5s (total={}, frameBytes={}, poolFree={})",
+            delta, m_allocCount, requiredBytes, poolSizeAfter);
     }
     return frame;
 }
@@ -187,7 +208,9 @@ void FrameGrabber::recycleFrame(std::shared_ptr<CapturedFrame> frame) {
         }
     }
     const size_t pooledBytes = sumFrameBufferBytes(m_framePool, [](const CapturedFrame& f) { return f.byteSize; });
-    if (canRetainPooledFrameBytes(m_framePool.size(), pooledBytes, frame->byteSize, kMaxPooledFrames, kMaxPooledBytes)) {
+    const size_t effectiveBudget = effectiveFrameByteBudget(
+        kBasePooledBytes, frame->byteSize, kMinPooledFrames, kHardMaxPooledBytes);
+    if (canRetainPooledFrameBytes(m_framePool.size(), pooledBytes, frame->byteSize, kMaxPooledFrames, effectiveBudget)) {
         m_framePool.push_back(std::move(frame));
     }
 }

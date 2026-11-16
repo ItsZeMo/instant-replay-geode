@@ -8,6 +8,7 @@
 #include "../encoder/MediaFoundationEncoder.hpp"
 #include "../capture/FrameGrabber.hpp"
 #include "../capture/AudioGrabber.hpp"
+#include "MicMixFifo.hpp"
 #include <string>
 #include <vector>
 #include <deque>
@@ -105,6 +106,7 @@ private:
 
     void workerThreadFunc(ReplayConfig sessionConfig);
     void reclaimInFlightFrames(bool forceClear = false);
+    bool canAcceptEncoderFrame(size_t frameBytes) const;
     WriteCheckResult handleEncoderWriteError(
         const char* streamLabel,
         const EncoderOpResult& res,
@@ -205,9 +207,20 @@ private:
 
     // Single-track microphone mixer (recordMic && !splitAudioTracks)
     void resetMicMixer();
-    void appendMicToMix(const AudioChunk& chunk, int targetRate, size_t startFrameOffset = 0, size_t maxFrameCount = SIZE_MAX);
-    void mixMicInto(float* stereoSamples, size_t numFrames);
+    void rebaseMicMixerForNewSegment(
+        std::chrono::steady_clock::time_point prevSegStart,
+        std::chrono::steady_clock::time_point nextSegStart
+    );
+    void appendMicToMix(
+        const AudioChunk& chunk,
+        int targetRate,
+        std::chrono::steady_clock::time_point captureStartTime,
+        size_t startFrameOffset = 0,
+        size_t maxFrameCount = SIZE_MAX
+    );
+    void mixMicInto(float* stereoSamples, size_t numFrames, int64_t targetSamplePos);
     bool flushMicMixFifo(int rate, bool checkErrors, const ReplayConfig& cfg,
+                         std::vector<float>& silenceScratch,
                          bool& outRecovered, std::string& outFatalError);
 
     // Shared timestamp resync + encoder write for game and mic audio streams
@@ -290,7 +303,16 @@ private:
     // Exclusive per-PID session lock inside pid_<PID> temp folder
     HANDLE m_sessionLockHandle = INVALID_HANDLE_VALUE;
     std::filesystem::path m_sessionLockDir;
+    std::filesystem::path m_persistedTempBase;
     std::mutex m_sessionLockMutex;
+
+    // Debug frame drop counters (stale, queue overflow, encoder backpressure)
+    std::atomic<uint64_t> m_staleDropCount{0};
+    std::atomic<uint64_t> m_queueDropCount{0};
+    std::atomic<uint64_t> m_inFlightDropCount{0};
+    std::chrono::steady_clock::time_point m_lastDropLogTime{};
+    uint64_t m_lastLoggedQueueDrops = 0;
+    uint64_t m_lastLoggedInFlightDrops = 0;
 
     // Asynchronous segment finalizer thread (prevents 30s rotation from stalling worker thread)
     std::thread m_finalizeThread;
@@ -304,9 +326,8 @@ private:
 
     // Microphone mix & game audio resampler state (worker thread only)
     bool m_mixMicIntoGame = false;
-    std::vector<float> m_micMixFifo; // interleaved stereo at m_micMixRate
-    size_t m_micMixReadPos = 0;
-    int m_micMixRate = 0;
+    MicMixFifo m_micMix;
+    std::vector<float> m_micMixResampleScratch;
     StereoResampler m_micMixResampler{};
     StereoResampler m_gameResampler{};
 
