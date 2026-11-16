@@ -1,4 +1,5 @@
 #include "MediaFoundationEncoder.hpp"
+#include "ConcatTimestampMath.hpp"
 
 #ifdef GEODE_IS_WINDOWS
 
@@ -876,9 +877,7 @@ ConcatResult concatenateImpl(
         : 0;
 
     // 3. Remux every segment, rebasing timestamps so they continue seamlessly
-    std::map<DWORD, LONGLONG> lastAudioTimes;
-    LONGLONG lastVideoDts = -1;
-    LONGLONG outputBase = initialPtsShift;
+    ConcatTimestampState concatState(initialPtsShift);
     size_t samplesWritten = 0;
 
     for (size_t segIdx = 0; segIdx < segmentPaths.size(); ++segIdx) {
@@ -905,8 +904,7 @@ ConcatResult concatenateImpl(
 
         const LONGLONG segCut = (segIdx == 0) ? cutHns : 0;
         bool seenFirstVideoKey = (segCut <= 0);
-        LONGLONG videoSegEnd = 0;
-        LONGLONG audioSegEnd = 0;
+        concatState.beginSegment();
         int emptyReads = 0;
 
         while (!remaining.empty()) {
@@ -943,33 +941,19 @@ ConcatResult concatenateImpl(
             LONGLONG sampleDuration = 0;
             sample->GetSampleDuration(&sampleDuration);
 
-            // Preserve relative presentation timestamps on video streams so B-frame display order
-            // is never clobbered; enforce strict monotonicity on audio streams.
-            LONGLONG sampleTime = std::max<LONGLONG>(0, timestamp - segCut + outputBase);
-            if (!mapIt->second.isVideo) {
-                auto lastIt = lastAudioTimes.find(actualStream);
-                if (lastIt != lastAudioTimes.end() && sampleTime <= lastIt->second) {
-                    sampleTime = lastIt->second + 1000LL;
-                }
-                lastAudioTimes[actualStream] = sampleTime;
-            }
-            sample->SetSampleTime(sampleTime);
+            // Preserve exact relative presentation timestamps across all streams;
+            // outputBase advances past the true end of all written samples so AAC packets never overlap.
+            int64_t sampleTime = concatState.computeSampleTime(timestamp, segCut);
 
             if (mapIt->second.isVideo) {
                 UINT64 dts = 0;
                 if (SUCCEEDED(sample->GetUINT64(MFSampleExtension_DecodeTimestamp, &dts))) {
-                    LONGLONG newDts = std::max<LONGLONG>(0, static_cast<LONGLONG>(dts) - segCut + outputBase);
-                    if (lastVideoDts >= 0 && newDts <= lastVideoDts) {
-                        newDts = lastVideoDts + 1000LL;
-                    }
-                    if (sampleTime < newDts) {
-                        sampleTime = newDts;
-                        sample->SetSampleTime(sampleTime);
-                    }
-                    lastVideoDts = newDts;
+                    int64_t newDts = 0;
+                    concatState.adjustVideoTimestamps(static_cast<int64_t>(dts), segCut, sampleTime, newDts);
                     sample->SetUINT64(MFSampleExtension_DecodeTimestamp, static_cast<UINT64>(newDts));
                 }
             }
+            sample->SetSampleTime(sampleTime);
 
             hr = writer->WriteSample(mapIt->second.writerIndex, sample.get());
             if (FAILED(hr)) {
@@ -977,21 +961,16 @@ ConcatResult concatenateImpl(
             }
             ++samplesWritten;
 
-            LONGLONG endRel = timestamp - segCut + std::max<LONGLONG>(sampleDuration, 1000LL);
-            if (mapIt->second.isVideo) {
-                videoSegEnd = std::max(videoSegEnd, endRel);
-            } else {
-                audioSegEnd = std::max(audioSegEnd, endRel);
+            int64_t prevAudioEnd = 0;
+            if (!concatState.recordWrittenSample(
+                    mapIt->second.writerIndex, mapIt->second.isVideo, sampleTime, sampleDuration, &prevAudioEnd)) {
+                geode::log::warn(
+                    "MediaFoundationEncoder: audio stream {} packet at {} overlaps prior end {} in {}",
+                    mapIt->second.writerIndex, sampleTime, prevAudioEnd, segLabel);
             }
         }
 
-        // Advance outputBase past all streams written in this segment so subsequent audio/video
-        // packets never collide with flushed AAC frames at segment boundaries (#4).
-        LONGLONG segEnd = std::max(videoSegEnd, audioSegEnd);
-        if (videoSegEnd > 0 && segEnd > videoSegEnd + 500000LL) {
-            segEnd = videoSegEnd + 500000LL;
-        }
-        outputBase += segEnd;
+        concatState.endSegment();
     }
 
     if (samplesWritten == 0) return fail("no media samples were written");
@@ -1000,7 +979,7 @@ ConcatResult concatenateImpl(
     if (FAILED(hr)) return fail("finalizing MP4 failed: " + hrToString(hr));
 
     res.success = true;
-    res.durationSeconds = static_cast<double>(std::max<LONGLONG>(0, outputBase - initialPtsShift)) / 1e7;
+    res.durationSeconds = static_cast<double>(std::max<LONGLONG>(0, concatState.outputBase - initialPtsShift)) / 1e7;
     return res;
 }
 
