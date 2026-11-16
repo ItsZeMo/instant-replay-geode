@@ -44,5 +44,6 @@ target_link_libraries(${PROJECT_NAME}
     opengl32
     winmm
     shell32
+    avrt
 )
 

@@ -8,6 +8,7 @@
 #include <Geode/binding/FMODSound.hpp>
 #include <Geode/utils/string.hpp>
 #include <windows.h>
+#include <avrt.h>
 #include <timeapi.h>
 #include <mmdeviceapi.h>
 #include <audioclient.h>
@@ -437,6 +438,8 @@ void AudioGrabber::stopMicCapture() {
 
 void AudioGrabber::micCaptureThreadFunc() {
     HRESULT coHr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    DWORD mmcssTaskIdx = 0;
+    HANDLE hMmcss = AvSetMmThreadCharacteristicsW(L"Audio", &mmcssTaskIdx);
     m_micResampler.reset();
 
     LARGE_INTEGER qpcFreq{};
@@ -505,7 +508,8 @@ void AudioGrabber::micCaptureThreadFunc() {
 
         REFERENCE_TIME hnsDefaultPeriod = 0, hnsMinPeriod = 0;
         audioClient->GetDevicePeriod(&hnsDefaultPeriod, &hnsMinPeriod);
-        REFERENCE_TIME hnsBuffer = (hnsDefaultPeriod > 0) ? hnsDefaultPeriod * 2 : 200000;
+        // Reserve >= 100 ms shared buffer so scheduler jitter never drops mic packets while waking per period
+        REFERENCE_TIME hnsBuffer = std::max<REFERENCE_TIME>(1000000LL, (hnsDefaultPeriod > 0) ? hnsDefaultPeriod * 10 : 1000000LL);
 
         HANDLE hWakeEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
         bool eventDriven = false;
@@ -563,6 +567,9 @@ void AudioGrabber::micCaptureThreadFunc() {
                         if (FAILED(hr)) {
                             deviceLost = true;
                             break;
+                        }
+                        if (flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) {
+                            geode::log::warn("AudioGrabber: WASAPI mic capture data discontinuity (numFrames={})", numFrames);
                         }
                         if (numFrames > 0) {
                             int channels = pwfx->nChannels;
@@ -651,6 +658,10 @@ void AudioGrabber::micCaptureThreadFunc() {
         }
     }
 
+    if (hMmcss) {
+        AvRevertMmThreadCharacteristics(hMmcss);
+        hMmcss = nullptr;
+    }
     if (SUCCEEDED(coHr)) {
         CoUninitialize();
     }
