@@ -1,4 +1,5 @@
 #include "FrameGrabber.hpp"
+#include "FrameBudget.hpp"
 
 #ifdef GEODE_IS_WINDOWS
 
@@ -177,8 +178,16 @@ void FrameGrabber::recycleFrame(std::shared_ptr<CapturedFrame> frame) {
     if (!isMediaBufferUnique(frame->buffer.get())) return;
 
     std::lock_guard<std::mutex> lock(m_poolMutex);
-    size_t maxFrames = std::clamp<size_t>(kMaxPooledBytes / std::max<size_t>(1, frame->byteSize), 4, kMaxPooledFrames);
-    if (m_framePool.size() < maxFrames) {
+    // Prune dead or mismatched-size unique buffers before checking the byte budget
+    for (size_t i = m_framePool.size(); i > 0; --i) {
+        auto& item = m_framePool[i - 1];
+        if (!item || !item->buffer ||
+            (item->byteSize != frame->byteSize && isMediaBufferUnique(item->buffer.get()))) {
+            m_framePool.erase(m_framePool.begin() + static_cast<std::ptrdiff_t>(i - 1));
+        }
+    }
+    const size_t pooledBytes = sumFrameBufferBytes(m_framePool, [](const CapturedFrame& f) { return f.byteSize; });
+    if (canRetainPooledFrameBytes(m_framePool.size(), pooledBytes, frame->byteSize, kMaxPooledFrames, kMaxPooledBytes)) {
         m_framePool.push_back(std::move(frame));
     }
 }

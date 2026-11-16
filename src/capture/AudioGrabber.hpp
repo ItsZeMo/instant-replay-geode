@@ -4,6 +4,7 @@
 
 #ifdef GEODE_IS_WINDOWS
 
+#include "GameAudioRing.hpp"
 #include <Geode/fmod/fmod.hpp>
 #include <vector>
 #include <memory>
@@ -122,6 +123,7 @@ public:
     size_t drainGameAudio(std::vector<float>& outStereoSamples, int& outSampleRate,
                           std::chrono::steady_clock::time_point& outTimestamp);
     bool hasPendingGameAudio() const noexcept;
+    size_t pendingGameAudioFrames() const noexcept;
     void resetGameAudioBuffer() noexcept;
 
     // Called by WASAPI microphone capture thread with packet capture timestamp
@@ -151,13 +153,8 @@ private:
     FMOD::DSP* m_fmodDSP = nullptr;
     std::chrono::steady_clock::time_point m_nextDspRetryTime{};
 
-    // Lock-free SPSC ring buffer for real-time FMOD DSP game audio (power-of-two stereo frames)
-    static constexpr size_t kGameRingFrames = 262144; // ~5.46s at 48 kHz
-    static constexpr size_t kGameRingMask = kGameRingFrames - 1;
-    std::vector<float> m_gameRingBuffer;
-    std::atomic<size_t> m_gameRingWriteFrame{0};
-    std::atomic<size_t> m_gameRingReadFrame{0};
-    std::atomic<int64_t> m_lastGamePushTimeNs{0};
+    // Lock-free SPSC ring buffer + per-packet metadata descriptors for FMOD game audio
+    GameAudioRing m_gameRing;
 
     AudioCallback m_micCallback;
 

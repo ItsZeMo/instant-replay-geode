@@ -21,58 +21,6 @@ static const PROPERTYKEY kPKEY_Device_FriendlyName = {
     { 0xa45c254e, 0xdf1c, 0x4efd, { 0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0 } }, 14
 };
 
-// Proper multichannel-to-stereo downmix supporting 1.0, 2.0, 3.0 (L/R/C), 4.0 Quad (FL/FR/BL/BR),
-// 5.0 (FL/FR/FC/BL/BR), 5.1 (FL/FR/FC/LFE/BL/BR), 6.1, and 7.1 (FL/FR/FC/LFE/BL/BR/SL/SR).
-static inline void downmixFrameToStereo(const float* frame, int channels, float vol, float& outL, float& outR) noexcept {
-    float l = 0.0f;
-    float r = 0.0f;
-    switch (channels) {
-        case 1:
-            l = r = frame[0];
-            break;
-        case 2:
-            l = frame[0];
-            r = frame[1];
-            break;
-        case 3: { // 3.0: FL, FR, FC
-            float c = frame[2] * 0.7071f;
-            l = frame[0] + c;
-            r = frame[1] + c;
-            break;
-        }
-        case 4: // 4.0 Quad: FL, FR, BL, BR
-            l = frame[0] + frame[2] * 0.7071f;
-            r = frame[1] + frame[3] * 0.7071f;
-            break;
-        case 5: { // 5.0: FL, FR, FC, BL, BR
-            float c = frame[2] * 0.7071f;
-            l = frame[0] + c + frame[3] * 0.7071f;
-            r = frame[1] + c + frame[4] * 0.7071f;
-            break;
-        }
-        case 6: { // 5.1: FL, FR, FC, LFE, BL, BR
-            float centerLfe = frame[2] * 0.7071f + frame[3] * 0.5f;
-            l = frame[0] + centerLfe + frame[4] * 0.7071f;
-            r = frame[1] + centerLfe + frame[5] * 0.7071f;
-            break;
-        }
-        case 7: { // 6.1: FL, FR, FC, LFE, BC, SL, SR
-            float mid = frame[2] * 0.7071f + frame[3] * 0.5f + frame[4] * 0.5f;
-            l = frame[0] + mid + frame[5] * 0.7071f;
-            r = frame[1] + mid + frame[6] * 0.7071f;
-            break;
-        }
-        default: { // >= 8 (7.1: FL, FR, FC, LFE, BL, BR, SL, SR)
-            float centerLfe = frame[2] * 0.7071f + frame[3] * 0.5f;
-            l = frame[0] + centerLfe + (frame[4] + frame[6]) * 0.7071f;
-            r = frame[1] + centerLfe + (frame[5] + frame[7]) * 0.7071f;
-            break;
-        }
-    }
-    outL = std::clamp(l * vol, -1.0f, 1.0f);
-    outR = std::clamp(r * vol, -1.0f, 1.0f);
-}
-
 static std::string sanitizeDeviceName(const std::wstring& wname) {
     std::wstring converted = wname;
     auto replaceAll = [](std::wstring& str, const std::wstring& from, const std::wstring& to) {
@@ -153,9 +101,7 @@ AudioGrabber* AudioGrabber::get() {
     return &instance;
 }
 
-AudioGrabber::AudioGrabber()
-    : m_gameRingBuffer(kGameRingFrames * 2, 0.0f) {
-}
+AudioGrabber::AudioGrabber() = default;
 
 AudioGrabber::~AudioGrabber() {
     stopMicCapture();
@@ -251,14 +197,15 @@ void AudioGrabber::removeFmodDSP() {
 }
 
 void AudioGrabber::resetGameAudioBuffer() noexcept {
-    size_t writePos = m_gameRingWriteFrame.load(std::memory_order_acquire);
-    m_gameRingReadFrame.store(writePos, std::memory_order_release);
+    m_gameRing.reset();
 }
 
 bool AudioGrabber::hasPendingGameAudio() const noexcept {
-    size_t writePos = m_gameRingWriteFrame.load(std::memory_order_acquire);
-    size_t readPos = m_gameRingReadFrame.load(std::memory_order_relaxed);
-    return writePos > readPos;
+    return m_gameRing.hasPending();
+}
+
+size_t AudioGrabber::pendingGameAudioFrames() const noexcept {
+    return m_gameRing.pendingFrames();
 }
 
 void AudioGrabber::pushGameAudio(const float* inbuffer, unsigned int length, int channels, int sampleRate) {
@@ -270,30 +217,9 @@ void AudioGrabber::pushGameAudio(const float* inbuffer, unsigned int length, int
     const auto& config = ReplayManager::get()->getSessionConfig();
 
     float vol = config.systemVolume.load();
-    size_t writePos = m_gameRingWriteFrame.load(std::memory_order_relaxed);
-    size_t readPos = m_gameRingReadFrame.load(std::memory_order_acquire);
-
-    size_t usedFrames = writePos - readPos;
-    if (usedFrames >= kGameRingFrames) {
-        return; // Ring buffer full; drop rather than block real-time FMOD mixer thread
-    }
-    size_t availFrames = kGameRingFrames - usedFrames;
-    size_t framesToWrite = std::min<size_t>(length, availFrames);
-
-    for (size_t i = 0; i < framesToWrite; ++i) {
-        float l = 0.0f;
-        float r = 0.0f;
-        downmixFrameToStereo(&inbuffer[i * static_cast<size_t>(channels)], channels, vol, l, r);
-
-        size_t slot = (writePos + i) & kGameRingMask;
-        m_gameRingBuffer[slot * 2] = l;
-        m_gameRingBuffer[slot * 2 + 1] = r;
-    }
-
-    auto nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+    int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
-    m_lastGamePushTimeNs.store(nowNs, std::memory_order_relaxed);
-    m_gameRingWriteFrame.store(writePos + framesToWrite, std::memory_order_release);
+    m_gameRing.push(inbuffer, length, channels, vol, sampleRate, nowNs);
 }
 
 size_t AudioGrabber::drainGameAudio(
@@ -301,35 +227,7 @@ size_t AudioGrabber::drainGameAudio(
     int& outSampleRate,
     std::chrono::steady_clock::time_point& outTimestamp
 ) {
-    size_t writePos = m_gameRingWriteFrame.load(std::memory_order_acquire);
-    size_t readPos = m_gameRingReadFrame.load(std::memory_order_relaxed);
-    if (writePos <= readPos) {
-        outStereoSamples.clear();
-        return 0;
-    }
-
-    size_t frames = writePos - readPos;
-    outStereoSamples.resize(frames * 2);
-
-    for (size_t i = 0; i < frames; ++i) {
-        size_t slot = (readPos + i) & kGameRingMask;
-        outStereoSamples[i * 2] = m_gameRingBuffer[slot * 2];
-        outStereoSamples[i * 2 + 1] = m_gameRingBuffer[slot * 2 + 1];
-    }
-
-    m_gameRingReadFrame.store(writePos, std::memory_order_release);
-
-    int rate = m_gameSampleRate.load(std::memory_order_relaxed);
-    outSampleRate = rate;
-
-    int64_t endNs = m_lastGamePushTimeNs.load(std::memory_order_relaxed);
-    int64_t durationNs = (static_cast<int64_t>(frames) * 1000000000LL) / rate;
-    if (endNs > durationNs) {
-        outTimestamp = std::chrono::steady_clock::time_point(std::chrono::nanoseconds(endNs - durationNs));
-    } else {
-        outTimestamp = std::chrono::steady_clock::now();
-    }
-    return frames;
+    return m_gameRing.drain(outStereoSamples, outSampleRate, outTimestamp);
 }
 
 void AudioGrabber::pushMicAudio(
@@ -350,7 +248,7 @@ void AudioGrabber::pushMicAudio(
     // 1. Channel conversion to stereo (2 channels) using reusable scratch
     m_micStereoScratch.resize(static_cast<size_t>(length) * 2);
     for (unsigned int i = 0; i < length; ++i) {
-        downmixFrameToStereo(
+        GameAudioRing::downmixFrameToStereo(
             &inbuffer[static_cast<size_t>(i) * channels],
             channels,
             vol,
