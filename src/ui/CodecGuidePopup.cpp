@@ -3,6 +3,9 @@
 #if defined(GEODE_IS_WINDOWS) || defined(GEODE_IS_MACOS)
 
 #include <cocos2d.h>
+#ifdef GEODE_IS_MACOS
+#include "../platform/MacVideoCapabilities.hpp"
+#endif
 
 using namespace cocos2d;
 using namespace geode::prelude;
@@ -51,25 +54,49 @@ void CodecGuidePopup::setup() {
         const char* desc2;
     };
 
+#ifdef GEODE_IS_MACOS
+    const auto& vtCaps = getMacVideoEncoderCaps();
+    const char* hevcTitle = vtCaps.hevcHardware
+        ? "HEVC / H.265 (Hardware Supported - Recommended):"
+        : "HEVC / H.265 (Software Only on this Mac):";
+    const char* hevcDesc1 = vtCaps.hevcHardware
+        ? "- Hardware encoder detected via macOS VideoToolbox."
+        : "- No hardware HEVC encoder detected; CPU fallback available.";
+    const char* h264Title = vtCaps.h264Hardware
+        ? "H.264 (Hardware Supported - Maximum Compatibility):"
+        : "H.264 (Software Only - Maximum Compatibility):";
+    const char* av1Title = vtCaps.av1Hardware
+        ? "AV1 (Hardware Supported on this Mac):"
+        : (vtCaps.av1Software ? "AV1 (Software Only on this Mac):" : "AV1 (Unsupported on this Mac):");
+    const char* av1Desc1 = vtCaps.av1Hardware
+        ? "- Hardware VideoToolbox AV1 encoder detected."
+        : (vtCaps.av1Software
+            ? "- No HW AV1 encode; SW AV1 available if HW is off."
+            : "- Not exposed by VideoToolbox on this Mac GPU/chip.");
+    const char* av1Desc2 = vtCaps.av1Hardware
+        ? "- Cleanest compression with lowest file sizes."
+        : "- Automatically routed to HEVC (or H.264) on this Mac.";
+#endif
+
     GuideEntry entries[] = {
 #ifdef GEODE_IS_MACOS
         {
-            "HEVC / H.265 (Recommended on Mac):",
+            hevcTitle,
             ccc3(255, 215, 80),
-            "- Apple Silicon (M1-M5) & Intel Macs with Apple T2 Security Chip",
+            hevcDesc1,
             "- Fast hardware encoding, great quality, and smaller files."
         },
         {
-            "H.264 (Maximum Compatibility):",
+            h264Title,
             ccc3(255, 140, 100),
-            "- Hardware accelerated on all Intel and Apple Silicon Macs.",
-            "- Best for Discord & older editors (max 4096x2304 resolution)."
+            "- Best for Discord & older editors (max 4096x2304 resolution).",
+            "- Hardware limits: does NOT support 4K at 240 FPS."
         },
         {
-            "AV1 (Experimental / Auto-Fallback):",
-            ccc3(100, 230, 255),
-            "- Supported where macOS VideoToolbox exposes AV1 encoding.",
-            "- Automatically falls back to HEVC if your Mac lacks AV1 encode."
+            av1Title,
+            vtCaps.av1Hardware ? ccc3(100, 230, 255) : ccc3(255, 130, 130),
+            av1Desc1,
+            av1Desc2
         }
 #else
         {

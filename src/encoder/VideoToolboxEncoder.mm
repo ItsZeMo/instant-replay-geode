@@ -4,6 +4,7 @@
 
 #include "ConcatTimestampMath.hpp"
 #include "../platform/MacPlatformUtils.hpp"
+#include "../platform/MacVideoCapabilities.hpp"
 
 #pragma push_macro("CommentType")
 #undef CommentType
@@ -424,12 +425,18 @@ EncoderOpResult VideoToolboxEncoder::start(
              static_cast<int>(codec), enableHardware ? 1 : 0, cname.c_str(), width, height, fps);
     std::string requestKey = reqKeyBuf;
 
+    const auto& vtCaps = getMacVideoEncoderCaps();
+    const bool targetSupportedByList = !vtCaps.enumerated || vtCaps.supports(targetFamily, enableHardware);
+
     struct Attempt {
         VideoCodecFamily family;
         bool hardware;
     };
     std::vector<Attempt> attempts;
-    auto addAttempt = [&attempts](VideoCodecFamily fam, bool hw) {
+    auto addAttempt = [&attempts, &vtCaps](VideoCodecFamily fam, bool hw) {
+        if (vtCaps.enumerated && !vtCaps.supports(fam, hw)) {
+            return;
+        }
         for (const auto& a : attempts) {
             if (a.family == fam && a.hardware == hw) return;
         }
@@ -476,11 +483,16 @@ EncoderOpResult VideoToolboxEncoder::start(
         std::filesystem::remove(outputPath, ec);
     };
 
-    bool primaryFailedPermanently = false;
+    bool primaryFailedPermanently = !targetSupportedByList;
     bool syncedBeforeFallback = false;
-    int64_t lastCode = -1;
+    int64_t lastCode = targetSupportedByList ? -1 : kVTCouldNotFindVideoEncoderErr;
     bool lastFatalStorage = false;
     std::string lastErrMsg;
+    if (!targetSupportedByList) {
+        lastErrMsg = std::string(familyName(targetFamily)) +
+                     (enableHardware ? " (HW)" : " (SW)") +
+                     ": encoder not available in VideoToolbox on this Mac";
+    }
 
     for (const auto& attempt : attempts) {
         bool isPrimary = (attempt.family == targetFamily && attempt.hardware == enableHardware);

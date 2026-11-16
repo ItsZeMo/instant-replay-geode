@@ -509,6 +509,16 @@ void ReplayManager::initialize() {
     m_saveRequested.store(false);
     m_savePending.store(false);
     ReplayConfig::refreshNativeFrameHeight();
+#ifdef GEODE_IS_MACOS
+    {
+        const auto& caps = getMacVideoEncoderCaps();
+        geode::log::info(
+            "Instant Replay: VideoToolbox compatibility — AV1(HW={},SW={}), HEVC(HW={},SW={}), H.264(HW={},SW={})",
+            caps.av1Hardware, caps.av1Software,
+            caps.hevcHardware, caps.hevcSoftware,
+            caps.h264Hardware, caps.h264Software);
+    }
+#endif
     ReplayConfig::get().loadFromSettings();
     m_sessionConfig = ReplayConfig::get().snapshot();
     if (auto* mod = geode::Mod::get()) {

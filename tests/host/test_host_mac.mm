@@ -29,6 +29,7 @@
 #include "config/CodecUtils.hpp"
 #include "encoder/ConcatTimestampMath.hpp"
 #include "encoder/VideoToolboxEncoder.hpp"
+#include "platform/MacVideoCapabilities.hpp"
 #include "recorder/MicMixFifo.hpp"
 
 namespace {
@@ -525,6 +526,59 @@ void testSharedMathAndBuffers() {
     std::cout << "  PASS Test 4\n";
 }
 
+void testHardwareCapabilityChecks() {
+    std::cout << "[Test 5] VideoToolbox hardware compatibility & AV1 gating...\n";
+    const auto& caps = replay::getMacVideoEncoderCaps();
+    CHECK(caps.enumerated);
+    CHECK(caps.h264Hardware || caps.h264Software);
+    CHECK(caps.hevcHardware || caps.hevcSoftware);
+    CHECK(!caps.supports(replay::VideoCodecFamily::VP9, true));
+    CHECK(!caps.supports(replay::VideoCodecFamily::VP9, false));
+
+    replay::ReplayConfig cfg;
+    cfg.codec = replay::CodecType::AV1;
+    cfg.hardwareAcceleration = true;
+    const bool sanitized = cfg.sanitizeCodecSettings();
+    if (!caps.av1Hardware) {
+        CHECK(sanitized);
+        CHECK(cfg.codec.load() != replay::CodecType::AV1);
+        CHECK(replay::ReplayConfig::isPresetCodecSupported(cfg.codec.load(), true));
+    }
+
+    if (!caps.av1Hardware) {
+        std::error_code ec;
+        std::filesystem::path dir = std::filesystem::temp_directory_path() /
+                                    ("ir_host_caps_" + std::to_string(static_cast<unsigned long long>(::getpid())));
+        std::filesystem::create_directories(dir, ec);
+        std::filesystem::path seg = dir / "av1_blocked.mp4";
+        replay::VideoToolboxEncoder enc;
+        auto res = enc.start(
+            seg, 320, 180, 60, 8, 12, 80,
+            replay::RateControlMode::ADAPTIVE_VBR, false,
+            replay::CodecType::AV1, true, "", 48000,
+            nullptr, false);
+        CHECK(!res.ok);
+        CHECK(!res.message.empty());
+        enc.finish();
+
+        // With fallback enabled, AV1 cleanly falls back to HEVC (or H.264) without failing.
+        std::filesystem::path segFallback = dir / "av1_fallback.mp4";
+        auto resFallback = enc.start(
+            segFallback, 320, 180, 60, 8, 12, 80,
+            replay::RateControlMode::ADAPTIVE_VBR, false,
+            replay::CodecType::AV1, true, "", 48000,
+            nullptr, true);
+        CHECK(resFallback.ok);
+        CHECK(enc.activeCodecFamily() != replay::VideoCodecFamily::AV1);
+        enc.finish();
+        std::filesystem::remove_all(dir, ec);
+    }
+
+    std::cout << "  PASS Test 5 (av1HW=" << caps.av1Hardware
+              << ", hevcHW=" << caps.hevcHardware
+              << ", h264HW=" << caps.h264Hardware << ")\n";
+}
+
 } // namespace
 
 int main() {
@@ -533,6 +587,7 @@ int main() {
         testOpenGLInvertedBlitAndPboToEncoder();
         testCoreAudioHardwareEnumeration();
         testSharedMathAndBuffers();
+        testHardwareCapabilityChecks();
     }
     std::cout << "ALL MACOS HOST TESTS PASSED!\n";
     return 0;

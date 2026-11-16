@@ -95,19 +95,20 @@ void setTextInputLocked(TextInput* input, bool locked) {
     input->setEnabled(!locked);
 }
 
-void updateMenuHighlight(
+template <typename DisabledPred>
+void updateMenuHighlightPred(
     CCMenu* menu,
     int activeTag,
-    bool allowActive = true,
-    int disabledTag = -1,
-    bool globalLocked = false
+    bool allowActive,
+    bool globalLocked,
+    DisabledPred&& isTagDisabled
 ) {
     if (!menu) return;
     for (auto child : CCArrayExt<CCNode*>(menu->getChildren())) {
         if (auto btn = typeinfo_cast<CCMenuItemSpriteExtra*>(child)) {
             int tag = btn->getTag();
             bool active = allowActive && (tag == activeTag);
-            bool itemDisabled = globalLocked || (disabledTag != -1 && tag == disabledTag);
+            bool itemDisabled = globalLocked || isTagDisabled(tag);
             btn->setEnabled(!itemDisabled);
             if (auto spr = typeinfo_cast<ButtonSprite*>(btn->getNormalImage())) {
                 spr->updateBGImage(active ? "GJ_button_01.png" : "GJ_button_04.png");
@@ -121,6 +122,17 @@ void updateMenuHighlight(
             }
         }
     }
+}
+
+void updateMenuHighlight(
+    CCMenu* menu,
+    int activeTag,
+    bool allowActive = true,
+    int disabledTag = -1,
+    bool globalLocked = false
+) {
+    updateMenuHighlightPred(menu, activeTag, allowActive, globalLocked,
+                            [disabledTag](int tag) { return disabledTag != -1 && tag == disabledTag; });
 }
 
 template <typename Callback>
@@ -696,7 +708,12 @@ void ReplayPopup::setupCodecTab(CCNode* page, CCSize const& winSize, float cente
         [this](int tag) {
             if (this->guardLocked()) return;
             auto& cfg = ReplayConfig::get();
-            cfg.codec = static_cast<CodecType>(tag);
+            auto chosen = static_cast<CodecType>(tag);
+            if (!ReplayConfig::isPresetCodecSupported(chosen, cfg.hardwareAcceleration.load())) {
+                Notification::create("This codec is not supported on this Mac", NotificationIcon::Warning, 1.5f)->show();
+                return;
+            }
+            cfg.codec = chosen;
             cfg.setCustomCodec("");
             cfg.sanitizeCodecSettings();
             this->markSettingsDirty(false);
@@ -725,7 +742,9 @@ void ReplayPopup::setupCodecTab(CCNode* page, CCSize const& winSize, float cente
                 toggler->toggle(!curHw);
                 return;
             }
-            ReplayConfig::get().hardwareAcceleration = !curHw;
+            auto& cfg = ReplayConfig::get();
+            cfg.hardwareAcceleration = !curHw;
+            cfg.sanitizeCodecSettings();
             this->markSettingsDirty(false);
             this->refreshUI(false);
             this->updateStatusDisplay(0.0f);
@@ -757,7 +776,7 @@ void ReplayPopup::setupCodecTab(CCNode* page, CCSize const& winSize, float cente
         if (!str.empty()) {
             c.codec = CodecType::CUSTOM;
         } else if (c.codec.load() == CodecType::CUSTOM) {
-            c.codec = CodecType::AV1;
+            c.codec = ReplayConfig::bestSupportedCodec(c.hardwareAcceleration.load());
             c.sanitizeCodecSettings();
         }
         this->markSettingsDirty(false);
@@ -1375,12 +1394,15 @@ void ReplayPopup::refreshUI(bool syncTogglers) {
 
     // Codec menu highlight
     CodecType curCodec = cfg.codec.load();
-    updateMenuHighlight(m_codecMenu, static_cast<int>(curCodec), curCodec != CodecType::CUSTOM, -1, locked);
+    bool hwAccel = cfg.hardwareAcceleration.load();
+    updateMenuHighlightPred(m_codecMenu, static_cast<int>(curCodec), curCodec != CodecType::CUSTOM, locked,
+                            [hwAccel](int tag) {
+                                return !ReplayConfig::isPresetCodecSupported(static_cast<CodecType>(tag), hwAccel);
+                            });
     if (m_customCodecInput && !isInputFocused(m_customCodecInput)) {
         m_customCodecInput->setString(cfg.getCustomCodec());
     }
 
-    bool hwAccel = cfg.hardwareAcceleration.load();
     if (syncTogglers && m_hwAccelToggle) {
         m_hwAccelToggle->toggle(hwAccel);
     }
@@ -1408,8 +1430,36 @@ void ReplayPopup::refreshUI(bool syncTogglers) {
     updateMenuHighlight(m_fpsMenu, curFps, true, disabledFpsTag, locked);
 
     if (m_codecConflictLabel) {
-        bool conflictPossible = isH264 && (curRes == ResolutionType::UHD_4K || curFps >= 240);
-        m_codecConflictLabel->setVisible(conflictPossible);
+        bool h264Conflict = isH264 && (curRes == ResolutionType::UHD_4K || curFps >= 240);
+        if (h264Conflict) {
+            m_codecConflictLabel->setString("Note: H.264 hardware encoders do not support 4K @ 240 FPS");
+            m_codecConflictLabel->setColor(ccc3(255, 120, 80));
+            m_codecConflictLabel->setVisible(true);
+        } else {
+#ifdef GEODE_IS_MACOS
+            bool customUnsupported = false;
+            if (curCodec == CodecType::CUSTOM) {
+                CodecTargetSpec customSpec = parseCustomCodecSpec(hwAccel, cfg.getCustomCodec());
+                customUnsupported = !ReplayConfig::isCodecFamilySupported(customSpec.family, customSpec.hardware);
+            }
+            if (customUnsupported) {
+                m_codecConflictLabel->setString("Note: Custom codec unsupported on this Mac (fallback)");
+                m_codecConflictLabel->setColor(ccc3(255, 120, 80));
+                m_codecConflictLabel->setVisible(true);
+            } else if (!ReplayConfig::isPresetCodecSupported(CodecType::AV1, hwAccel)) {
+                m_codecConflictLabel->setString(
+                    hwAccel
+                        ? "Note: AV1 HW encode unsupported on this Mac (using HEVC)"
+                        : "Note: VideoToolbox AV1 is unsupported on this Mac");
+                m_codecConflictLabel->setColor(ccc3(255, 195, 95));
+                m_codecConflictLabel->setVisible(true);
+            } else {
+                m_codecConflictLabel->setVisible(false);
+            }
+#else
+            m_codecConflictLabel->setVisible(false);
+#endif
+        }
     }
 
     // Rate Control highlight

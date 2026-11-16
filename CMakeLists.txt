@@ -41,6 +41,7 @@ if (WIN32)
 elseif (APPLE AND NOT IOS)
     set(IR_OBJCXX_SOURCES
         src/platform/MacPlatformUtils.mm
+        src/platform/MacVideoCapabilities.mm
         src/capture/AudioGrabberMac.mm
         src/encoder/VideoToolboxEncoder.mm
     )

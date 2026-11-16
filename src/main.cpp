@@ -172,7 +172,13 @@ $on_mod(Loaded) {
                 }
 
                 if (paramChanged) {
+                    auto prevModCodecStr = mod->getSettingValue<std::string>("codec");
                     ReplayConfig::get().loadFromSettings();
+                    if (ReplayConfig::codecFromString(prevModCodecStr) != ReplayConfig::get().codec.load()) {
+                        std::string msg = std::string("Selected codec is unsupported on this Mac — switched to ") +
+                                          ReplayConfig::codecToString(ReplayConfig::get().codec.load());
+                        geode::Notification::create(msg, geode::NotificationIcon::Warning, 2.0f)->show();
+                    }
                 }
 
                 if (enabledChanged && targetEnabled && !ReplayManager::get()->isReplayActive()) {

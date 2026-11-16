@@ -12,6 +12,7 @@
 #include <shlobj.h>
 #elif defined(GEODE_IS_MACOS)
 #include "../platform/MacPlatformUtils.hpp"
+#include "../platform/MacVideoCapabilities.hpp"
 #include <OpenGL/gl.h>
 #include <cstdlib>
 #include <unistd.h>
@@ -515,16 +516,62 @@ struct ReplayConfig {
         return false;
     }
 
+    static bool isCodecFamilySupported(VideoCodecFamily family, bool hardware) noexcept {
+#ifdef GEODE_IS_MACOS
+        return getMacVideoEncoderCaps().supports(family, hardware);
+#else
+        (void)family;
+        (void)hardware;
+        return true;
+#endif
+    }
+
+    static bool isPresetCodecSupported(CodecType c, bool hwAccel) noexcept {
+#ifdef GEODE_IS_MACOS
+        switch (c) {
+            case CodecType::AV1:  return isCodecFamilySupported(VideoCodecFamily::AV1, hwAccel);
+            case CodecType::HEVC: return isCodecFamilySupported(VideoCodecFamily::HEVC, hwAccel);
+            case CodecType::H264: return isCodecFamilySupported(VideoCodecFamily::H264, hwAccel);
+            case CodecType::CUSTOM:
+            default:              return true;
+        }
+#else
+        (void)c;
+        (void)hwAccel;
+        return true;
+#endif
+    }
+
+    static CodecType bestSupportedCodec(bool hwAccel) noexcept {
+#ifdef GEODE_IS_MACOS
+        if (isPresetCodecSupported(CodecType::AV1, hwAccel))  return CodecType::AV1;
+        if (isPresetCodecSupported(CodecType::HEVC, hwAccel)) return CodecType::HEVC;
+        if (isPresetCodecSupported(CodecType::H264, hwAccel)) return CodecType::H264;
+        return CodecType::H264;
+#else
+        (void)hwAccel;
+        return CodecType::AV1;
+#endif
+    }
+
     static bool isH264Conflict(ResolutionType res, int fps) noexcept {
         return (res == ResolutionType::UHD_4K && fps >= 240);
     }
 
     bool sanitizeCodecSettings() noexcept {
+        bool changed = false;
+#ifdef GEODE_IS_MACOS
+        const bool hw = hardwareAcceleration.load();
+        if (codec.load() != CodecType::CUSTOM && !isPresetCodecSupported(codec.load(), hw)) {
+            codec = bestSupportedCodec(hw);
+            changed = true;
+        }
+#endif
         if (codec.load() == CodecType::H264 && isH264Conflict(resolution.load(), targetFps.load())) {
             targetFps = 120;
-            return true;
+            changed = true;
         }
-        return false;
+        return changed;
     }
 
     static inline std::atomic<bool> s_isSavingSettings{false};
@@ -582,6 +629,7 @@ struct ReplayConfig {
         if (sanitized) {
             s_isSavingSettings.store(true);
             setClampedSetting<geode::IntSettingV3>(mod, "fps", static_cast<int64_t>(targetFps.load()));
+            (void)mod->setSettingValue("codec", std::string(codecToString(codec.load())));
             s_isSavingSettings.store(false);
         }
     }
