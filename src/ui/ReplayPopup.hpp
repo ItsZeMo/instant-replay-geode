@@ -60,6 +60,7 @@ private:
     void updateFolderDisplay();
     void onBrowseFolder();
     void onResetFolder();
+    void cancelAsyncTasks() noexcept;
     void cycleMicDevice(int direction);
     void refreshMicDeviceButton();
     void handleVolumeSlider(Slider* slider, cocos2d::CCLabelBMFont* label, AtomicVal<float>& targetVol);
@@ -131,6 +132,11 @@ private:
     std::vector<AudioDeviceInfo> m_availableMics;
     int m_currentMicIndex = 0;
     geode::async::TaskHolder<std::vector<AudioDeviceInfo>> m_micEnumTask;
+
+    // Asynchronous folder browse preflight & picker
+    geode::async::TaskHolder<std::filesystem::path> m_browsePathTask;
+    geode::async::TaskHolder<geode::Result<std::optional<std::filesystem::path>>> m_browsePickerTask;
+    uint64_t m_browseRequestId = 0;
 
     // Settings dirty tracking & lock state (#17, #24, #31)
     bool m_settingsDirty = false;

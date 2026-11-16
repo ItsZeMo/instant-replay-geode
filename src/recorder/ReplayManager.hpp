@@ -35,6 +35,13 @@ enum class SaveReplayResult {
     AlreadySaving
 };
 
+enum class ToggleReplayResult {
+    Enabled,
+    Stopping,
+    RestartQueued,
+    StopPending
+};
+
 class ReplayManager {
 public:
     static ReplayManager* get();
@@ -45,13 +52,15 @@ public:
     // User actions
     SaveReplayResult saveReplay();
     static void showSaveFeedback(SaveReplayResult result);
-    void toggleReplay();
+    ToggleReplayResult toggleReplay();
     // Applies the "enabled" state (e.g. from Geode settings) to the running recorder
     void setReplayEnabled(bool enabled);
     bool isReplayActive() const noexcept { return m_running.load(); }
     bool isStopping() const noexcept { return m_stopping.load(); }
+    bool isRestartPending() const noexcept { return m_pendingRestart.load(); }
     bool isReplayLocked() const noexcept { return m_running.load() || m_stopping.load(); }
-    bool isSaving() const noexcept { return m_saving.load(); }
+    bool isExportInFlight() const noexcept { return m_exportInFlight.load(); }
+    bool isSaving() const noexcept { return m_savePending.load() || m_exportInFlight.load(); }
 
     // Direct folder opener
     void openRecordingsFolder();
@@ -154,13 +163,28 @@ private:
 
     bool rotateSegment(bool syncForExport, const ReplayConfig& cfg,
                        std::chrono::steady_clock::time_point nextSegStart = std::chrono::steady_clock::now());
-    void handleSaveRequest(
+    bool writeEncodedVideoFrame(
+        std::shared_ptr<CapturedFrame> frame,
+        const ReplayConfig& cfg,
+        bool& outRecovered,
+        std::string& outFatalError
+    );
+    bool drainPreBoundaryVideoFrames(
+        std::chrono::steady_clock::time_point& boundaryTime,
+        const ReplayConfig& cfg,
+        bool& outRecovered,
+        std::string& outFatalError
+    );
+    void abortPendingSave();
+    bool handleSaveRequest(
         bool continueRecording,
         const ReplayConfig& cfg,
         std::chrono::steady_clock::time_point boundaryTime,
+        bool alreadyRecovered,
         std::vector<float>& gameAudioScratch,
         std::vector<float>& resampledGameAudioScratch,
-        std::vector<float>& silenceScratch
+        std::vector<float>& silenceScratch,
+        std::string& outFatalError
     );
     void handleFatalRecordingError(const std::string& reason);
     void purgeOldSegments(const ReplayConfig& cfg);
@@ -200,20 +224,24 @@ private:
 
     std::atomic<bool> m_running{false};
     std::atomic<bool> m_stopping{false};
-    std::atomic<bool> m_saving{false};
+    std::atomic<bool> m_pendingRestart{false};
+    std::atomic<bool> m_savePending{false};
     std::atomic<bool> m_saveRequested{false};
+    std::atomic<bool> m_exportInFlight{false};
     std::atomic<bool> m_shuttingDown{false};
     uint64_t m_sessionId = 0; // guarded by m_queueMutex (#12, #13)
 
-    // Asynchronous teardown thread for non-blocking Stop Recording (#B7)
+    // Asynchronous teardown thread & lifecycle state guard for non-blocking Stop/Start
     std::thread m_stopThread;
     std::mutex m_stopMutex;
+    std::mutex m_lifecycleMutex;
 
     std::unique_ptr<MediaFoundationEncoder> m_encoder;
     std::deque<std::shared_ptr<CapturedFrame>> m_inFlightFrames; // worker thread only (#1, #7)
     std::wstring m_currentSegmentPath;
     std::string m_currentFormatKey;
     std::chrono::steady_clock::time_point m_currentSegmentStart{};
+    std::chrono::steady_clock::time_point m_lastVideoCaptureTime{};
     bool m_isContinuationSegment = false;
     int m_segmentGameSampleRate = 48000;
     int m_segmentIndex = 0; // monotonic across sessions so names never collide with in-flight exports

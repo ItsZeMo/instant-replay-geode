@@ -4,6 +4,7 @@
 
 #include "../ui/ReplayNotification.hpp"
 #include "../ui/ReplayPopup.hpp"
+#include "../capture/FrameBudget.hpp"
 #include <Geode/binding/FMODAudioEngine.hpp>
 #include <Geode/utils/async.hpp>
 #include <Geode/utils/file.hpp>
@@ -20,6 +21,7 @@ static constexpr double SEGMENT_DURATION = 30.0; // 30-second rolling chunks
 static constexpr double SEGMENT_PREWARM_SECONDS = 25.0; // pre-warm next encoder 5s before rotation
 static constexpr double MAX_SEGMENT_DURATION = 120.0;   // safety fallback if prepare stalls
 static constexpr double SAVE_PENDING_SWITCH_TIMEOUT = 5.0; // safety fallback for non-blocking F6 switch
+static constexpr size_t MAX_QUEUED_VIDEO_FRAMES = 16;
 static constexpr size_t MAX_QUEUED_VIDEO_BYTES = 64ull * 1024 * 1024;
 static constexpr size_t MAX_IN_FLIGHT_ENCODER_FRAMES = 16;
 static constexpr size_t MAX_MIC_MIX_SAMPLES = AudioGrabber::kMicSampleRate * 2 * 5; // ~5s stereo cap
@@ -348,6 +350,10 @@ void ReplayManager::reclaimInFlightFrames(bool forceClear) {
 
 void ReplayManager::initialize() {
     m_shuttingDown.store(false);
+    m_pendingRestart.store(false);
+    m_stopping.store(false);
+    m_saveRequested.store(false);
+    m_savePending.store(false);
     ReplayConfig::refreshNativeFrameHeight();
     ReplayConfig::get().loadFromSettings();
     m_sessionConfig = ReplayConfig::get().snapshot();
@@ -362,9 +368,8 @@ void ReplayManager::initialize() {
             if (!m_running.load(std::memory_order_relaxed)) {
                 dropped = std::move(frame);
             } else {
-                size_t frameBytes = std::max<size_t>(1, frame->byteSize);
-                size_t maxFrames = std::clamp<size_t>(MAX_QUEUED_VIDEO_BYTES / frameBytes, 4, 16);
-                if (m_frameQueue.size() < maxFrames) {
+                const size_t queuedBytes = sumFrameBufferBytes(m_frameQueue, [](const CapturedFrame& f) { return f.byteSize; });
+                if (canEnqueueVideoFrameBytes(m_frameQueue.size(), queuedBytes, frame->byteSize, MAX_QUEUED_VIDEO_FRAMES, MAX_QUEUED_VIDEO_BYTES)) {
                     m_frameQueue.push_back(std::move(frame));
                 } else {
                     dropped = std::move(frame);
@@ -405,6 +410,10 @@ void ReplayManager::initialize() {
 
 void ReplayManager::shutdown() {
     if (m_shuttingDown.exchange(true)) return;
+    {
+        std::lock_guard<std::mutex> lc(m_lifecycleMutex);
+        m_pendingRestart.store(false);
+    }
 
     stopReplay();
     joinFinalizeThread();
@@ -416,11 +425,20 @@ void ReplayManager::shutdown() {
 }
 
 void ReplayManager::startReplay() {
-    if (m_running.load() || m_shuttingDown.load()) return;
+    {
+        std::lock_guard<std::mutex> lc(m_lifecycleMutex);
+        if (m_running.load() || m_shuttingDown.load()) return;
+        if (m_stopping.load()) {
+            // Stop teardown is still running asynchronously; queue restart without blocking the UI thread
+            m_pendingRestart.store(true);
+            return;
+        }
+        m_pendingRestart.store(false);
+    }
 
-    // If an asynchronous Stop is still finishing in the background, wait for it before restarting
+    // Stop teardown has already finished; harvest any exited thread handle before starting anew
     joinStopThread();
-    if (m_running.load() || m_shuttingDown.load()) return;
+    if (m_running.load() || m_shuttingDown.load() || m_stopping.load()) return;
 
     ReplayConfig::refreshNativeFrameHeight();
 
@@ -450,6 +468,7 @@ void ReplayManager::startReplay() {
     // Note: m_segmentIndex is intentionally NOT reset so segment filenames never
     // collide with files still being read by an in-flight export thread.
     m_lastVideoHns = -1;
+    m_lastVideoCaptureTime = {};
     m_gameAudioSamples = 0;
     m_micAudioSamples = 0;
     m_isContinuationSegment = false;
@@ -526,12 +545,13 @@ void ReplayManager::finishStopCleanup() {
     m_carryGameAudio = {};
     m_carryMicAudio.clear();
     m_savePendingSwitch = false;
+    m_lastVideoHns = -1;
+    m_lastVideoCaptureTime = {};
 
     {
         std::lock_guard<std::mutex> lock(m_queueMutex);
-        if (m_saveRequested.exchange(false)) {
-            m_saving.store(false);
-        }
+        m_saveRequested.store(false);
+        m_savePending.store(false);
         for (auto& f : m_frameQueue) {
             if (!m_shuttingDown.load()) {
                 FrameGrabber::get()->recycleFrame(std::move(f));
@@ -555,10 +575,26 @@ void ReplayManager::finishStopCleanup() {
         m_currentFormatKey.clear();
     }
 
-    m_stopping.store(false);
+    bool shouldRestart = false;
+    {
+        std::lock_guard<std::mutex> lc(m_lifecycleMutex);
+        shouldRestart = !m_shuttingDown.load() && m_pendingRestart.exchange(false);
+        m_stopping.store(false);
+    }
 
     if (!m_shuttingDown.load()) {
-        geode::queueInMainThread([]() {
+        geode::queueInMainThread([this, shouldRestart]() {
+            if (m_shuttingDown.load()) return;
+            if (shouldRestart && ReplayConfig::get().enabled.load()) {
+                startReplay();
+                if (ReplayConfig::get().showNotification.load() && isReplayActive()) {
+                    geode::Notification::create(
+                        "Instant Replay: Replay Enabled",
+                        geode::NotificationIcon::Success,
+                        1.5f
+                    )->show();
+                }
+            }
             if (auto* popup = ReplayPopup::get()) {
                 popup->refreshUI();
                 popup->updateStatusDisplay(0.0f);
@@ -578,23 +614,27 @@ void ReplayManager::stopReplay() {
     m_prepareCancel.store(true);
     m_cv.notify_all();
 
-    if (m_shuttingDown.load()) {
-        m_stopping.store(true);
-        // Synchronous teardown on game exit so GL/FMOD stay valid (#5 invariant)
-        joinStopThread();
-        finishStopCleanup();
-        return;
+    {
+        std::lock_guard<std::mutex> lc(m_lifecycleMutex);
+        m_pendingRestart.store(false);
+        if (m_shuttingDown.load()) {
+            m_stopping.store(true);
+        } else {
+            if (m_stopping.exchange(true)) {
+                return;
+            }
+            joinStopThread();
+            std::lock_guard<std::mutex> stopLock(m_stopMutex);
+            m_stopThread = std::thread([this]() {
+                finishStopCleanup();
+            });
+            return;
+        }
     }
 
-    if (m_stopping.exchange(true)) {
-        return;
-    }
-
+    // Synchronous teardown on game exit so GL/FMOD stay valid (#5 invariant)
     joinStopThread();
-    std::lock_guard<std::mutex> lock(m_stopMutex);
-    m_stopThread = std::thread([this]() {
-        finishStopCleanup();
-    });
+    finishStopCleanup();
 }
 
 void ReplayManager::setReplayEnabled(bool enabled) {
@@ -607,17 +647,34 @@ void ReplayManager::setReplayEnabled(bool enabled) {
     }
 }
 
-void ReplayManager::toggleReplay() {
+ToggleReplayResult ReplayManager::toggleReplay() {
     auto& cfg = ReplayConfig::get();
+    bool handledWhileStopping = false;
+    bool restartQueued = false;
+    {
+        std::lock_guard<std::mutex> lc(m_lifecycleMutex);
+        if (m_stopping.load()) {
+            handledWhileStopping = true;
+            restartQueued = !m_pendingRestart.load();
+            m_pendingRestart.store(restartQueued);
+        }
+    }
+    if (handledWhileStopping) {
+        cfg.enabled = restartQueued;
+        cfg.saveToSettings();
+        return restartQueued ? ToggleReplayResult::RestartQueued : ToggleReplayResult::StopPending;
+    }
+
     bool newState = !cfg.enabled.load();
     cfg.enabled = newState;
     cfg.saveToSettings();
 
     if (newState) {
         startReplay();
-    } else {
-        stopReplay();
+        return m_pendingRestart.load() ? ToggleReplayResult::RestartQueued : ToggleReplayResult::Enabled;
     }
+    stopReplay();
+    return ToggleReplayResult::Stopping;
 }
 
 void ReplayManager::handleFatalRecordingError(const std::string& reason) {
@@ -627,9 +684,8 @@ void ReplayManager::handleFatalRecordingError(const std::string& reason) {
     {
         std::lock_guard<std::mutex> lock(m_queueMutex);
         m_running.store(false);
-        if (m_saveRequested.exchange(false)) {
-            m_saving.store(false);
-        }
+        m_saveRequested.store(false);
+        m_savePending.store(false);
         failedSession = m_sessionId;
     }
     FrameGrabber::get()->setCapturing(false);
@@ -1351,7 +1407,10 @@ ReplayManager::PendingFinalizeInfo ReplayManager::finalizeCurrentSegment(bool sy
             }
         }
         prom->set_value(keep);
-        m_finalizeInFlight.store(false);
+        {
+            std::lock_guard<std::mutex> ql(m_queueMutex);
+            m_finalizeInFlight.store(false);
+        }
         purgeOldSegments(cfg);
         m_cv.notify_one();
     });
@@ -1365,6 +1424,7 @@ bool ReplayManager::startNewSegment(
     bool isContinuation
 ) {
     m_lastVideoHns = -1;
+    m_lastVideoCaptureTime = {};
     m_gameAudioSamples = 0;
     m_micAudioSamples = 0;
     m_currentSegmentStart = segStart;
@@ -1464,6 +1524,7 @@ bool ReplayManager::activatePreparedOrStartNew(
             resetMicMixer();
         }
         m_lastVideoHns = -1;
+        m_lastVideoCaptureTime = {};
         m_gameAudioSamples = 0;
         m_micAudioSamples = 0;
         m_currentSegmentStart = nextSegStart;
@@ -1578,7 +1639,10 @@ void ReplayManager::startPrepareNextSegment(const ReplayConfig& cfg) {
         }
 
         if (SUCCEEDED(coHr)) CoUninitialize();
-        m_prepareInFlight.store(false);
+        {
+            std::lock_guard<std::mutex> ql(m_queueMutex);
+            m_prepareInFlight.store(false);
+        }
         m_cv.notify_one();
     });
 }
@@ -1594,7 +1658,7 @@ bool ReplayManager::rotateSegment(bool syncForExport, const ReplayConfig& cfg,
 }
 
 void ReplayManager::purgeOldSegments(const ReplayConfig& cfg) {
-    if (m_saving.load()) return;
+    if (isSaving()) return;
     std::lock_guard<std::mutex> lock(m_segmentMutex);
     auto now = std::chrono::steady_clock::now();
     double maxAge = static_cast<double>(cfg.durationSeconds.load()) + SEGMENT_DURATION * 2.0;
@@ -1611,21 +1675,187 @@ void ReplayManager::purgeOldSegments(const ReplayConfig& cfg) {
     }
 }
 
-void ReplayManager::handleSaveRequest(
+void ReplayManager::abortPendingSave() {
+    std::lock_guard<std::mutex> lock(m_queueMutex);
+    m_saveRequested.store(false);
+    m_savePending.store(false);
+}
+
+bool ReplayManager::writeEncodedVideoFrame(
+    std::shared_ptr<CapturedFrame> frame,
+    const ReplayConfig& cfg,
+    bool& outRecovered,
+    std::string& outFatalError
+) {
+    outRecovered = false;
+    if (!frame || !m_encoder || !m_encoder->isRecording()) {
+        if (frame) {
+            FrameGrabber::get()->recycleFrame(std::move(frame));
+        }
+        return true;
+    }
+
+    if (frame->timestamp < m_currentSegmentStart) {
+        // Stale frame captured before the current segment started; recycle instead of clamping to 0/0.1ms
+        FrameGrabber::get()->recycleFrame(std::move(frame));
+        return true;
+    }
+
+    if (m_inFlightFrames.size() >= MAX_IN_FLIGHT_ENCODER_FRAMES) {
+        // Encoder queue is saturated; drop frame cleanly to bound memory (#1, #7)
+        FrameGrabber::get()->recycleFrame(std::move(frame));
+        return true;
+    }
+
+    int64_t ts = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        frame->timestamp - m_currentSegmentStart).count() / 100;
+    if (ts <= m_lastVideoHns) ts = m_lastVideoHns + 1000;
+
+    EncoderOpResult videoRes = m_encoder->writeVideoFrame(frame->buffer.get(), frame->width, frame->height, ts);
+    if (videoRes) {
+        m_lastVideoHns = ts;
+        m_lastVideoCaptureTime = frame->timestamp;
+        m_videoWriteErrors = 0;
+        if (FrameGrabber::isMediaBufferUnique(frame->buffer.get())) {
+            FrameGrabber::get()->recycleFrame(std::move(frame));
+        } else {
+            m_inFlightFrames.push_back(std::move(frame));
+        }
+        return true;
+    }
+
+    WriteCheckResult wc = handleEncoderWriteError("video", videoRes, m_videoWriteErrors, cfg, outFatalError);
+    FrameGrabber::get()->recycleFrame(std::move(frame));
+    if (wc == WriteCheckResult::Recovered) {
+        outRecovered = true;
+        return false;
+    }
+    return wc != WriteCheckResult::Fatal;
+}
+
+bool ReplayManager::drainPreBoundaryVideoFrames(
+    std::chrono::steady_clock::time_point& boundaryTime,
+    const ReplayConfig& cfg,
+    bool& outRecovered,
+    std::string& outFatalError
+) {
+    outRecovered = false;
+    while (m_encoder && m_encoder->isRecording() && !m_shuttingDown.load()) {
+        std::shared_ptr<CapturedFrame> qFrame;
+        std::chrono::steady_clock::time_point frontTs{};
+        bool hasFront = false;
+        {
+            std::lock_guard<std::mutex> lock(m_queueMutex);
+            if (!m_frameQueue.empty()) {
+                frontTs = m_frameQueue.front()->timestamp;
+                hasFront = true;
+                if (frontTs <= boundaryTime &&
+                    m_frameQueue.front()->width == m_videoWidth &&
+                    m_frameQueue.front()->height == m_videoHeight) {
+                    // Only pop once encoder has capacity so unencoded frames never strand
+                    if (m_inFlightFrames.size() < MAX_IN_FLIGHT_ENCODER_FRAMES) {
+                        qFrame = std::move(m_frameQueue.front());
+                        m_frameQueue.pop_front();
+                    }
+                }
+            }
+        }
+
+        if (!hasFront || frontTs > boundaryTime) {
+            break;
+        }
+        if (!qFrame) {
+            bool sizeMismatch = false;
+            {
+                std::lock_guard<std::mutex> lock(m_queueMutex);
+                if (!m_frameQueue.empty() &&
+                    (m_frameQueue.front()->width != m_videoWidth ||
+                     m_frameQueue.front()->height != m_videoHeight)) {
+                    sizeMismatch = true;
+                }
+            }
+            if (sizeMismatch) {
+                boundaryTime = std::min(boundaryTime, frontTs);
+                break;
+            }
+            // Wait briefly for Media Foundation to release an in-flight buffer
+            reclaimInFlightFrames(false);
+            if (m_inFlightFrames.size() >= MAX_IN_FLIGHT_ENCODER_FRAMES) {
+                bool freed = false;
+                for (int attempt = 0; attempt < 50 && !m_shuttingDown.load(); ++attempt) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                    reclaimInFlightFrames(false);
+                    if (m_inFlightFrames.size() < MAX_IN_FLIGHT_ENCODER_FRAMES) {
+                        freed = true;
+                        break;
+                    }
+                }
+                if (!freed) {
+                    // Leave remaining frames in queue for next segment starting right at frontTs
+                    boundaryTime = std::min(boundaryTime, frontTs);
+                    break;
+                }
+            }
+            continue;
+        }
+
+        bool frameRecovered = false;
+        if (!writeEncodedVideoFrame(std::move(qFrame), cfg, frameRecovered, outFatalError)) {
+            if (frameRecovered) {
+                outRecovered = true;
+                return true;
+            }
+            return false;
+        }
+    }
+
+    if (!outRecovered) {
+        std::lock_guard<std::mutex> lock(m_queueMutex);
+        if (!m_frameQueue.empty()) {
+            boundaryTime = std::min(boundaryTime, m_frameQueue.front()->timestamp);
+        } else if (m_lastVideoHns >= 0 &&
+                   m_lastVideoCaptureTime != std::chrono::steady_clock::time_point{} &&
+                   (boundaryTime - m_lastVideoCaptureTime) < std::chrono::milliseconds(200)) {
+            // Align audio boundary right after the last encoded video frame so a PBO-lagged next frame stays >= boundary
+            auto tightBoundary = m_lastVideoCaptureTime + std::chrono::microseconds(100);
+            if (tightBoundary < boundaryTime) {
+                boundaryTime = tightBoundary;
+            }
+        }
+    }
+    return true;
+}
+
+bool ReplayManager::handleSaveRequest(
     bool continueRecording,
     const ReplayConfig& cfg,
     std::chrono::steady_clock::time_point boundaryTime,
+    bool alreadyRecovered,
     std::vector<float>& gameAudioScratch,
     std::vector<float>& resampledGameAudioScratch,
-    std::vector<float>& silenceScratch
+    std::vector<float>& silenceScratch,
+    std::string& outFatalError
 ) {
     PendingFinalizeInfo extraPending{};
     bool wasRecording = (m_encoder && m_encoder->isRecording());
 
-    if (continueRecording && wasRecording) {
-        std::string ignoredErr;
+    auto failSave = [this, &outFatalError](std::string err) -> bool {
+        m_carryGameAudio = {};
+        m_carryMicAudio.clear();
+        m_prepareCancel.store(true);
+        joinPrepareThread();
+        discardPreparedEncoder();
+        abortPendingSave();
+        outFatalError = std::move(err);
+        return false;
+    };
+
+    if (continueRecording && wasRecording && !alreadyRecovered) {
+        std::string audioErr;
         bool recovered = false;
-        splitAudioAtBoundary(boundaryTime, cfg, gameAudioScratch, resampledGameAudioScratch, silenceScratch, recovered, ignoredErr);
+        if (!splitAudioAtBoundary(boundaryTime, cfg, gameAudioScratch, resampledGameAudioScratch, silenceScratch, recovered, audioErr)) {
+            return failSave(std::move(audioErr));
+        }
 
         if (recovered) {
             m_prepareCancel.store(true);
@@ -1644,11 +1874,20 @@ void ReplayManager::handleSaveRequest(
             if (canHotSwap && !m_finalizeInFlight.load()) {
                 extraPending = finalizeCurrentSegment(false, cfg);
                 if (activatePreparedOrStartNew(cfg, boundaryTime, true, false)) {
-                    flushCarryAudio(cfg, resampledGameAudioScratch, silenceScratch, ignoredErr);
+                    if (!flushCarryAudio(cfg, resampledGameAudioScratch, silenceScratch, audioErr)) {
+                        return failSave(std::move(audioErr));
+                    }
                 } else {
                     m_carryGameAudio = {};
                     m_carryMicAudio.clear();
                     m_encoderFailCount++;
+                    if (MediaFoundationEncoder::isFatalStorageError(m_lastStartError.hr) ||
+                        m_encoderFailCount >= MAX_ENCODER_START_FAILURES) {
+                        std::string detail = m_lastStartError.message.empty()
+                            ? MediaFoundationEncoder::formatHr(m_lastStartError.hr)
+                            : m_lastStartError.message;
+                        return failSave("Instant Replay stopped: " + detail);
+                    }
                     m_nextEncoderRetryTime = std::chrono::steady_clock::now() + std::chrono::seconds(2 * m_encoderFailCount);
                 }
             } else {
@@ -1660,11 +1899,20 @@ void ReplayManager::handleSaveRequest(
                 purgeOldSegments(cfg);
                 if (m_running.load()) {
                     if (startNewSegment(cfg, boundaryTime, true)) {
-                        flushCarryAudio(cfg, resampledGameAudioScratch, silenceScratch, ignoredErr);
+                        if (!flushCarryAudio(cfg, resampledGameAudioScratch, silenceScratch, audioErr)) {
+                            return failSave(std::move(audioErr));
+                        }
                     } else {
                         m_carryGameAudio = {};
                         m_carryMicAudio.clear();
                         m_encoderFailCount++;
+                        if (MediaFoundationEncoder::isFatalStorageError(m_lastStartError.hr) ||
+                            m_encoderFailCount >= MAX_ENCODER_START_FAILURES) {
+                            std::string detail = m_lastStartError.message.empty()
+                                ? MediaFoundationEncoder::formatHr(m_lastStartError.hr)
+                                : m_lastStartError.message;
+                            return failSave("Instant Replay stopped: " + detail);
+                        }
                         m_nextEncoderRetryTime = std::chrono::steady_clock::now() + std::chrono::seconds(2 * m_encoderFailCount);
                     }
                 } else {
@@ -1673,13 +1921,21 @@ void ReplayManager::handleSaveRequest(
                 }
             }
         }
+    } else if (alreadyRecovered) {
+        m_prepareCancel.store(true);
+        joinPrepareThread();
+        discardPreparedEncoder();
+        m_carryGameAudio = {};
+        m_carryMicAudio.clear();
     } else if (!continueRecording) {
         m_prepareCancel.store(true);
         joinPrepareThread();
         discardPreparedEncoder();
         if (wasRecording) {
-            std::string ignoredErr;
-            processPendingAudio(cfg, gameAudioScratch, resampledGameAudioScratch, silenceScratch, ignoredErr);
+            std::string audioErr;
+            if (!processPendingAudio(cfg, gameAudioScratch, resampledGameAudioScratch, silenceScratch, audioErr)) {
+                return failSave(std::move(audioErr));
+            }
             finalizeCurrentSegment(true, cfg);
         } else {
             std::lock_guard<std::mutex> lock(m_finalizeMutex);
@@ -1714,15 +1970,21 @@ void ReplayManager::handleSaveRequest(
     }
 
     if (candidateSegments.empty() && !extraPending.future.valid()) {
-        m_saving.store(false);
+        abortPendingSave();
         geode::Loader::get()->queueInMainThread([]() {
             geode::Notification::create("Instant Replay: replay is empty", geode::NotificationIcon::Warning)->show();
         });
-        return;
+        return true;
     }
 
-    // Wait for any previous finished export thread, then run finalization wait, disk checks, and merge off worker thread.
+    // Wait for any previously finished export thread, transition savePending -> exportInFlight atomically, and run export off worker thread.
     joinExportThread();
+    {
+        std::lock_guard<std::mutex> qLock(m_queueMutex);
+        m_exportInFlight.store(true);
+        m_savePending.store(false);
+    }
+
     bool showNotif = ReplayConfig::get().showNotification.load();
     ReplayConfig cfgCopy = cfg;
 
@@ -1733,6 +1995,11 @@ void ReplayManager::handleSaveRequest(
                                   extraPending = std::move(extraPending),
                                   cfgCopy,
                                   showNotif]() mutable {
+        struct ExportFlagGuard {
+            std::atomic<bool>& flag;
+            ~ExportFlagGuard() { flag.store(false); }
+        } exportGuard{m_exportInFlight};
+
         if (extraPending.future.valid()) {
             bool keepExtra = extraPending.future.get();
             if (keepExtra && !extraPending.segment.filePath.empty()) {
@@ -1781,7 +2048,6 @@ void ReplayManager::handleSaveRequest(
         }
 
         if (segsToMerge.empty()) {
-            m_saving.store(false);
             geode::Loader::get()->queueInMainThread([]() {
                 geode::Notification::create("Instant Replay: replay is empty", geode::NotificationIcon::Warning)->show();
             });
@@ -1823,7 +2089,6 @@ void ReplayManager::handleSaveRequest(
         if (SUCCEEDED(coHr)) CoUninitialize();
 
         releaseExportSegments(segsToMerge);
-        m_saving.store(false);
 
         std::string finalPathStr = geode::utils::string::pathToString(finalPath);
         double savedDuration = (result.durationSeconds > 0.0)
@@ -1848,6 +2113,7 @@ void ReplayManager::handleSaveRequest(
             }
         });
     });
+    return true;
 }
 
 void ReplayManager::workerThreadFunc(ReplayConfig sessionConfig) {
@@ -1863,20 +2129,72 @@ void ReplayManager::workerThreadFunc(ReplayConfig sessionConfig) {
         std::shared_ptr<CapturedFrame> frame;
         {
             std::unique_lock<std::mutex> lock(m_queueMutex);
-            m_cv.wait_for(lock, std::chrono::milliseconds(10), [this] {
-                return !m_running.load() || m_saveRequested.load() ||
-                       (m_savePendingSwitch && !m_prepareInFlight.load()) ||
-                       !m_frameQueue.empty() || !m_micAudioQueue.empty() ||
-                       AudioGrabber::get()->hasPendingGameAudio();
+            auto wakeDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(10);
+            if (m_savePendingSwitch) {
+                auto switchDeadline = m_savePendingSince + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                    std::chrono::duration<double>(SAVE_PENDING_SWITCH_TIMEOUT));
+                if (switchDeadline < wakeDeadline) {
+                    wakeDeadline = switchDeadline;
+                }
+            }
+
+            const bool hasEnc = (m_encoder && m_encoder->isRecording());
+            const bool inBackoff = (!hasEnc && std::chrono::steady_clock::now() < m_nextEncoderRetryTime);
+            if (inBackoff && m_nextEncoderRetryTime < wakeDeadline) {
+                wakeDeadline = m_nextEncoderRetryTime;
+            }
+
+            m_cv.wait_until(lock, wakeDeadline, [this, hasEnc, inBackoff] {
+                if (!m_running.load() || m_saveRequested.load()) return true;
+                if (m_savePendingSwitch) {
+                    auto nowCheck = std::chrono::steady_clock::now();
+                    double waited = std::chrono::duration<double>(nowCheck - m_savePendingSince).count();
+                    if (!hasEnc ||
+                        m_prepareFailedLastAttempt.load() ||
+                        (!m_finalizeInFlight.load() && !m_prepareInFlight.load()) ||
+                        waited >= SAVE_PENDING_SWITCH_TIMEOUT) {
+                        return true;
+                    }
+                }
+                if (!inBackoff && !m_frameQueue.empty()) return true;
+                if (hasEnc && (!m_micAudioQueue.empty() || AudioGrabber::get()->hasPendingGameAudio())) {
+                    return true;
+                }
+                return false;
             });
 
-            if (!m_frameQueue.empty()) {
-                frame = std::move(m_frameQueue.front());
-                m_frameQueue.pop_front();
+            if (inBackoff) {
+                while (!m_frameQueue.empty()) {
+                    FrameGrabber::get()->recycleFrame(std::move(m_frameQueue.front()));
+                    m_frameQueue.pop_front();
+                }
+                m_micAudioQueue.clear();
+            } else {
+                if (!hasEnc && m_micAudioQueue.size() > 25) {
+                    while (m_micAudioQueue.size() > 25) {
+                        m_micAudioQueue.pop_front();
+                    }
+                }
+                if (!m_frameQueue.empty()) {
+                    frame = std::move(m_frameQueue.front());
+                    m_frameQueue.pop_front();
+                }
             }
         }
 
         reclaimInFlightFrames(false);
+
+        if (!m_encoder || !m_encoder->isRecording()) {
+            auto curNow = std::chrono::steady_clock::now();
+            if (curNow < m_nextEncoderRetryTime) {
+                AudioGrabber::get()->resetGameAudioBuffer();
+            } else {
+                const size_t encRate = static_cast<size_t>(std::max(1, AudioGrabber::get()->getEncodedGameSampleRate()));
+                if (AudioGrabber::get()->pendingGameAudioFrames() > encRate / 2) {
+                    AudioGrabber::get()->resetGameAudioBuffer();
+                }
+            }
+        }
 
         auto now = std::chrono::steady_clock::now();
         if (!m_savePendingSwitch && m_prepareFailedLastAttempt.exchange(false)) {
@@ -2013,42 +2331,18 @@ void ReplayManager::workerThreadFunc(ReplayConfig sessionConfig) {
         if (m_encoder && m_encoder->isRecording()) {
             bool skipAudioAfterRecovery = false;
             if (frame) {
-                int64_t ts = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    frame->timestamp - m_currentSegmentStart).count() / 100;
-                if (ts < 0) ts = 0;
-                if (ts <= m_lastVideoHns) ts = m_lastVideoHns + 1000;
-
-                if (m_inFlightFrames.size() >= MAX_IN_FLIGHT_ENCODER_FRAMES) {
-                    // Encoder queue is saturated; drop frame cleanly to bound memory (#1, #7)
-                    FrameGrabber::get()->recycleFrame(std::move(frame));
-                    frame.reset();
-                } else {
-                    EncoderOpResult videoRes = m_encoder->writeVideoFrame(frame->buffer.get(), frame->width, frame->height, ts);
-                    if (videoRes) {
-                        m_lastVideoHns = ts;
-                        m_videoWriteErrors = 0;
-                        if (FrameGrabber::isMediaBufferUnique(frame->buffer.get())) {
-                            FrameGrabber::get()->recycleFrame(std::move(frame));
-                        } else {
-                            m_inFlightFrames.push_back(std::move(frame));
-                        }
-                        frame.reset();
+                bool videoRecovered = false;
+                std::string videoFatalErr;
+                if (!writeEncodedVideoFrame(std::move(frame), sessionConfig, videoRecovered, videoFatalErr)) {
+                    if (videoRecovered) {
+                        skipAudioAfterRecovery = true;
                     } else {
-                        std::string videoFatalErr;
-                        WriteCheckResult wc = handleEncoderWriteError("video", videoRes, m_videoWriteErrors, sessionConfig, videoFatalErr);
-                        if (wc == WriteCheckResult::Recovered) {
-                            FrameGrabber::get()->recycleFrame(std::move(frame));
-                            frame.reset();
-                            skipAudioAfterRecovery = true;
-                        } else if (wc == WriteCheckResult::Fatal) {
-                            FrameGrabber::get()->recycleFrame(std::move(frame));
-                            frame.reset();
-                            hadFatalError = true;
-                            handleFatalRecordingError(videoFatalErr);
-                            break;
-                        }
+                        hadFatalError = true;
+                        handleFatalRecordingError(videoFatalErr);
+                        break;
                     }
                 }
+                frame.reset();
             }
 
             if (!skipAudioAfterRecovery) {
@@ -2101,16 +2395,59 @@ void ReplayManager::workerThreadFunc(ReplayConfig sessionConfig) {
 
             if (readyToExecute) {
                 m_savePendingSwitch = false;
-                handleSaveRequest(true, sessionConfig, saveNow, gameAudioScratch, resampledGameAudioScratch, silenceScratch);
+                auto boundaryTime = saveNow;
+                bool drainRecovered = false;
+                std::string saveFatalErr;
+                if (activeEnc) {
+                    if (!drainPreBoundaryVideoFrames(boundaryTime, sessionConfig, drainRecovered, saveFatalErr)) {
+                        hadFatalError = true;
+                        abortPendingSave();
+                        handleFatalRecordingError(saveFatalErr);
+                        break;
+                    }
+                    if (drainRecovered) {
+                        boundaryTime = std::chrono::steady_clock::now();
+                    }
+                }
+                if (!handleSaveRequest(true, sessionConfig, boundaryTime, drainRecovered,
+                                       gameAudioScratch, resampledGameAudioScratch, silenceScratch, saveFatalErr)) {
+                    hadFatalError = true;
+                    handleFatalRecordingError(saveFatalErr);
+                    break;
+                }
             }
         }
     }
 
-    // If a save was requested right before stopReplay() woke us up, fulfill it before tearing down
+    // If a save was requested right before stopReplay() woke us up (without fatal error), fulfill it cleanly before tearing down
     if (!hadFatalError && (m_saveRequested.exchange(false) || m_savePendingSwitch)) {
         m_savePendingSwitch = false;
-        handleSaveRequest(false, sessionConfig, std::chrono::steady_clock::now(),
-                          gameAudioScratch, resampledGameAudioScratch, silenceScratch);
+        auto boundaryTime = std::chrono::steady_clock::now();
+        bool drainRecovered = false;
+        std::string saveFatalErr;
+        bool drainOk = true;
+        if (m_encoder && m_encoder->isRecording()) {
+            drainOk = drainPreBoundaryVideoFrames(boundaryTime, sessionConfig, drainRecovered, saveFatalErr);
+            if (drainOk && drainRecovered) {
+                boundaryTime = std::chrono::steady_clock::now();
+            }
+        }
+        bool saveOk = drainOk && handleSaveRequest(
+            false, sessionConfig, boundaryTime, drainRecovered,
+            gameAudioScratch, resampledGameAudioScratch, silenceScratch, saveFatalErr);
+        if (!saveOk) {
+            hadFatalError = true;
+            abortPendingSave();
+            geode::log::error("Instant Replay: {}", saveFatalErr);
+            if (!m_shuttingDown.load()) {
+                geode::Loader::get()->queueInMainThread([saveFatalErr]() {
+                    geode::Notification::create(saveFatalErr, geode::NotificationIcon::Error, 4.0f)->show();
+                });
+            }
+        }
+    } else {
+        m_savePendingSwitch = false;
+        abortPendingSave();
     }
 
     // Release all COM objects held on this thread BEFORE CoUninitialize (#20)
@@ -2133,8 +2470,8 @@ SaveReplayResult ReplayManager::saveReplay() {
     {
         std::lock_guard<std::mutex> lock(m_queueMutex);
         if (!m_running.load() || m_shuttingDown.load()) return SaveReplayResult::NotRunning;
-        bool expected = false;
-        if (!m_saving.compare_exchange_strong(expected, true)) return SaveReplayResult::AlreadySaving;
+        if (m_savePending.load() || m_exportInFlight.load()) return SaveReplayResult::AlreadySaving;
+        m_savePending.store(true);
         m_saveRequested.store(true);
     }
     m_cv.notify_all();

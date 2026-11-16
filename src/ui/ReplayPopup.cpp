@@ -258,8 +258,16 @@ void ReplayPopup::toggle() {
     }
 }
 
-ReplayPopup::~ReplayPopup() {
+void ReplayPopup::cancelAsyncTasks() noexcept {
+    ++m_browseRequestId;
     m_diskCheckTask.cancel();
+    m_micEnumTask.cancel();
+    m_browsePathTask.cancel();
+    m_browsePickerTask.cancel();
+}
+
+ReplayPopup::~ReplayPopup() {
+    cancelAsyncTasks();
     if (s_instance == this) {
         s_instance = nullptr;
     }
@@ -280,7 +288,7 @@ void ReplayPopup::markSettingsDirty(bool flushToDisk) {
 }
 
 void ReplayPopup::onClose(CCObject* sender) {
-    m_diskCheckTask.cancel();
+    cancelAsyncTasks();
     if (s_instance == this) {
         s_instance = nullptr;
     }
@@ -1119,25 +1127,38 @@ void ReplayPopup::updateFolderDisplay() {
 
 void ReplayPopup::onBrowseFolder() {
     if (guardLocked()) return;
-    auto defaultDir = ReplayConfig::get().getExistingRecordingsPickerPath();
+    ReplayConfig snap = ReplayConfig::get().snapshot();
+    uint64_t reqId = ++m_browseRequestId;
+    m_browsePickerTask.cancel();
 
-    file::FilePickOptions options;
-    options.defaultPath = defaultDir;
+    m_browsePathTask.spawn(
+        geode::async::runtime().spawnBlocking<std::filesystem::path>([snap = std::move(snap)]() {
+            return snap.getExistingRecordingsPickerPath();
+        }),
+        [this, reqId](std::filesystem::path defaultDir) {
+            if (s_instance != this || !this->getParent() || reqId != m_browseRequestId || this->guardLocked()) {
+                return;
+            }
+            file::FilePickOptions options;
+            options.defaultPath = std::move(defaultDir);
 
-    geode::Ref<ReplayPopup> self = this;
-    geode::async::spawn(
-        file::pick(file::PickMode::OpenFolder, options),
-        [self](Result<std::optional<std::filesystem::path>> result) {
-            if (!result.isOk() || !result.unwrap().has_value()) return;
-            if (self->guardLocked()) return;
+            m_browsePickerTask.spawn(
+                file::pick(file::PickMode::OpenFolder, options),
+                [this, reqId](Result<std::optional<std::filesystem::path>> result) {
+                    if (s_instance != this || !this->getParent() || reqId != m_browseRequestId || this->guardLocked()) {
+                        return;
+                    }
+                    if (!result.isOk() || !result.unwrap().has_value()) return;
 
-            auto path = std::move(result).unwrap().value();
-            ReplayConfig::get().setCustomSaveFolder(geode::utils::string::pathToString(path));
-            self->markSettingsDirty(true);
-            self->updateFolderDisplay();
-            self->updateStatusDisplay(0.0f);
-            self->scheduleDiskSpaceCheck(true);
-            Notification::create("Save folder updated", NotificationIcon::Success, 1.0f)->show();
+                    auto path = std::move(result).unwrap().value();
+                    ReplayConfig::get().setCustomSaveFolder(geode::utils::string::pathToString(path));
+                    this->markSettingsDirty(true);
+                    this->updateFolderDisplay();
+                    this->updateStatusDisplay(0.0f);
+                    this->scheduleDiskSpaceCheck(true);
+                    Notification::create("Save folder updated", NotificationIcon::Success, 1.0f)->show();
+                }
+            );
         }
     );
 }
@@ -1203,7 +1224,7 @@ void ReplayPopup::updateStatusDisplay(float dt) {
         if (mgr->isSaving()) {
             m_statusLabel->setString("Saving Replay...");
         } else if (isStopping) {
-            m_statusLabel->setString("Stopping...");
+            m_statusLabel->setString(mgr->isRestartPending() ? "Stopping (Restart Queued)..." : "Stopping...");
         } else if (isRec) {
             m_statusLabel->setString("Replay Active (Settings Locked)");
         } else {

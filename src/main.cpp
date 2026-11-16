@@ -46,18 +46,26 @@ static void triggerSaveReplay() {
 
 static void triggerToggleReplay() {
     geode::log::info("Instant Replay: Keybind triggered Toggle Replay");
-    ReplayManager::get()->toggleReplay();
+    ToggleReplayResult res = ReplayManager::get()->toggleReplay();
     if (auto* popup = ReplayPopup::get()) {
         popup->refreshUI();
         popup->updateStatusDisplay(0.0f);
     }
     if (ReplayConfig::get().showNotification.load()) {
-        bool active = ReplayManager::get()->isReplayActive();
-        geode::Notification::create(
-            active ? "Instant Replay: Replay Enabled" : "Instant Replay: Replay Disabled",
-            active ? geode::NotificationIcon::Success : geode::NotificationIcon::Warning,
-            1.5f
-        )->show();
+        switch (res) {
+            case ToggleReplayResult::Enabled:
+                geode::Notification::create("Instant Replay: Replay Enabled", geode::NotificationIcon::Success, 1.5f)->show();
+                break;
+            case ToggleReplayResult::Stopping:
+                geode::Notification::create("Instant Replay: Stopping...", geode::NotificationIcon::Warning, 1.5f)->show();
+                break;
+            case ToggleReplayResult::RestartQueued:
+                geode::Notification::create("Instant Replay: Restarting after stop...", geode::NotificationIcon::Info, 1.5f)->show();
+                break;
+            case ToggleReplayResult::StopPending:
+                geode::Notification::create("Instant Replay: Stop pending...", geode::NotificationIcon::Warning, 1.5f)->show();
+                break;
+        }
     }
 }
 
@@ -147,7 +155,7 @@ $on_mod(Loaded) {
                     return;
                 }
 
-                if (isActive && !targetEnabled) {
+                if ((isActive || ReplayManager::get()->isRestartPending()) && !targetEnabled) {
                     ReplayManager::get()->setReplayEnabled(false);
                 }
 
@@ -155,8 +163,8 @@ $on_mod(Loaded) {
                     ReplayConfig::get().loadFromSettings();
                 }
 
-                if (enabledChanged && targetEnabled != ReplayManager::get()->isReplayActive()) {
-                    ReplayManager::get()->setReplayEnabled(targetEnabled);
+                if (enabledChanged && targetEnabled && !ReplayManager::get()->isReplayActive()) {
+                    ReplayManager::get()->setReplayEnabled(true);
                 }
 
                 if (auto* popup = ReplayPopup::get()) {
