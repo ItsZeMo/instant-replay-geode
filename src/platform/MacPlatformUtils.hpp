@@ -24,9 +24,10 @@ bool isMacProcessAlive(int pid) noexcept;
 // (accounting for Retina wantsBestResolutionOpenGLSurface). Must be called on the render thread.
 void getMacOpenGLDrawableSize(int& outWidth, int& outHeight);
 
-// Installs an Objective-C hook on -[NSOpenGLContext flushBuffer] (running late, right before presentation)
-// that invokes `onBeforeFlush()` when presenting Geometry Dash's main EAGLView OpenGL context.
-void installMacGLCaptureHook(void (*onBeforeFlush)());
+// Installs an Objective-C method replacement on -[NSOpenGLContext flushBuffer] (running right before
+// presentation without patching AppKit shared-cache code pages) that invokes `onBeforeFlush()` when
+// `shouldCapture` is null or true and the context belongs to Geometry Dash's main EAGLView.
+void installMacGLCaptureHook(void (*onBeforeFlush)(), bool (*shouldCapture)() = nullptr);
 
 // Disables the flushBuffer callback cleanly during shutdown.
 void disableMacGLCaptureHook() noexcept;

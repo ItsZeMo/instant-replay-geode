@@ -90,9 +90,10 @@ $on_mod(Loaded) {
 
 #ifdef GEODE_IS_MACOS
     // On macOS, CCDirectorCaller calls -[NSOpenGLContext flushBuffer] directly (CCEGLView::swapBuffers is a no-op).
-    installMacGLCaptureHook([]() {
-        FrameGrabber::get()->captureCurrentFrame();
-    });
+    installMacGLCaptureHook(
+        []() { FrameGrabber::get()->captureCurrentFrame(); },
+        []() { return FrameGrabber::get()->isCapturing(); }
+    );
 #endif
 
     // 2. Register keybind listeners (Geode 5.10+ native keybind setting system)

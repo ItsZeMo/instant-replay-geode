@@ -25,7 +25,10 @@ namespace replay {
 
 namespace {
 std::atomic<void (*)()> g_onBeforeFlushCallback{nullptr};
+std::atomic<bool (*)()> g_shouldCaptureCallback{nullptr};
 std::atomic<bool> g_captureHookEnabled{false};
+std::atomic<void*> g_origFlushBuffer{nullptr};
+std::atomic<bool> g_hookInstalled{false};
 } // namespace
 
 std::filesystem::path getMacDefaultVideosDirectory() {
@@ -73,70 +76,109 @@ void getMacOpenGLDrawableSize(int& outWidth, int& outHeight) {
     outHeight = 0;
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    @autoreleasepool {
-        id eaglView = getSharedEAGLView();
-        if (eaglView && [eaglView isKindOfClass:[NSView class]]) {
-            NSView* nsView = static_cast<NSView*>(eaglView);
-            NSRect bounds = [nsView bounds];
-            NSSize sz = bounds.size;
-            if ([nsView wantsBestResolutionOpenGLSurface]) {
-                sz = [nsView convertRectToBacking:bounds].size;
+    if ([NSThread isMainThread]) {
+        @autoreleasepool {
+            id eaglView = getSharedEAGLView();
+            if (eaglView && [eaglView isKindOfClass:[NSView class]]) {
+                NSView* nsView = static_cast<NSView*>(eaglView);
+                NSRect bounds = [nsView bounds];
+                NSSize sz = bounds.size;
+                if ([nsView wantsBestResolutionOpenGLSurface]) {
+                    sz = [nsView convertRectToBacking:bounds].size;
+                }
+                outWidth = static_cast<int>(sz.width + 0.5);
+                outHeight = static_cast<int>(sz.height + 0.5);
             }
-            outWidth = static_cast<int>(sz.width + 0.5);
-            outHeight = static_cast<int>(sz.height + 0.5);
         }
     }
-#pragma clang diagnostic pop
+    if ((outWidth <= 0 || outHeight <= 0) && CGLGetCurrentContext() != nullptr) {
+        GLint curDrawFbo = 0;
+        glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &curDrawFbo);
+        if (curDrawFbo == 0) {
+            GLint vp[4] = {0, 0, 0, 0};
+            glGetIntegerv(GL_VIEWPORT, vp);
+            if (vp[2] >= 16 && vp[3] >= 16) {
+                outWidth = vp[2];
+                outHeight = vp[3];
+            }
+        }
+    }
     if (outWidth <= 0 || outHeight <= 0) {
         if (auto* view = cocos2d::CCEGLView::get()) {
             auto fs = view->getFrameSize();
-            float factor = geode::utils::getDisplayFactor();
-            if (factor <= 0.0f) factor = 1.0f;
-            outWidth = static_cast<int>(fs.width * factor + 0.5f);
-            outHeight = static_cast<int>(fs.height * factor + 0.5f);
+            float scale = 1.0f;
+            @autoreleasepool {
+                id eaglView = getSharedEAGLView();
+                if (eaglView && [eaglView isKindOfClass:[NSView class]] &&
+                    [static_cast<NSView*>(eaglView) wantsBestResolutionOpenGLSurface]) {
+                    float f = geode::utils::getDisplayFactor();
+                    if (f > 1.0f) scale = f;
+                }
+            }
+            outWidth = static_cast<int>(fs.width * scale + 0.5f);
+            outHeight = static_cast<int>(fs.height * scale + 0.5f);
         }
     }
-    if (outWidth <= 0 || outHeight <= 0) {
-        GLint vp[4] = {0, 0, 0, 0};
-        glGetIntegerv(GL_VIEWPORT, vp);
-        outWidth = vp[2];
-        outHeight = vp[3];
-    }
+#pragma clang diagnostic pop
 }
 
 static void nsOpenGLContextFlushBufferHook(NSOpenGLContext* self, SEL sel) {
     if (g_captureHookEnabled.load(std::memory_order_acquire)) {
-        if (auto cb = g_onBeforeFlushCallback.load(std::memory_order_acquire)) {
-            id eaglView = getSharedEAGLView();
+        auto shouldCapture = g_shouldCaptureCallback.load(std::memory_order_acquire);
+        if (!shouldCapture || shouldCapture()) {
+            if (auto cb = g_onBeforeFlushCallback.load(std::memory_order_acquire)) {
+                @autoreleasepool {
+                    id eaglView = getSharedEAGLView();
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-            id ctxView = self ? [self view] : nil;
-            if (self && eaglView && ctxView == eaglView) {
-                if (CGLGetCurrentContext() != [self CGLContextObj]) {
-                    [self makeCurrentContext];
-                }
-                cb();
-            }
+                    id ctxView = self ? [self view] : nil;
+                    if (self && eaglView && ctxView == eaglView) {
+                        if (CGLGetCurrentContext() != [self CGLContextObj]) {
+                            [self makeCurrentContext];
+                        }
+                        cb();
+                    }
 #pragma clang diagnostic pop
+                }
+            }
         }
     }
-    reinterpret_cast<void (*)(id, SEL)>(objc_msgSend)(self, sel);
+    if (void* orig = g_origFlushBuffer.load(std::memory_order_acquire)) {
+        reinterpret_cast<void (*)(NSOpenGLContext*, SEL)>(orig)(self, sel);
+    }
 }
 
-void installMacGLCaptureHook(void (*onBeforeFlush)()) {
+void installMacGLCaptureHook(void (*onBeforeFlush)(), bool (*shouldCapture)()) {
     g_onBeforeFlushCallback.store(onBeforeFlush, std::memory_order_release);
+    g_shouldCaptureCallback.store(shouldCapture, std::memory_order_release);
     g_captureHookEnabled.store(true, std::memory_order_release);
 
-    static bool s_hookInstalled = false;
-    if (s_hookInstalled) return;
-    s_hookInstalled = true;
+    bool expected = false;
+    if (!g_hookInstalled.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        return;
+    }
 
-    if (auto hookRes = geode::ObjcHook::create("NSOpenGLContext", "flushBuffer", &nsOpenGLContextFlushBufferHook)) {
-        auto hook = std::move(hookRes).unwrap();
-        hook->setPriority(100000);
-        (void)geode::Mod::get()->claimHook(std::move(hook));
+    // Seed original IMP before replacing the ObjC method table entry so any concurrent
+    // CVDisplayLink flushBuffer call immediately after method_setImplementation sees a non-null IMP.
+    // Using replaceObjcMethod (method_setImplementation) avoids TulipHook inline-patching AppKit's
+    // dyld_shared_cache page, which strips VM_PROT_EXECUTE and crashes with SIGBUS on arm64.
+    if (auto curImpRes = geode::hook::getObjcMethodImp("NSOpenGLContext", "flushBuffer")) {
+        void* curImp = curImpRes.unwrap();
+        if (curImp && curImp != reinterpret_cast<void*>(&nsOpenGLContextFlushBufferHook)) {
+            g_origFlushBuffer.store(curImp, std::memory_order_release);
+        }
+    }
+
+    if (auto replaceRes = geode::hook::replaceObjcMethod(
+            "NSOpenGLContext",
+            "flushBuffer",
+            reinterpret_cast<void*>(&nsOpenGLContextFlushBufferHook))) {
+        void* prevImp = replaceRes.unwrap();
+        if (prevImp && prevImp != reinterpret_cast<void*>(&nsOpenGLContextFlushBufferHook)) {
+            g_origFlushBuffer.store(prevImp, std::memory_order_release);
+        }
     } else {
-        geode::log::error("Instant Replay: failed to hook -[NSOpenGLContext flushBuffer]: {}", hookRes.unwrapErr());
+        geode::log::error("Instant Replay: failed to swizzle -[NSOpenGLContext flushBuffer]: {}", replaceRes.unwrapErr());
     }
 }
 

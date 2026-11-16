@@ -114,6 +114,7 @@ public:
 
     // Thread-safe: signals capture state change; render-thread state resets on next swap (#12).
     void setCapturing(bool active);
+    bool isCapturing() const noexcept { return m_capturing.load(std::memory_order_acquire); }
 
     // Called on the OpenGL render thread right BEFORE the back buffer is swapped
     void captureCurrentFrame();
