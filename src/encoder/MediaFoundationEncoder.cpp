@@ -41,6 +41,28 @@ const char* subtypeName(const GUID& subtype) noexcept {
     return "H.264";
 }
 
+GUID guidForCodecFamily(VideoCodecFamily family) noexcept {
+    switch (family) {
+        case VideoCodecFamily::AV1:  return MFVideoFormat_AV1;
+        case VideoCodecFamily::HEVC: return MFVideoFormat_HEVC;
+        case VideoCodecFamily::VP9:  return MFVideoFormat_VP90;
+        case VideoCodecFamily::H264:
+        default:                     return MFVideoFormat_H264;
+    }
+}
+
+VideoCodecFamily familyForGuid(const GUID& subtype) noexcept {
+    if (subtype == MFVideoFormat_AV1) return VideoCodecFamily::AV1;
+    if (subtype == MFVideoFormat_HEVC) return VideoCodecFamily::HEVC;
+    if (subtype == MFVideoFormat_VP90) return VideoCodecFamily::VP9;
+    return VideoCodecFamily::H264;
+}
+
+EncoderOpResult makeMfFailure(HRESULT hr, std::string msg) {
+    if (msg.empty()) msg = hrToString(hr);
+    return {false, hr, std::move(msg), MediaFoundationEncoder::isFatalStorageError(hr)};
+}
+
 bool isPermanentCodecUnsupported(HRESULT hr) noexcept {
     return hr == MF_E_TOPO_CODEC_NOT_FOUND ||
            hr == MF_E_INVALIDMEDIATYPE ||
@@ -113,6 +135,10 @@ std::string MediaFoundationEncoder::formatHr(HRESULT hr) {
     return hrToString(hr);
 }
 
+VideoCodecFamily MediaFoundationEncoder::activeCodecFamily() const noexcept {
+    return familyForGuid(m_activeSubtype);
+}
+
 std::string MediaFoundationEncoder::activeCodecName() const {
     if (m_activeSubtype == GUID_NULL) return "encoder";
     return std::string(subtypeName(m_activeSubtype)) + (m_activeHardware ? " (HW)" : " (SW)");
@@ -127,7 +153,7 @@ MediaFoundationEncoder::~MediaFoundationEncoder() {
 }
 
 EncoderOpResult MediaFoundationEncoder::start(
-    const std::wstring& outputPath,
+    const std::filesystem::path& outputPathFs,
     int width,
     int height,
     int fps,
@@ -142,10 +168,11 @@ EncoderOpResult MediaFoundationEncoder::start(
     int gameSampleRate,
     const std::function<void()>& onBeforeFallback,
     bool allowFallback,
-    const GUID& forcedSubtype,
-    bool useForcedHardware,
+    bool hasForcedCodec,
+    VideoCodecFamily forcedFamily,
     bool forcedHardware
 ) {
+    const std::wstring outputPath = outputPathFs.wstring();
     std::lock_guard<std::mutex> lock(m_mutex);
     finishLocked();
 
@@ -163,27 +190,16 @@ EncoderOpResult MediaFoundationEncoder::start(
     m_activeHardware = hardwareAcceleration;
 
     bool enableHardware = hardwareAcceleration;
-    GUID targetSubtype = MFVideoFormat_H264;
-
     const CodecTargetSpec resolvedSpec = resolveRequestedCodecSpec(
         static_cast<int>(codec), hardwareAcceleration, customCodec);
     enableHardware = resolvedSpec.hardware;
-    switch (resolvedSpec.family) {
-        case VideoCodecFamily::AV1:  targetSubtype = MFVideoFormat_AV1; break;
-        case VideoCodecFamily::HEVC: targetSubtype = MFVideoFormat_HEVC; break;
-        case VideoCodecFamily::VP9:  targetSubtype = MFVideoFormat_VP90; break;
-        case VideoCodecFamily::H264:
-        default:                     targetSubtype = MFVideoFormat_H264; break;
-    }
+    GUID targetSubtype = guidForCodecFamily(resolvedSpec.family);
 
     std::string cname = customCodec;
     std::transform(cname.begin(), cname.end(), cname.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 
-    const bool hasForcedCodec = (forcedSubtype != GUID_NULL);
     if (hasForcedCodec) {
-        targetSubtype = forcedSubtype;
-    }
-    if (useForcedHardware) {
+        targetSubtype = guidForCodecFamily(forcedFamily);
         enableHardware = forcedHardware;
     }
 
@@ -347,7 +363,7 @@ EncoderOpResult MediaFoundationEncoder::start(
     if (allowFallback) {
         geode::log::error("Instant Replay: encoder start failed ({})", lastErrMsg);
     }
-    return {false, lastHr, lastErrMsg};
+    return makeMfFailure(lastHr, lastErrMsg);
 }
 
 // Performs one complete sink writer initialisation for the given codec.
@@ -640,20 +656,20 @@ EncoderOpResult MediaFoundationEncoder::writeVideoFrame(
 ) {
     std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_recording || !m_sinkWriter || !videoBuffer) {
-        return {false, MF_E_NOT_INITIALIZED, "encoder not recording"};
+        return makeMfFailure(MF_E_NOT_INITIALIZED, "encoder not recording");
     }
     if (width != m_width || height != m_height) {
-        return {false, E_INVALIDARG, "frame resolution mismatch"};
+        return makeMfFailure(E_INVALIDARG, "frame resolution mismatch");
     }
 
     ComRef<IMFSample> sample;
     HRESULT hr = E_FAIL;
     if (!createVideoSample(videoBuffer, timestampHns, sample.put(), hr)) {
-        return {false, hr, hrToString(hr)};
+        return makeMfFailure(hr, hrToString(hr));
     }
     hr = m_sinkWriter->WriteSample(m_videoStreamIndex, sample.get());
     if (FAILED(hr)) {
-        return {false, hr, hrToString(hr)};
+        return makeMfFailure(hr, hrToString(hr));
     }
     return {true, S_OK, {}};
 }
@@ -667,17 +683,17 @@ EncoderOpResult MediaFoundationEncoder::writeGameAudio(
 ) {
     std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_recording || !m_sinkWriter) {
-        return {false, MF_E_NOT_INITIALIZED, "encoder not recording"};
+        return makeMfFailure(MF_E_NOT_INITIALIZED, "encoder not recording");
     }
 
     ComRef<IMFSample> sample;
     HRESULT hr = E_FAIL;
     if (!createAudioSample(pcmFloat, numSamples, channels, sampleRate, timestampHns, sample.put(), hr)) {
-        return {false, hr, hrToString(hr)};
+        return makeMfFailure(hr, hrToString(hr));
     }
     hr = m_sinkWriter->WriteSample(m_gameAudioStreamIndex, sample.get());
     if (FAILED(hr)) {
-        return {false, hr, hrToString(hr)};
+        return makeMfFailure(hr, hrToString(hr));
     }
     return {true, S_OK, {}};
 }
@@ -691,17 +707,17 @@ EncoderOpResult MediaFoundationEncoder::writeMicAudio(
 ) {
     std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_recording || !m_sinkWriter || !m_splitAudio) {
-        return {false, MF_E_NOT_INITIALIZED, "encoder not recording"};
+        return makeMfFailure(MF_E_NOT_INITIALIZED, "encoder not recording");
     }
 
     ComRef<IMFSample> sample;
     HRESULT hr = E_FAIL;
     if (!createAudioSample(pcmFloat, numSamples, channels, sampleRate, timestampHns, sample.put(), hr)) {
-        return {false, hr, hrToString(hr)};
+        return makeMfFailure(hr, hrToString(hr));
     }
     hr = m_sinkWriter->WriteSample(m_micAudioStreamIndex, sample.get());
     if (FAILED(hr)) {
-        return {false, hr, hrToString(hr)};
+        return makeMfFailure(hr, hrToString(hr));
     }
     return {true, S_OK, {}};
 }
@@ -1020,19 +1036,27 @@ ConcatResult concatenateImpl(
 } // namespace
 
 ConcatResult MediaFoundationEncoder::concatenateSegments(
-    const std::vector<std::wstring>& segmentPaths,
-    const std::wstring& finalOutputPath,
+    const std::vector<std::filesystem::path>& segmentPaths,
+    const std::filesystem::path& finalOutputPath,
     double trimStartSeconds
 ) {
+    std::vector<std::wstring> wideSegments;
+    wideSegments.reserve(segmentPaths.size());
+    for (const auto& p : segmentPaths) {
+        wideSegments.push_back(p.wstring());
+    }
+    const std::wstring wideOut = finalOutputPath.wstring();
+
     ConcatResult res;
     try {
-        res = concatenateImpl(segmentPaths, finalOutputPath, trimStartSeconds);
+        res = concatenateImpl(wideSegments, wideOut, trimStartSeconds);
     } catch (const std::exception& e) {
         res.success = false;
         res.error = std::string("exception: ") + e.what();
     }
     if (!res.success) {
-        DeleteFileW(finalOutputPath.c_str());
+        std::error_code ec;
+        std::filesystem::remove(finalOutputPath, ec);
     }
     return res;
 }

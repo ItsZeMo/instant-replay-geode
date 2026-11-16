@@ -1,8 +1,12 @@
 #include <Geode/Geode.hpp>
 
-#ifdef GEODE_IS_WINDOWS
+#if defined(GEODE_IS_WINDOWS) || defined(GEODE_IS_MACOS)
 
+#ifdef GEODE_IS_WINDOWS
 #include <Geode/modify/CCEGLView.hpp>
+#elif defined(GEODE_IS_MACOS)
+#include "platform/MacPlatformUtils.hpp"
+#endif
 #include <Geode/modify/FMODAudioEngine.hpp>
 #include <Geode/modify/MenuLayer.hpp>
 #include <Geode/modify/PauseLayer.hpp>
@@ -21,9 +25,9 @@ static bool shouldIgnoreKeybindWhileTyping(Keybind const& kb) {
     if (!CCIMEDispatcher::sharedDispatcher()->hasDelegate()) {
         return false;
     }
-    bool hasCtrlOrAlt = (kb.modifiers.value & (KeyboardModifier::Control | KeyboardModifier::Alt)) != 0;
+    bool hasModifier = (kb.modifiers.value & (KeyboardModifier::Control | KeyboardModifier::Alt | KeyboardModifier::Super)) != 0;
     bool isFKey = (kb.key >= KEY_F1 && kb.key <= KEY_F24);
-    return !hasCtrlOrAlt && !isFKey;
+    return !hasModifier && !isFKey;
 }
 
 static void addReplayButtonToMenu(CCNode* menu, CCObject* target, SEL_MenuHandler selector) {
@@ -83,6 +87,13 @@ $on_mod(Loaded) {
     (void)FrameGrabber::get();
     (void)AudioGrabber::get();
     ReplayManager::get()->initialize();
+
+#ifdef GEODE_IS_MACOS
+    // On macOS, CCDirectorCaller calls -[NSOpenGLContext flushBuffer] directly (CCEGLView::swapBuffers is a no-op).
+    installMacGLCaptureHook([]() {
+        FrameGrabber::get()->captureCurrentFrame();
+    });
+#endif
 
     // 2. Register keybind listeners (Geode 5.10+ native keybind setting system)
     listenForKeybindSettingPresses("save-replay", [](Keybind const& kb, bool down, bool repeat, double) {
@@ -184,9 +195,13 @@ $on_mod(Loaded) {
 
 // Perform clean shutdown on game exit while OpenGL context and FMOD are still alive
 $on_game(Exiting) {
+#ifdef GEODE_IS_MACOS
+    disableMacGLCaptureHook();
+#endif
     ReplayManager::get()->shutdown();
 }
 
+#ifdef GEODE_IS_WINDOWS
 // Capture the finished frame right BEFORE it is presented, after all overlay/ImGui mods (like Mega Hack) have finished drawing
 class $modify(ReplayEGLView, CCEGLView) {
     static void onModify(auto& self) {
@@ -199,6 +214,7 @@ class $modify(ReplayEGLView, CCEGLView) {
         CCEGLView::swapBuffers();
     }
 };
+#endif
 
 // Ensure FMOD DSP audio capture is attached to the audio engine
 class $modify(ReplayFMOD, FMODAudioEngine) {
@@ -233,4 +249,4 @@ class $modify(ReplayPauseLayer, PauseLayer) {
     }
 };
 
-#endif // GEODE_IS_WINDOWS
+#endif // GEODE_IS_WINDOWS || GEODE_IS_MACOS

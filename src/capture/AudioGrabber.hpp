@@ -2,10 +2,12 @@
 
 #include <Geode/Geode.hpp>
 
-#ifdef GEODE_IS_WINDOWS
+#if defined(GEODE_IS_WINDOWS) || defined(GEODE_IS_MACOS)
 
 #include "GameAudioRing.hpp"
 #include <Geode/fmod/fmod.hpp>
+#include <string>
+#include <string_view>
 #include <vector>
 #include <memory>
 #include <functional>
@@ -109,6 +111,7 @@ public:
     void cleanup();
 
     static std::vector<AudioDeviceInfo> getAvailableMicrophones();
+    static std::string sanitizeDeviceNameUtf8(std::string_view rawName);
     void startMicCapture();
     void stopMicCapture();
 
@@ -176,4 +179,4 @@ private:
 
 } // namespace replay
 
-#endif // GEODE_IS_WINDOWS
+#endif // GEODE_IS_WINDOWS || GEODE_IS_MACOS

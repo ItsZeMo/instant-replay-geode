@@ -2,11 +2,21 @@
 
 #include <Geode/Geode.hpp>
 
-#ifdef GEODE_IS_WINDOWS
+#if defined(GEODE_IS_WINDOWS) || defined(GEODE_IS_MACOS)
 
 #include "../config/ReplayConfig.hpp"
+#ifdef GEODE_IS_WINDOWS
 #include <mfapi.h>
 #include <mfidl.h>
+#elif defined(GEODE_IS_MACOS)
+#pragma push_macro("CommentType")
+#undef CommentType
+#define CommentType AppleScriptCommentTypeDummy
+#include <CoreVideo/CoreVideo.h>
+#include <OpenGL/CGLTypes.h>
+#undef CommentType
+#pragma pop_macro("CommentType")
+#endif
 #include <vector>
 #include <chrono>
 #include <memory>
@@ -16,24 +26,85 @@
 
 namespace replay {
 
-// Frames are delivered BOTTOM-UP (native OpenGL row order), tightly packed BGRA,
-// already scaled to the encoder output size (width/height are always even).
-// Pixels are stored directly in a reusable IMFMediaBuffer to avoid a second copy in the encoder.
+#ifdef GEODE_IS_MACOS
+// Lightweight RAII wrapper around CVPixelBufferRef for zero-copy VideoToolbox handoff.
+class PixelBufferRef {
+public:
+    PixelBufferRef() noexcept = default;
+    ~PixelBufferRef() { reset(); }
+
+    PixelBufferRef(const PixelBufferRef& other) noexcept : m_ptr(other.m_ptr) {
+        if (m_ptr) CVPixelBufferRetain(m_ptr);
+    }
+    PixelBufferRef& operator=(const PixelBufferRef& other) noexcept {
+        if (this != &other) {
+            if (other.m_ptr) CVPixelBufferRetain(other.m_ptr);
+            reset();
+            m_ptr = other.m_ptr;
+        }
+        return *this;
+    }
+    PixelBufferRef(PixelBufferRef&& other) noexcept : m_ptr(other.m_ptr) {
+        other.m_ptr = nullptr;
+    }
+    PixelBufferRef& operator=(PixelBufferRef&& other) noexcept {
+        if (this != &other) {
+            reset();
+            m_ptr = other.m_ptr;
+            other.m_ptr = nullptr;
+        }
+        return *this;
+    }
+
+    void reset() noexcept {
+        if (m_ptr) {
+            CVPixelBufferRelease(m_ptr);
+            m_ptr = nullptr;
+        }
+    }
+    CVPixelBufferRef* put() noexcept { reset(); return &m_ptr; }
+    CVPixelBufferRef get() const noexcept { return m_ptr; }
+    explicit operator bool() const noexcept { return m_ptr != nullptr; }
+
+private:
+    CVPixelBufferRef m_ptr = nullptr;
+};
+#endif
+
+// Frames are tightly packed BGRA scaled to encoder output dimensions (always even).
+// Windows delivers bottom-up OpenGL row order in IMFMediaBuffer; macOS delivers top-down CVPixelBufferRef.
 struct CapturedFrame {
+#ifdef GEODE_IS_WINDOWS
     ComRef<IMFMediaBuffer> buffer;
+#elif defined(GEODE_IS_MACOS)
+    PixelBufferRef pixelBuffer;
+#endif
     size_t byteSize = 0;
     int width = 0;
     int height = 0;
     int stride = 0;
     std::chrono::steady_clock::time_point timestamp;
+
+    bool hasBuffer() const noexcept {
+#ifdef GEODE_IS_WINDOWS
+        return static_cast<bool>(buffer);
+#elif defined(GEODE_IS_MACOS)
+        return static_cast<bool>(pixelBuffer);
+#else
+        return false;
+#endif
+    }
 };
 
 class FrameGrabber {
 public:
     static FrameGrabber* get();
 
-    // True when no external consumer (such as Media Foundation's async pipeline) holds a ref.
+    // True when no external consumer (Media Foundation or VideoToolbox async pipeline) holds a ref.
+    static bool isFrameBufferUnique(const CapturedFrame& frame) noexcept;
+#ifdef GEODE_IS_WINDOWS
     static bool isMediaBufferUnique(IMFMediaBuffer* buf) noexcept;
+#endif
 
     void initialize();
     void cleanup(bool glContextValid = true);
@@ -60,7 +131,7 @@ private:
 
     bool ensureScaleTarget(int width, int height, std::chrono::steady_clock::time_point now);
     void ensurePbo(int index, size_t bytes);
-    std::shared_ptr<CapturedFrame> acquireFrame(size_t requiredBytes);
+    std::shared_ptr<CapturedFrame> acquireFrame(int width, int height, size_t requiredBytes);
     void resetRenderThreadState() noexcept;
     void resetGlResources(bool glContextValid) noexcept;
 
@@ -73,7 +144,11 @@ private:
     bool m_initialized = false;
     bool m_hasPbo = false;
     bool m_hasBlit = false;
+#ifdef GEODE_IS_WINDOWS
     HGLRC m_glContext = nullptr;
+#elif defined(GEODE_IS_MACOS)
+    CGLContextObj m_glContext = nullptr;
+#endif
     std::chrono::steady_clock::time_point m_blitRetryAfter{};
     int m_failedBlitW = 0;
     int m_failedBlitH = 0;
@@ -91,6 +166,7 @@ private:
     int m_pboWidth[2] = {0, 0};
     int m_pboHeight[2] = {0, 0};
     bool m_pboPending[2] = {false, false};
+    bool m_pboTopDown[2] = {false, false};
     std::chrono::steady_clock::time_point m_pboTime[2];
     int m_pboIndex = 0;
 
@@ -116,4 +192,4 @@ private:
 
 } // namespace replay
 
-#endif // GEODE_IS_WINDOWS
+#endif // GEODE_IS_WINDOWS || GEODE_IS_MACOS

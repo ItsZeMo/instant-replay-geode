@@ -1,52 +1,42 @@
 #include "AudioGrabber.hpp"
 
-#ifdef GEODE_IS_WINDOWS
+#if defined(GEODE_IS_WINDOWS) || defined(GEODE_IS_MACOS)
 
 #include "../config/ReplayConfig.hpp"
 #include "../recorder/ReplayManager.hpp"
 #include <Geode/binding/FMODAudioEngine.hpp>
 #include <Geode/binding/FMODSound.hpp>
 #include <Geode/utils/string.hpp>
+#include <algorithm>
+#include <cstdio>
+#include <cstring>
+
+#ifdef GEODE_IS_WINDOWS
 #include <windows.h>
 #include <avrt.h>
 #include <timeapi.h>
 #include <mmdeviceapi.h>
 #include <audioclient.h>
 #include <propsys.h>
-#include <algorithm>
 
 #pragma comment(lib, "winmm.lib")
+#endif
 
 namespace replay {
 
-static const PROPERTYKEY kPKEY_Device_FriendlyName = {
-    { 0xa45c254e, 0xdf1c, 0x4efd, { 0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0 } }, 14
-};
-
-static std::string sanitizeDeviceName(const std::wstring& wname) {
-    std::wstring converted = wname;
-    auto replaceAll = [](std::wstring& str, const std::wstring& from, const std::wstring& to) {
-        size_t startPos = 0;
-        while ((startPos = str.find(from, startPos)) != std::wstring::npos) {
-            str.replace(startPos, from.length(), to);
-            startPos += to.length();
-        }
-    };
-    replaceAll(converted, L"Микрофон", L"Mic");
-    replaceAll(converted, L"микрофон", L"Mic");
-    replaceAll(converted, L"Связь", L"Comm");
-    replaceAll(converted, L"связь", L"Comm");
-    replaceAll(converted, L"Наушники", L"Headset");
-    replaceAll(converted, L"наушники", L"Headset");
-    replaceAll(converted, L"Динамики", L"Speakers");
-    replaceAll(converted, L"динамики", L"Speakers");
-
+std::string AudioGrabber::sanitizeDeviceNameUtf8(std::string_view rawName) {
     std::string ascii;
-    for (wchar_t wc : converted) {
-        if (wc >= 32 && wc < 127) {
-            ascii += static_cast<char>(wc);
-        } else if (wc == L'«' || wc == L'»' || wc == L'"') {
-            ascii += '"';
+    ascii.reserve(rawName.size());
+    for (size_t i = 0; i < rawName.size(); ++i) {
+        unsigned char c = static_cast<unsigned char>(rawName[i]);
+        if (c >= 32 && c < 127) {
+            ascii += static_cast<char>(c);
+        } else if (c == 0xC2 && i + 1 < rawName.size()) {
+            unsigned char c2 = static_cast<unsigned char>(rawName[i + 1]);
+            if (c2 == 0xAB || c2 == 0xBB) { // « or » in UTF-8
+                ascii += '"';
+                ++i;
+            }
         }
     }
 
@@ -69,6 +59,32 @@ static std::string sanitizeDeviceName(const std::wstring& wname) {
     }
     return clean;
 }
+
+#ifdef GEODE_IS_WINDOWS
+static const PROPERTYKEY kPKEY_Device_FriendlyName = {
+    { 0xa45c254e, 0xdf1c, 0x4efd, { 0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0 } }, 14
+};
+
+static std::string sanitizeDeviceName(const std::wstring& wname) {
+    std::wstring converted = wname;
+    auto replaceAll = [](std::wstring& str, const std::wstring& from, const std::wstring& to) {
+        size_t startPos = 0;
+        while ((startPos = str.find(from, startPos)) != std::wstring::npos) {
+            str.replace(startPos, from.length(), to);
+            startPos += to.length();
+        }
+    };
+    replaceAll(converted, L"Микрофон", L"Mic");
+    replaceAll(converted, L"микрофон", L"Mic");
+    replaceAll(converted, L"Связь", L"Comm");
+    replaceAll(converted, L"связь", L"Comm");
+    replaceAll(converted, L"Наушники", L"Headset");
+    replaceAll(converted, L"наушники", L"Headset");
+    replaceAll(converted, L"Динамики", L"Speakers");
+    replaceAll(converted, L"динамики", L"Speakers");
+    return AudioGrabber::sanitizeDeviceNameUtf8(geode::utils::string::wideToUtf8(converted));
+}
+#endif
 
 static FMOD_RESULT F_CALL customDSPCallback(
     FMOD_DSP_STATE* dsp_state,
@@ -250,7 +266,7 @@ void AudioGrabber::setupFmodDSP() {
 
     FMOD_DSP_DESCRIPTION dspDesc = {};
     dspDesc.pluginsdkversion = FMOD_PLUGIN_SDK_VERSION;
-    strcpy_s(dspDesc.name, "GDInstantReplayDSP");
+    snprintf(dspDesc.name, sizeof(dspDesc.name), "%s", "GDInstantReplayDSP");
     dspDesc.version = 0x00010000;
     dspDesc.numinputbuffers = 1;
     dspDesc.numoutputbuffers = 1;
@@ -364,6 +380,7 @@ void AudioGrabber::pushMicAudio(
     m_micCallback(std::move(chunk));
 }
 
+#ifdef GEODE_IS_WINDOWS
 std::vector<AudioDeviceInfo> AudioGrabber::getAvailableMicrophones() {
     std::vector<AudioDeviceInfo> list;
     list.push_back({"default", "Default System Device"});
@@ -421,6 +438,7 @@ std::vector<AudioDeviceInfo> AudioGrabber::getAvailableMicrophones() {
     }
     return list;
 }
+#endif // GEODE_IS_WINDOWS
 
 void AudioGrabber::startMicCapture() {
     if (m_micRunning.load()) return;
@@ -436,6 +454,7 @@ void AudioGrabber::stopMicCapture() {
     }
 }
 
+#ifdef GEODE_IS_WINDOWS
 void AudioGrabber::micCaptureThreadFunc() {
     HRESULT coHr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
     DWORD mmcssTaskIdx = 0;
@@ -667,6 +686,8 @@ void AudioGrabber::micCaptureThreadFunc() {
     }
 }
 
+#endif // GEODE_IS_WINDOWS
+
 } // namespace replay
 
-#endif // GEODE_IS_WINDOWS
+#endif // GEODE_IS_WINDOWS || GEODE_IS_MACOS

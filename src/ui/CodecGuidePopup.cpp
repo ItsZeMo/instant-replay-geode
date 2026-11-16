@@ -1,6 +1,6 @@
 #include "CodecGuidePopup.hpp"
 
-#ifdef GEODE_IS_WINDOWS
+#if defined(GEODE_IS_WINDOWS) || defined(GEODE_IS_MACOS)
 
 #include <cocos2d.h>
 
@@ -52,6 +52,26 @@ void CodecGuidePopup::setup() {
     };
 
     GuideEntry entries[] = {
+#ifdef GEODE_IS_MACOS
+        {
+            "HEVC / H.265 (Recommended on Mac):",
+            ccc3(255, 215, 80),
+            "- Apple Silicon (M1-M5) & Intel Macs with Apple T2 Security Chip",
+            "- Fast hardware encoding, great quality, and smaller files."
+        },
+        {
+            "H.264 (Maximum Compatibility):",
+            ccc3(255, 140, 100),
+            "- Hardware accelerated on all Intel and Apple Silicon Macs.",
+            "- Best for Discord & older editors (max 4096x2304 resolution)."
+        },
+        {
+            "AV1 (Experimental / Auto-Fallback):",
+            ccc3(100, 230, 255),
+            "- Supported where macOS VideoToolbox exposes AV1 encoding.",
+            "- Automatically falls back to HEVC if your Mac lacks AV1 encode."
+        }
+#else
         {
             "AV1 (Best Quality & Smallest Size):",
             ccc3(100, 230, 255),
@@ -70,6 +90,7 @@ void CodecGuidePopup::setup() {
             "- Supported on all older GPUs, web players, Discord, and editors.",
             "- Larger files. Hardware limits: does NOT support 4K at 240 FPS."
         }
+#endif
     };
 
     float curY = startY - 24.0f;
@@ -113,4 +134,4 @@ void CodecGuidePopup::setup() {
 
 } // namespace replay
 
-#endif // GEODE_IS_WINDOWS
+#endif // GEODE_IS_WINDOWS || GEODE_IS_MACOS

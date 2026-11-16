@@ -1,6 +1,6 @@
 #include "ReplayPopup.hpp"
 
-#ifdef GEODE_IS_WINDOWS
+#if defined(GEODE_IS_WINDOWS) || defined(GEODE_IS_MACOS)
 
 #include "CodecGuidePopup.hpp"
 #include <cocos2d.h>
@@ -739,7 +739,11 @@ void ReplayPopup::setupCodecTab(CCNode* page, CCSize const& winSize, float cente
     customCodecTitle->setPosition(ccp(20.0f, winSize.height - 135.0f));
     page->addChild(customCodecTitle);
 
+#ifdef GEODE_IS_MACOS
+    m_customCodecInput = TextInput::create(150.0f, "e.g. hevc_vt", "chatFont.fnt");
+#else
     m_customCodecInput = TextInput::create(150.0f, "e.g. av1_nvenc", "chatFont.fnt");
+#endif
     m_customCodecInput->setCommonFilter(CommonFilter::Any);
     m_customCodecInput->setString(ReplayConfig::get().getCustomCodec());
     m_customCodecInput->setPosition(ccp(centerX - 10.0f, winSize.height - 135.0f));
@@ -1000,7 +1004,11 @@ void ReplayPopup::setupAudioStorageTab(CCNode* page, CCSize const& winSize, floa
     m_micToggle = addLabeledToggler(
         page, m_audioToggleMenu, ccp(checkX, row2Y), 0.68f,
         ReplayConfig::get().recordMic.load(),
+#ifdef GEODE_IS_MACOS
+        "Record Microphone Audio (CoreAudio)", 0.50f, 24.0f, &m_micRecordLabel,
+#else
         "Record Microphone Audio (WASAPI)", 0.50f, 24.0f, &m_micRecordLabel,
+#endif
         [this](auto* toggler) {
             bool curMic = ReplayConfig::get().recordMic.load();
             if (this->guardLocked()) {
@@ -1481,4 +1489,4 @@ void ReplayPopup::refreshMicDeviceButton() {
 
 } // namespace replay
 
-#endif // GEODE_IS_WINDOWS
+#endif // GEODE_IS_WINDOWS || GEODE_IS_MACOS

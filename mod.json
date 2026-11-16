@@ -1,7 +1,8 @@
 {
     "geode": "5.11.2",
     "gd": {
-        "win": "2.2081"
+        "win": "2.2081",
+        "mac": "2.2081"
     },
     "version": "v1.0.5",
     "id": "zemo.instant-replay",
