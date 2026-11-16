@@ -2,13 +2,20 @@
 
 #include <Geode/Geode.hpp>
 
-#ifdef GEODE_IS_WINDOWS
+#if defined(GEODE_IS_WINDOWS) || defined(GEODE_IS_MACOS)
 
 #include "CodecUtils.hpp"
 #include <Geode/loader/SettingV3.hpp>
 #include <Geode/utils/string.hpp>
+#ifdef GEODE_IS_WINDOWS
 #include <windows.h>
 #include <shlobj.h>
+#elif defined(GEODE_IS_MACOS)
+#include "../platform/MacPlatformUtils.hpp"
+#include <OpenGL/gl.h>
+#include <cstdlib>
+#include <unistd.h>
+#endif
 #include <string>
 #include <string_view>
 #include <vector>
@@ -21,6 +28,7 @@
 
 namespace replay {
 
+#ifdef GEODE_IS_WINDOWS
 // Minimal COM smart pointer (shared across WASAPI, Media Foundation, and frame buffer pooling).
 template <typename T>
 class ComRef {
@@ -57,6 +65,7 @@ public:
 private:
     T* m_p = nullptr;
 };
+#endif
 
 enum class CodecType {
     AV1,
@@ -130,6 +139,14 @@ struct ReplayConfig {
 
     // Must ONLY be called on the main / OpenGL render thread (#18).
     static void refreshNativeFrameHeight() noexcept {
+#ifdef GEODE_IS_MACOS
+        int w = 0, h = 0;
+        getMacOpenGLDrawableSize(w, h);
+        if (h > 0) {
+            s_nativeFrameHeight.store(h, std::memory_order_relaxed);
+            return;
+        }
+#endif
         if (auto view = cocos2d::CCEGLView::get()) {
             auto fs = view->getFrameSize();
             if (fs.height > 0.0f) {
@@ -355,8 +372,12 @@ struct ReplayConfig {
         return getEffectiveMaxBitrateMbpsForHeight(s_nativeFrameHeight.load(std::memory_order_relaxed));
     }
 
-    // Cached GPU vendor string (populated on the main/GL thread).
+    // Cached GPU / hardware encoder backend string (populated on the main/GL thread).
     static const std::string& getGpuAccelName() {
+#ifdef GEODE_IS_MACOS
+        static const std::string kMacBackend = "VideoToolbox";
+        return kMacBackend;
+#else
         static std::string s_cached;
         if (!s_cached.empty()) {
             return s_cached;
@@ -382,6 +403,7 @@ struct ReplayConfig {
             s_cached = "GPU";
         }
         return s_cached;
+#endif
     }
 
     std::string getCodecDisplayName() const {
@@ -682,6 +704,14 @@ struct ReplayConfig {
         return {w, h};
     }
 
+    static std::filesystem::path pathFromUtf8(std::string_view utf8) {
+#ifdef GEODE_IS_WINDOWS
+        return std::filesystem::path(geode::utils::string::utf8ToWide(utf8));
+#else
+        return std::filesystem::path(std::string(utf8));
+#endif
+    }
+
     // Pure lexical normalization: strips surrounding whitespace/quotes, validates syntax,
     // removes trailing separators so `.filename()` is never empty on `"D:\\Temp\\"` (#23).
     static std::filesystem::path normalizeCustomDirPath(const std::string& rawUtf8) {
@@ -695,6 +725,7 @@ struct ReplayConfig {
         }
         if (first >= last) return {};
 
+#ifdef GEODE_IS_WINDOWS
         std::wstring wide = geode::utils::string::utf8ToWide(rawUtf8.substr(first, last - first));
         if (wide.empty()) return {};
 
@@ -721,10 +752,34 @@ struct ReplayConfig {
             }
         }
         return p;
+#else
+        std::string cleaned = rawUtf8.substr(first, last - first);
+        if (cleaned.find('\0') != std::string::npos) return {};
+        if (cleaned == "~" || cleaned.rfind("~/", 0) == 0) {
+            const char* home = std::getenv("HOME");
+            if (!home || !home[0]) return {};
+            cleaned = std::string(home) + cleaned.substr(1);
+        }
+
+        std::filesystem::path p(cleaned);
+        if (!p.is_absolute()) {
+            return {};
+        }
+
+        p = p.lexically_normal();
+        while (!p.has_filename() && p.parent_path() != p) {
+            p = p.parent_path();
+        }
+        return p;
+#endif
     }
 
-    static std::wstring currentPidSubfolder() {
-        return L"pid_" + std::to_wstring(GetCurrentProcessId());
+    static std::filesystem::path currentPidSubfolder() {
+#ifdef GEODE_IS_WINDOWS
+        return std::filesystem::path(L"pid_" + std::to_wstring(GetCurrentProcessId()));
+#else
+        return std::filesystem::path("pid_" + std::to_string(static_cast<unsigned long long>(getpid())));
+#endif
     }
 
     // When createIfMissing == false, performs zero disk I/O so UI callers never block (#16).
@@ -736,7 +791,7 @@ struct ReplayConfig {
         return resolveTempDirectory(createIfMissing, createIfMissing);
     }
 
-    // Returns all candidate temp base folders (custom, %TEMP%, and Geode fallback) without disk I/O,
+    // Returns all candidate temp base folders (custom, system TEMP, and Geode fallback) without disk I/O,
     // so startup cleanup finds orphaned pid_* directories even after temp-folder changes or fallback.
     std::vector<std::filesystem::path> getAllCandidateTempBaseDirectories() const {
         std::vector<std::filesystem::path> bases;
@@ -751,14 +806,14 @@ struct ReplayConfig {
 
         std::filesystem::path customPath = normalizeCustomDirPath(getCustomTempFolder());
         if (!customPath.empty()) {
-            auto fname = customPath.filename().wstring();
-            if (fname != L"GeometryDash_InstantReplay" && fname != L"InstantReplay") {
-                customPath /= L"GeometryDash_InstantReplay";
+            auto fname = customPath.filename();
+            if (fname != "GeometryDash_InstantReplay" && fname != "InstantReplay") {
+                customPath /= "GeometryDash_InstantReplay";
             }
             addUnique(customPath);
         }
         addUnique(cachedDefaultTempDir());
-        addUnique(geode::dirs::getTempDir() / L"InstantReplay");
+        addUnique(geode::dirs::getTempDir() / "InstantReplay");
         return bases;
     }
 
@@ -788,6 +843,7 @@ struct ReplayConfig {
 private:
     static const std::filesystem::path& cachedDefaultVideosDir() {
         static const std::filesystem::path s_videosDir = []() -> std::filesystem::path {
+#ifdef GEODE_IS_WINDOWS
             PWSTR pszVideos = nullptr;
             HRESULT hr = SHGetKnownFolderPath(FOLDERID_Videos, 0, nullptr, &pszVideos);
             std::filesystem::path result;
@@ -798,18 +854,25 @@ private:
                 CoTaskMemFree(pszVideos);
             }
             return result;
+#else
+            return getMacDefaultVideosDirectory();
+#endif
         }();
         return s_videosDir;
     }
 
     static const std::filesystem::path& cachedDefaultTempDir() {
         static const std::filesystem::path s_tempDir = []() -> std::filesystem::path {
+#ifdef GEODE_IS_WINDOWS
             wchar_t tempBuf[MAX_PATH + 1] = {};
             DWORD len = GetTempPathW(MAX_PATH, tempBuf);
             if (len > 0 && len <= MAX_PATH) {
                 return std::filesystem::path(tempBuf) / L"GeometryDash_InstantReplay";
             }
             return {};
+#else
+            return getMacDefaultTempDirectory();
+#endif
         }();
         return s_tempDir;
     }
@@ -828,11 +891,11 @@ private:
             std::filesystem::create_directories(dir, ec);
             return !ec && std::filesystem::is_directory(dir, ec);
         }
-        // Verify root drive exists and nearest existing ancestor is a directory, not a file
+        // Verify root volume exists and nearest existing ancestor is a directory, not a file
         auto cur = dir;
         while (!cur.empty() && !std::filesystem::exists(cur, ec)) {
             auto parent = cur.parent_path();
-            if (parent == cur) return false; // Root volume itself does not exist (e.g. Z:\)
+            if (parent == cur) return false;
             cur = std::move(parent);
         }
         return !cur.empty() && std::filesystem::is_directory(cur, ec);
@@ -853,7 +916,11 @@ private:
             }
         }
 
-        std::filesystem::path fallback = geode::dirs::getGameDir() / L"Replays";
+#ifdef GEODE_IS_WINDOWS
+        std::filesystem::path fallback = geode::dirs::getGameDir() / "Replays";
+#else
+        std::filesystem::path fallback = geode::dirs::getSaveDir() / "Replays";
+#endif
         if (createIfMissing) {
             std::error_code ec;
             std::filesystem::create_directories(fallback, ec);
@@ -864,9 +931,9 @@ private:
     std::filesystem::path resolveTempDirectory(bool createIfMissing, bool verifyOnDisk) const {
         std::filesystem::path customPath = normalizeCustomDirPath(getCustomTempFolder());
         if (!customPath.empty()) {
-            auto fname = customPath.filename().wstring();
-            if (fname != L"GeometryDash_InstantReplay" && fname != L"InstantReplay") {
-                customPath /= L"GeometryDash_InstantReplay";
+            auto fname = customPath.filename();
+            if (fname != "GeometryDash_InstantReplay" && fname != "InstantReplay") {
+                customPath /= "GeometryDash_InstantReplay";
             }
             if (!verifyOnDisk || isPathCreatableOrExistingDir(customPath, createIfMissing)) {
                 return customPath;
@@ -880,7 +947,7 @@ private:
             }
         }
 
-        std::filesystem::path fallback = geode::dirs::getTempDir() / L"InstantReplay";
+        std::filesystem::path fallback = geode::dirs::getTempDir() / "InstantReplay";
         if (createIfMissing) {
             std::error_code ec;
             std::filesystem::create_directories(fallback, ec);
@@ -893,4 +960,4 @@ private:
 
 } // namespace replay
 
-#endif // GEODE_IS_WINDOWS
+#endif // GEODE_IS_WINDOWS || GEODE_IS_MACOS

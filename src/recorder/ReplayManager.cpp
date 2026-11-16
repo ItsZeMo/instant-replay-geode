@@ -1,6 +1,6 @@
 #include "ReplayManager.hpp"
 
-#ifdef GEODE_IS_WINDOWS
+#if defined(GEODE_IS_WINDOWS) || defined(GEODE_IS_MACOS)
 
 #include "../ui/ReplayNotification.hpp"
 #include "../ui/ReplayPopup.hpp"
@@ -8,14 +8,49 @@
 #include <Geode/binding/FMODAudioEngine.hpp>
 #include <Geode/utils/async.hpp>
 #include <Geode/utils/file.hpp>
+#ifdef GEODE_IS_WINDOWS
 #include <windows.h>
+#elif defined(GEODE_IS_MACOS)
+#include "../platform/MacPlatformUtils.hpp"
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
+#endif
 #include <sstream>
 #include <iomanip>
+#include <cerrno>
 #include <ctime>
 #include <cmath>
 #include <algorithm>
 
 namespace replay {
+
+namespace {
+
+// RAII thread-scope helper for COM (Windows) and Objective-C autorelease pools (macOS).
+struct MediaThreadScope {
+#ifdef GEODE_IS_WINDOWS
+    HRESULT coHr = E_FAIL;
+    explicit MediaThreadScope(DWORD flags = COINIT_MULTITHREADED) noexcept
+        : coHr(CoInitializeEx(nullptr, flags)) {}
+    ~MediaThreadScope() {
+        if (SUCCEEDED(coHr)) CoUninitialize();
+    }
+#elif defined(GEODE_IS_MACOS)
+    MacAutoreleasePoolScope pool;
+    explicit MediaThreadScope(int /*unused*/ = 0) noexcept {}
+#endif
+    MediaThreadScope(const MediaThreadScope&) = delete;
+    MediaThreadScope& operator=(const MediaThreadScope&) = delete;
+};
+
+#ifdef GEODE_IS_WINDOWS
+constexpr DWORD kCoInitApartment = COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE;
+#else
+constexpr int kCoInitApartment = 0;
+#endif
+
+} // namespace
 
 static constexpr double SEGMENT_DURATION = 30.0; // 30-second rolling chunks
 static constexpr double SEGMENT_PREWARM_SECONDS = 25.0; // pre-warm next encoder 5s before rotation
@@ -33,13 +68,13 @@ static constexpr int MAX_ENCODER_START_FAILURES = 3;
 static constexpr int MAX_CONSECUTIVE_WRITE_ERRORS = 5;
 
 static bool isSegmentFile(const std::filesystem::path& path) {
-    std::wstring name = path.filename().wstring();
+    std::string name = path.filename().string();
     // Match exact pattern "seg_<digits>.mp4"
     if (name.size() <= 8) return false; // at least "seg_1.mp4"
-    if (name.compare(0, 4, L"seg_") != 0) return false;
-    if (name.compare(name.size() - 4, 4, L".mp4") != 0) return false;
+    if (name.compare(0, 4, "seg_") != 0) return false;
+    if (name.compare(name.size() - 4, 4, ".mp4") != 0) return false;
     for (size_t i = 4; i + 4 < name.size(); ++i) {
-        if (name[i] < L'0' || name[i] > L'9') return false;
+        if (name[i] < '0' || name[i] > '9') return false;
     }
     return true;
 }
@@ -69,23 +104,32 @@ ReplayManager::~ReplayManager() {
 }
 
 namespace {
-bool parsePidFolderName(const std::wstring& name, DWORD& outPid) {
-    if (name.size() <= 4 || name.compare(0, 4, L"pid_") != 0) return false;
+bool parsePidFolderName(const std::string& name, uint32_t& outPid) {
+    if (name.size() <= 4 || name.compare(0, 4, "pid_") != 0) return false;
     uint64_t val = 0;
     for (size_t i = 4; i < name.size(); ++i) {
-        wchar_t c = name[i];
-        if (c < L'0' || c > L'9') return false;
-        val = val * 10 + static_cast<uint64_t>(c - L'0');
+        char c = name[i];
+        if (c < '0' || c > '9') return false;
+        val = val * 10 + static_cast<uint64_t>(c - '0');
         if (val > 0xFFFFFFFFULL) return false;
     }
-    outPid = static_cast<DWORD>(val);
+    outPid = static_cast<uint32_t>(val);
     return outPid != 0;
 }
 
-bool isPidProcessAlive(DWORD pid) {
+uint32_t currentPid() noexcept {
+#ifdef GEODE_IS_WINDOWS
+    return static_cast<uint32_t>(GetCurrentProcessId());
+#else
+    return static_cast<uint32_t>(::getpid());
+#endif
+}
+
+bool isPidProcessAlive(uint32_t pid) {
     if (pid == 0) return false;
-    if (pid == GetCurrentProcessId()) return true;
-    HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (pid == currentPid()) return true;
+#ifdef GEODE_IS_WINDOWS
+    HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(pid));
     if (!hProc) {
         return GetLastError() != ERROR_INVALID_PARAMETER;
     }
@@ -93,6 +137,11 @@ bool isPidProcessAlive(DWORD pid) {
     bool alive = GetExitCodeProcess(hProc, &exitCode) && exitCode == STILL_ACTIVE;
     CloseHandle(hProc);
     return alive;
+#elif defined(GEODE_IS_MACOS)
+    return isMacProcessAlive(static_cast<int>(pid));
+#else
+    return false;
+#endif
 }
 } // namespace
 
@@ -101,11 +150,12 @@ void ReplayManager::ensureSessionLock(const std::filesystem::path& pidTempDir) {
     std::filesystem::path baseToPersist;
     {
         std::lock_guard<std::mutex> lock(m_sessionLockMutex);
+#ifdef GEODE_IS_WINDOWS
         if (m_sessionLockHandle != INVALID_HANDLE_VALUE && m_sessionLockDir == pidTempDir) {
             return;
         }
 
-        auto lockPath = pidTempDir / L"session.lock";
+        auto lockPath = pidTempDir / "session.lock";
         HANDLE hNew = CreateFileW(
             lockPath.c_str(),
             GENERIC_READ | GENERIC_WRITE,
@@ -126,11 +176,42 @@ void ReplayManager::ensureSessionLock(const std::filesystem::path& pidTempDir) {
             m_sessionLockHandle = INVALID_HANDLE_VALUE;
             if (!m_sessionLockDir.empty()) {
                 std::error_code ec;
-                std::filesystem::remove(m_sessionLockDir / L"session.lock", ec);
+                std::filesystem::remove(m_sessionLockDir / "session.lock", ec);
                 std::filesystem::remove(m_sessionLockDir, ec);
             }
         }
         m_sessionLockHandle = hNew;
+#else
+        if (m_sessionLockFd >= 0 && m_sessionLockDir == pidTempDir) {
+            return;
+        }
+
+        auto lockPath = pidTempDir / "session.lock";
+        int fdNew = ::open(lockPath.c_str(), O_CREAT | O_RDWR, 0644);
+        if (fdNew < 0) {
+            geode::log::warn("ReplayManager: failed to open session file '{}': errno={}",
+                geode::utils::string::pathToString(lockPath), errno);
+            return;
+        }
+        if (::flock(fdNew, LOCK_EX | LOCK_NB) != 0) {
+            geode::log::warn("ReplayManager: failed to lock session file '{}': errno={}",
+                geode::utils::string::pathToString(lockPath), errno);
+            ::close(fdNew);
+            return;
+        }
+
+        if (m_sessionLockFd >= 0) {
+            ::flock(m_sessionLockFd, LOCK_UN);
+            ::close(m_sessionLockFd);
+            m_sessionLockFd = -1;
+            if (!m_sessionLockDir.empty()) {
+                std::error_code ec;
+                std::filesystem::remove(m_sessionLockDir / "session.lock", ec);
+                std::filesystem::remove(m_sessionLockDir, ec);
+            }
+        }
+        m_sessionLockFd = fdNew;
+#endif
         m_sessionLockDir = pidTempDir;
 
         auto baseDir = pidTempDir.parent_path().lexically_normal();
@@ -152,13 +233,21 @@ void ReplayManager::ensureSessionLock(const std::filesystem::path& pidTempDir) {
 
 void ReplayManager::releaseSessionLock(bool removeFiles) {
     std::lock_guard<std::mutex> lock(m_sessionLockMutex);
+#ifdef GEODE_IS_WINDOWS
     if (m_sessionLockHandle != INVALID_HANDLE_VALUE) {
         CloseHandle(m_sessionLockHandle);
         m_sessionLockHandle = INVALID_HANDLE_VALUE;
     }
+#else
+    if (m_sessionLockFd >= 0) {
+        ::flock(m_sessionLockFd, LOCK_UN);
+        ::close(m_sessionLockFd);
+        m_sessionLockFd = -1;
+    }
+#endif
     if (removeFiles && !m_sessionLockDir.empty()) {
         std::error_code ec;
-        std::filesystem::remove(m_sessionLockDir / L"session.lock", ec);
+        std::filesystem::remove(m_sessionLockDir / "session.lock", ec);
         std::filesystem::remove(m_sessionLockDir, ec);
     }
     m_sessionLockDir.clear();
@@ -191,9 +280,8 @@ void ReplayManager::cleanupTempDir() {
             if (!isReg || !isSegmentFile(entryPath)) {
                 continue;
             }
-            auto wpath = entryPath.wstring();
-            if (m_exportLockedSegments.find(wpath) != m_exportLockedSegments.end()) {
-                m_deferredDeletes.push_back(wpath);
+            if (m_exportLockedSegments.find(entryPath) != m_exportLockedSegments.end()) {
+                m_deferredDeletes.push_back(entryPath);
             } else {
                 std::filesystem::remove(entryPath, fileEc);
             }
@@ -204,7 +292,7 @@ void ReplayManager::cleanupTempDir() {
         if (baseDir.empty()) return;
         std::error_code ec;
         if (!std::filesystem::exists(baseDir, ec) || !std::filesystem::is_directory(baseDir, ec)) return;
-        DWORD selfPid = GetCurrentProcessId();
+        uint32_t selfPid = currentPid();
         std::filesystem::directory_iterator it(baseDir, ec);
         std::filesystem::directory_iterator end;
         while (!ec && it != end) {
@@ -214,12 +302,13 @@ void ReplayManager::cleanupTempDir() {
             it.increment(ec);
             if (!isDir) continue;
 
-            DWORD otherPid = 0;
-            if (!parsePidFolderName(dirPath.filename().wstring(), otherPid) || otherPid == selfPid) {
+            uint32_t otherPid = 0;
+            if (!parsePidFolderName(dirPath.filename().string(), otherPid) || otherPid == selfPid) {
                 continue;
             }
 
-            auto lockPath = dirPath / L"session.lock";
+            auto lockPath = dirPath / "session.lock";
+#ifdef GEODE_IS_WINDOWS
             HANDLE hLock = CreateFileW(
                 lockPath.c_str(),
                 GENERIC_READ | GENERIC_WRITE,
@@ -246,6 +335,30 @@ void ReplayManager::cleanupTempDir() {
             if (hLock != INVALID_HANDLE_VALUE) {
                 CloseHandle(hLock);
             }
+#else
+            int lockFd = ::open(lockPath.c_str(), O_RDWR);
+            if (lockFd < 0) {
+                if (errno != ENOENT || isPidProcessAlive(otherPid)) {
+                    continue;
+                }
+            } else {
+                if (::flock(lockFd, LOCK_EX | LOCK_NB) != 0) {
+                    ::close(lockFd);
+                    continue; // active instance holds session.lock
+                }
+                if (isPidProcessAlive(otherPid)) {
+                    ::flock(lockFd, LOCK_UN);
+                    ::close(lockFd);
+                    continue;
+                }
+            }
+
+            cleanSegmentsInDir(dirPath);
+            if (lockFd >= 0) {
+                ::flock(lockFd, LOCK_UN);
+                ::close(lockFd);
+            }
+#endif
             std::error_code rmEc;
             std::filesystem::remove(lockPath, rmEc);
             std::filesystem::remove(dirPath, rmEc); // removes only if empty
@@ -258,7 +371,7 @@ void ReplayManager::cleanupTempDir() {
         cleanSegmentsInDir(m_lastTempDir);
     }
 
-    // Collect every candidate base folder (custom, %TEMP%, Geode fallback, persisted previous base)
+    // Collect every candidate base folder (custom, system temp, Geode fallback, persisted previous base)
     // so crashed sessions are cleaned up even if the user changed temp folders or hit disk fallback.
     std::vector<std::filesystem::path> candidateBases = ReplayConfig::get().getAllCandidateTempBaseDirectories();
     auto addBase = [&candidateBases](const std::filesystem::path& p) {
@@ -280,7 +393,7 @@ void ReplayManager::cleanupTempDir() {
     }
 }
 
-void ReplayManager::deleteSegmentFileLocked(const std::wstring& path) {
+void ReplayManager::deleteSegmentFileLocked(const std::filesystem::path& path) {
     if (path.empty()) return;
     if (m_exportLockedSegments.find(path) != m_exportLockedSegments.end()) {
         // Export thread is currently reading this segment; defer deletion until export completes
@@ -304,7 +417,7 @@ void ReplayManager::flushDeferredDeletesLocked() {
     }
 }
 
-void ReplayManager::releaseExportSegments(const std::vector<std::wstring>& paths) {
+void ReplayManager::releaseExportSegments(const std::vector<std::filesystem::path>& paths) {
     std::lock_guard<std::mutex> lock(m_segmentMutex);
     for (const auto& p : paths) {
         auto it = m_exportLockedSegments.find(p);
@@ -337,7 +450,8 @@ void ReplayManager::discardPreparedEncoder() {
         stale.encoder.reset();
     }
     if (!stale.path.empty()) {
-        DeleteFileW(stale.path.c_str());
+        std::error_code ec;
+        std::filesystem::remove(stale.path, ec);
     }
 }
 
@@ -377,7 +491,7 @@ void ReplayManager::reclaimInFlightFrames(bool forceClear) {
 
     auto it = m_inFlightFrames.begin();
     while (it != m_inFlightFrames.end()) {
-        if (!*it || !(*it)->buffer || FrameGrabber::isMediaBufferUnique((*it)->buffer.get())) {
+        if (!*it || !(*it)->hasBuffer() || FrameGrabber::isFrameBufferUnique(**it)) {
             if (*it && !m_shuttingDown.load()) {
                 FrameGrabber::get()->recycleFrame(std::move(*it));
             }
@@ -401,7 +515,7 @@ void ReplayManager::initialize() {
         std::string savedBase = mod->getSavedValue<std::string>("last-temp-base");
         if (!savedBase.empty()) {
             std::lock_guard<std::mutex> slLock(m_sessionLockMutex);
-            m_persistedTempBase = std::filesystem::path(geode::utils::string::utf8ToWide(savedBase)).lexically_normal();
+            m_persistedTempBase = ReplayConfig::pathFromUtf8(savedBase).lexically_normal();
         }
     }
     cleanupTempDir();
@@ -516,7 +630,7 @@ void ReplayManager::startReplay() {
     }
     reclaimInFlightFrames(true);
     AudioGrabber::get()->resetGameAudioBuffer();
-    MediaFoundationEncoder::resetCodecCache();
+    PlatformEncoder::resetCodecCache();
 
     m_videoWidth = 0;
     m_videoHeight = 0;
@@ -845,9 +959,9 @@ ReplayManager::WriteCheckResult ReplayManager::handleEncoderWriteError(
     std::string& outFatalError
 ) {
     std::string codec = m_encoder ? m_encoder->activeCodecName() : "encoder";
-    std::string detail = res.message.empty() ? MediaFoundationEncoder::formatHr(res.hr) : res.message;
+    std::string detail = res.detailString();
 
-    if (MediaFoundationEncoder::isFatalStorageError(res.hr)) {
+    if (res.fatalStorage) {
         outFatalError = "Instant Replay stopped: " + codec + " failed writing " +
                         streamLabel + " (" + detail + ")";
         return WriteCheckResult::Fatal;
@@ -871,15 +985,13 @@ ReplayManager::WriteCheckResult ReplayManager::handleEncoderWriteError(
         discardPreparedEncoder();
 
         finalizeCurrentSegment(true, cfg);
-        MediaFoundationEncoder::resetCodecCache();
+        PlatformEncoder::resetCodecCache();
 
         if (startNewSegment(cfg, std::chrono::steady_clock::now(), true)) {
             return WriteCheckResult::Recovered;
         }
 
-        std::string startDetail = m_lastStartError.message.empty()
-            ? MediaFoundationEncoder::formatHr(m_lastStartError.hr)
-            : m_lastStartError.message;
+        std::string startDetail = m_lastStartError.detailString();
         outFatalError = "Instant Replay stopped: " + codec + " " + streamLabel +
                         " write error (" + detail + "); recovery failed (" + startDetail + ")";
         return WriteCheckResult::Fatal;
@@ -1548,7 +1660,7 @@ ReplayManager::PendingFinalizeInfo ReplayManager::finalizeCurrentSegment(bool sy
     flushTrailingSilenceForClose(cfg);
 
     auto oldEncoder = std::move(m_encoder);
-    std::wstring segPath = std::move(m_currentSegmentPath);
+    std::filesystem::path segPath = std::move(m_currentSegmentPath);
     std::string segFormat = std::move(m_currentFormatKey);
     auto segStart = m_currentSegmentStart;
     bool hasVideo = (m_lastVideoHns >= 0);
@@ -1584,10 +1696,12 @@ ReplayManager::PendingFinalizeInfo ReplayManager::finalizeCurrentSegment(bool sy
     m_finalizeThread = std::thread([this, enc = std::move(oldEncoder), segPath = std::move(segPath),
                                     segStart, segDuration, segFormat = std::move(segFormat),
                                     hasVideo, cfg, prom = std::move(prom)]() mutable {
-        HRESULT coHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-        bool ok = enc->finish();
-        enc.reset();
-        if (SUCCEEDED(coHr)) CoUninitialize();
+        bool ok = false;
+        {
+            MediaThreadScope mediaScope;
+            ok = enc->finish();
+            enc.reset();
+        }
 
         bool keep = (ok && hasVideo && segDuration > 0.25);
         {
@@ -1651,8 +1765,7 @@ bool ReplayManager::startNewSegment(
     }
 
     m_segmentIndex++;
-    auto segFile = tempDir / (L"seg_" + std::to_wstring(m_segmentIndex) + L".mp4");
-    m_currentSegmentPath = segFile.wstring();
+    m_currentSegmentPath = tempDir / ("seg_" + std::to_string(m_segmentIndex) + ".mp4");
 
     m_mixMicIntoGame = cfg.recordMic.load() && !cfg.splitAudioTracks.load();
     if (!m_mixMicIntoGame || !isContinuation) {
@@ -1662,7 +1775,7 @@ bool ReplayManager::startNewSegment(
     }
 
     if (!m_encoder) {
-        m_encoder = std::make_unique<MediaFoundationEncoder>();
+        m_encoder = std::make_unique<PlatformEncoder>();
     }
 
     int gameSampleRate = AudioGrabber::get()->getEncodedGameSampleRate();
@@ -1789,10 +1902,10 @@ void ReplayManager::startPrepareNextSegment(const ReplayConfig& cfg) {
     int effBitrate = m_sessionEffBitrateMbps;
     int effMaxBitrate = std::max(m_sessionEffMaxBitrateMbps, effBitrate);
     int gameSampleRate = AudioGrabber::get()->getEncodedGameSampleRate();
-    GUID forcedSubtype = m_encoder->activeSubtype();
+    bool hasForcedCodec = m_encoder->hasActiveCodec();
+    VideoCodecFamily forcedFamily = m_encoder->activeCodecFamily();
     bool forcedHardware = m_encoder->activeHardware();
-    bool useForcedHardware = (forcedSubtype != GUID_NULL);
-    bool allowFallback = (forcedSubtype == GUID_NULL);
+    bool allowFallback = !hasForcedCodec;
 
     m_prepareFailedLastAttempt.store(false);
     m_prepareCancel.store(false);
@@ -1800,64 +1913,68 @@ void ReplayManager::startPrepareNextSegment(const ReplayConfig& cfg) {
 
     std::lock_guard<std::mutex> lock(m_prepareMutex);
     m_prepareThread = std::thread([this, cfg, segIdx, width, height, effBitrate, effMaxBitrate, gameSampleRate,
-                                   forcedSubtype, useForcedHardware, forcedHardware, allowFallback]() {
-        HRESULT coHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-
-        auto tempDir = cfg.getTempDirectory(true);
-        ensureSessionLock(tempDir);
-        auto segFile = tempDir / (L"seg_" + std::to_wstring(segIdx) + L".mp4");
-        std::wstring segPath = segFile.wstring();
-
-        auto enc = std::make_unique<MediaFoundationEncoder>();
-
+                                   hasForcedCodec, forcedFamily, forcedHardware, allowFallback]() {
+        std::filesystem::path segPath;
         bool ok = false;
-        if (!m_prepareCancel.load()) {
-            ok = enc->start(
-                segPath,
-                width,
-                height,
-                cfg.targetFps.load(),
-                effBitrate,
-                effMaxBitrate,
-                cfg.qualityLevel.load(),
-                cfg.rateControl.load(),
-                cfg.recordMic.load() && cfg.splitAudioTracks.load(),
-                cfg.codec.load(),
-                cfg.hardwareAcceleration.load(),
-                cfg.getCustomCodec(),
-                gameSampleRate,
-                nullptr,
-                allowFallback,
-                forcedSubtype,
-                useForcedHardware,
-                forcedHardware
-            ).ok;
-        }
+        {
+            MediaThreadScope mediaScope;
 
-        if (ok && !m_prepareCancel.load()) {
-            std::lock_guard<std::mutex> dataLock(m_prepareDataMutex);
-            m_prepared.encoder = std::move(enc);
-            m_prepared.path = std::move(segPath);
-            m_prepared.formatKey = m_prepared.encoder->formatKey();
-            m_prepared.gameSampleRate = m_prepared.encoder->encodedGameSampleRate();
-            m_prepared.tempDir = std::move(tempDir);
-            m_prepared.width = width;
-            m_prepared.height = height;
-            m_prepareFailedLastAttempt.store(false);
-        } else {
-            if (enc) {
-                if (enc->isRecording()) {
-                    enc->finish();
+            auto tempDir = cfg.getTempDirectory(true);
+            ensureSessionLock(tempDir);
+            segPath = tempDir / ("seg_" + std::to_string(segIdx) + ".mp4");
+
+            auto enc = std::make_unique<PlatformEncoder>();
+
+            if (!m_prepareCancel.load()) {
+                ok = enc->start(
+                    segPath,
+                    width,
+                    height,
+                    cfg.targetFps.load(),
+                    effBitrate,
+                    effMaxBitrate,
+                    cfg.qualityLevel.load(),
+                    cfg.rateControl.load(),
+                    cfg.recordMic.load() && cfg.splitAudioTracks.load(),
+                    cfg.codec.load(),
+                    cfg.hardwareAcceleration.load(),
+                    cfg.getCustomCodec(),
+                    gameSampleRate,
+                    nullptr,
+                    allowFallback,
+                    hasForcedCodec,
+                    forcedFamily,
+                    forcedHardware
+                ).ok;
+            }
+
+            if (ok && !m_prepareCancel.load()) {
+                std::lock_guard<std::mutex> dataLock(m_prepareDataMutex);
+                m_prepared.encoder = std::move(enc);
+                m_prepared.path = std::move(segPath);
+                m_prepared.formatKey = m_prepared.encoder->formatKey();
+                m_prepared.gameSampleRate = m_prepared.encoder->encodedGameSampleRate();
+                m_prepared.tempDir = std::move(tempDir);
+                m_prepared.width = width;
+                m_prepared.height = height;
+                m_prepareFailedLastAttempt.store(false);
+                segPath.clear();
+            } else {
+                if (enc) {
+                    if (enc->isRecording()) {
+                        enc->finish();
+                    }
+                    enc.reset();
                 }
-                enc.reset();
-            }
-            DeleteFileW(segPath.c_str());
-            if (!ok && !m_prepareCancel.load()) {
-                m_prepareFailedLastAttempt.store(true);
+                if (!ok && !m_prepareCancel.load()) {
+                    m_prepareFailedLastAttempt.store(true);
+                }
             }
         }
-
-        if (SUCCEEDED(coHr)) CoUninitialize();
+        if (!segPath.empty()) {
+            std::error_code rmEc;
+            std::filesystem::remove(segPath, rmEc);
+        }
         {
             std::lock_guard<std::mutex> ql(m_queueMutex);
             m_prepareInFlight.store(false);
@@ -1951,13 +2068,17 @@ bool ReplayManager::writeEncodedVideoFrame(
         frame->timestamp - m_currentSegmentStart).count() / 100;
     if (ts <= m_lastVideoHns) ts = m_lastVideoHns + 1000;
 
+#ifdef GEODE_IS_WINDOWS
     EncoderOpResult videoRes = m_encoder->writeVideoFrame(frame->buffer.get(), frame->width, frame->height, ts);
+#elif defined(GEODE_IS_MACOS)
+    EncoderOpResult videoRes = m_encoder->writeVideoFrame(frame->pixelBuffer.get(), frame->width, frame->height, ts);
+#endif
     if (videoRes) {
         m_lastVideoHns = ts;
         m_lastVideoCaptureTime = frame->timestamp;
         m_lastWrittenVideoCaptureTime = frame->timestamp;
         m_videoWriteErrors = 0;
-        if (FrameGrabber::isMediaBufferUnique(frame->buffer.get())) {
+        if (FrameGrabber::isFrameBufferUnique(*frame)) {
             FrameGrabber::get()->recycleFrame(std::move(frame));
         } else {
             m_inFlightFrames.push_back(std::move(frame));
@@ -2122,12 +2243,9 @@ bool ReplayManager::handleSaveRequest(
                     m_carryGameChunks.clear();
                     m_carryMicAudio.clear();
                     m_encoderFailCount++;
-                    if (MediaFoundationEncoder::isFatalStorageError(m_lastStartError.hr) ||
+                    if (m_lastStartError.fatalStorage ||
                         m_encoderFailCount >= MAX_ENCODER_START_FAILURES) {
-                        std::string detail = m_lastStartError.message.empty()
-                            ? MediaFoundationEncoder::formatHr(m_lastStartError.hr)
-                            : m_lastStartError.message;
-                        return failSave("Instant Replay stopped: " + detail);
+                        return failSave("Instant Replay stopped: " + m_lastStartError.detailString());
                     }
                     m_nextEncoderRetryTime = std::chrono::steady_clock::now() + std::chrono::seconds(2 * m_encoderFailCount);
                 }
@@ -2147,12 +2265,9 @@ bool ReplayManager::handleSaveRequest(
                         m_carryGameChunks.clear();
                         m_carryMicAudio.clear();
                         m_encoderFailCount++;
-                        if (MediaFoundationEncoder::isFatalStorageError(m_lastStartError.hr) ||
+                        if (m_lastStartError.fatalStorage ||
                             m_encoderFailCount >= MAX_ENCODER_START_FAILURES) {
-                            std::string detail = m_lastStartError.message.empty()
-                                ? MediaFoundationEncoder::formatHr(m_lastStartError.hr)
-                                : m_lastStartError.message;
-                            return failSave("Instant Replay stopped: " + detail);
+                            return failSave("Instant Replay stopped: " + m_lastStartError.detailString());
                         }
                         m_nextEncoderRetryTime = std::chrono::steady_clock::now() + std::chrono::seconds(2 * m_encoderFailCount);
                     }
@@ -2197,7 +2312,7 @@ bool ReplayManager::handleSaveRequest(
     // Snapshot candidate segments and lock their files immediately under m_segmentMutex so neither
     // purgeOldSegments nor stopReplay can delete them while background finalization or export runs.
     std::vector<SegmentInfo> candidateSegments;
-    std::vector<std::wstring> preLockedPaths;
+    std::vector<std::filesystem::path> preLockedPaths;
     {
         std::lock_guard<std::mutex> lock(m_segmentMutex);
         candidateSegments = m_activeSegments;
@@ -2258,7 +2373,7 @@ bool ReplayManager::handleSaveRequest(
             }
         }
 
-        std::vector<std::wstring> segsToMerge;
+        std::vector<std::filesystem::path> segsToMerge;
         double totalSeconds = 0.0;
         double maxDuration = static_cast<double>(std::max(1, cfgCopy.durationSeconds.load()));
         std::string requiredFormat;
@@ -2313,22 +2428,28 @@ bool ReplayManager::handleSaveRequest(
         auto t = std::chrono::system_clock::to_time_t(sysNow);
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(sysNow.time_since_epoch()).count() % 1000;
         if (ms < 0) ms += 1000;
-        struct tm tmBuf;
+        struct tm tmBuf{};
+#ifdef GEODE_IS_WINDOWS
         localtime_s(&tmBuf, &t);
-        std::wstringstream wss;
-        wss << L"replay_" << std::put_time(&tmBuf, L"%Y-%m-%d_%H-%M-%S")
-            << L"_" << std::setw(3) << std::setfill(L'0') << ms;
-        std::wstring baseStem = wss.str();
+#else
+        localtime_r(&t, &tmBuf);
+#endif
+        std::ostringstream oss;
+        oss << "replay_" << std::put_time(&tmBuf, "%Y-%m-%d_%H-%M-%S")
+            << "_" << std::setw(3) << std::setfill('0') << ms;
+        std::string baseStem = oss.str();
 
-        std::filesystem::path finalPath = saveDir / (baseStem + L".mp4");
+        std::filesystem::path finalPath = saveDir / (baseStem + ".mp4");
         std::error_code ec;
         for (int suffix = 2; std::filesystem::exists(finalPath, ec); ++suffix) {
-            finalPath = saveDir / (baseStem + L"_" + std::to_wstring(suffix) + L".mp4");
+            finalPath = saveDir / (baseStem + "_" + std::to_string(suffix) + ".mp4");
         }
 
-        HRESULT coHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-        ConcatResult result = MediaFoundationEncoder::concatenateSegments(segsToMerge, finalPath.wstring(), trimStartSeconds);
-        if (SUCCEEDED(coHr)) CoUninitialize();
+        ConcatResult result;
+        {
+            MediaThreadScope mediaScope;
+            result = PlatformEncoder::concatenateSegments(segsToMerge, finalPath, trimStartSeconds);
+        }
 
         releaseExportSegments(segsToMerge);
 
@@ -2361,8 +2482,8 @@ bool ReplayManager::handleSaveRequest(
 }
 
 void ReplayManager::workerThreadFunc(ReplayConfig sessionConfig) {
-    HRESULT coHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    MediaFoundationEncoder::globalInitialize();
+    MediaThreadScope mediaScope;
+    PlatformEncoder::globalInitialize();
 
     std::vector<float> gameAudioScratch;
     std::vector<float> resampledGameAudioScratch;
@@ -2370,6 +2491,9 @@ void ReplayManager::workerThreadFunc(ReplayConfig sessionConfig) {
     bool hadFatalError = false;
 
     while (m_running.load()) {
+#ifdef GEODE_IS_MACOS
+        MacAutoreleasePoolScope iterPool;
+#endif
         std::shared_ptr<CapturedFrame> frame;
         {
             std::unique_lock<std::mutex> lock(m_queueMutex);
@@ -2464,11 +2588,9 @@ void ReplayManager::workerThreadFunc(ReplayConfig sessionConfig) {
         }
 
         auto handleStartFailure = [this, &frame, &hadFatalError, &now]() -> bool {
-            std::string detail = m_lastStartError.message.empty()
-                ? MediaFoundationEncoder::formatHr(m_lastStartError.hr)
-                : m_lastStartError.message;
+            std::string detail = m_lastStartError.detailString();
             m_encoderFailCount++;
-            if (MediaFoundationEncoder::isFatalStorageError(m_lastStartError.hr) ||
+            if (m_lastStartError.fatalStorage ||
                 m_encoderFailCount >= MAX_ENCODER_START_FAILURES) {
                 if (frame) {
                     FrameGrabber::get()->recycleFrame(std::move(frame));
@@ -2726,7 +2848,7 @@ void ReplayManager::workerThreadFunc(ReplayConfig sessionConfig) {
         }
     }
 
-    // Release all COM objects held on this thread BEFORE CoUninitialize (#20)
+    // Release all platform media objects held on this thread BEFORE tearing down MediaThreadScope (#20)
     m_prepareCancel.store(true);
     joinPrepareThread();
     discardPreparedEncoder();
@@ -2738,8 +2860,6 @@ void ReplayManager::workerThreadFunc(ReplayConfig sessionConfig) {
         m_encoder.reset();
     }
     reclaimInFlightFrames(true);
-
-    if (SUCCEEDED(coHr)) CoUninitialize();
 }
 
 SaveReplayResult ReplayManager::saveReplay() {
@@ -2778,12 +2898,15 @@ void ReplayManager::showSaveFeedback(SaveReplayResult result) {
 void ReplayManager::openRecordingsFolder() {
     auto cfg = ReplayConfig::get().snapshot();
     geode::async::runtime().spawnBlocking<void>([cfg]() {
-        HRESULT coHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
-        std::filesystem::path dir = cfg.getRecordingsDirectory(true);
-        std::error_code ec;
-        bool exists = std::filesystem::exists(dir, ec) && std::filesystem::is_directory(dir, ec);
-        bool opened = exists && geode::utils::file::openFolder(dir);
-        if (SUCCEEDED(coHr)) CoUninitialize();
+        bool opened = false;
+        std::filesystem::path dir;
+        {
+            MediaThreadScope mediaScope(kCoInitApartment);
+            dir = cfg.getRecordingsDirectory(true);
+            std::error_code ec;
+            bool exists = std::filesystem::exists(dir, ec) && std::filesystem::is_directory(dir, ec);
+            opened = exists && geode::utils::file::openFolder(dir);
+        }
 
         if (!opened) {
             std::string dirStr = geode::utils::string::pathToString(dir);
@@ -2800,4 +2923,4 @@ void ReplayManager::openRecordingsFolder() {
 
 } // namespace replay
 
-#endif // GEODE_IS_WINDOWS
+#endif // GEODE_IS_WINDOWS || GEODE_IS_MACOS

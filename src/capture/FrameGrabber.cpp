@@ -1,13 +1,30 @@
+#ifndef GL_SILENCE_DEPRECATION
+#define GL_SILENCE_DEPRECATION
+#endif
+
 #include "FrameGrabber.hpp"
 #include "FrameBudget.hpp"
 
-#ifdef GEODE_IS_WINDOWS
+#if defined(GEODE_IS_WINDOWS) || defined(GEODE_IS_MACOS)
 
 #include "../config/ReplayConfig.hpp"
 #include "../recorder/ReplayManager.hpp"
-#include "../encoder/MediaFoundationEncoder.hpp"
+#include "../encoder/PlatformEncoder.hpp"
+#ifdef GEODE_IS_MACOS
+#include "../platform/MacPlatformUtils.hpp"
+#pragma push_macro("CommentType")
+#undef CommentType
+#define CommentType AppleScriptCommentTypeDummy
+#include <CoreFoundation/CoreFoundation.h>
+#include <OpenGL/CGLCurrent.h>
+#include <OpenGL/gl.h>
+#include <OpenGL/glext.h>
+#undef CommentType
+#pragma pop_macro("CommentType")
+#endif
 #include <cocos2d.h>
 #include <algorithm>
+#include <cstring>
 
 using namespace cocos2d;
 
@@ -20,11 +37,76 @@ static constexpr size_t kMinPooledFrames = 4;
 static constexpr size_t kBasePooledBytes = 50ull * 1024 * 1024;
 static constexpr size_t kHardMaxPooledBytes = 256ull * 1024 * 1024;
 
+namespace {
+
+inline bool hasGlPboSupport() noexcept {
+#ifdef GEODE_IS_WINDOWS
+    return glGenBuffers && glBindBuffer && glBufferData && glMapBuffer && glUnmapBuffer;
+#else
+    return true;
+#endif
+}
+
+inline bool hasGlBlitSupport() noexcept {
+#ifdef GEODE_IS_WINDOWS
+    return glBlitFramebuffer && glGenFramebuffers && glBindFramebuffer &&
+           glGenRenderbuffers && glBindRenderbuffer && glRenderbufferStorage &&
+           glFramebufferRenderbuffer && glCheckFramebufferStatus;
+#else
+    return true;
+#endif
+}
+
+inline bool hasGlFramebufferBind() noexcept {
+#ifdef GEODE_IS_WINDOWS
+    return glBindFramebuffer != nullptr;
+#else
+    return true;
+#endif
+}
+
+#ifdef GEODE_IS_MACOS
+bool allocateIOSurfacePixelBuffer(int width, int height, CVPixelBufferRef* outPb) noexcept {
+    if (!outPb || width <= 0 || height <= 0) return false;
+    CFMutableDictionaryRef emptyDict = CFDictionaryCreateMutable(
+        kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    CFMutableDictionaryRef attrs = CFDictionaryCreateMutable(
+        kCFAllocatorDefault, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    if (emptyDict && attrs) {
+        CFDictionarySetValue(attrs, kCVPixelBufferIOSurfacePropertiesKey, emptyDict);
+    }
+    CVReturn ret = CVPixelBufferCreate(
+        kCFAllocatorDefault,
+        static_cast<size_t>(width),
+        static_cast<size_t>(height),
+        kCVPixelFormatType_32BGRA,
+        attrs,
+        outPb);
+    if (emptyDict) CFRelease(emptyDict);
+    if (attrs) CFRelease(attrs);
+    return ret == kCVReturnSuccess && *outPb != nullptr;
+}
+#endif
+
+} // namespace
+
+#ifdef GEODE_IS_WINDOWS
 bool FrameGrabber::isMediaBufferUnique(IMFMediaBuffer* buf) noexcept {
     if (!buf) return false;
     buf->AddRef();
     ULONG refs = buf->Release();
     return refs == 1;
+}
+#endif
+
+bool FrameGrabber::isFrameBufferUnique(const CapturedFrame& frame) noexcept {
+#ifdef GEODE_IS_WINDOWS
+    return isMediaBufferUnique(frame.buffer.get());
+#elif defined(GEODE_IS_MACOS)
+    return frame.pixelBuffer && CFGetRetainCount(frame.pixelBuffer.get()) <= 1;
+#else
+    return false;
+#endif
 }
 
 FrameGrabber* FrameGrabber::get() {
@@ -41,6 +123,7 @@ FrameGrabber::~FrameGrabber() {
 
 void FrameGrabber::resetRenderThreadState() noexcept {
     m_pboPending[0] = m_pboPending[1] = false;
+    m_pboTopDown[0] = m_pboTopDown[1] = false;
     m_pboIndex = 0;
     m_nextCaptureTime = {};
     m_lastSwapTime = {};
@@ -55,18 +138,20 @@ void FrameGrabber::resetRenderThreadState() noexcept {
 void FrameGrabber::initialize() {
     if (m_initialized) return;
 
-    MediaFoundationEncoder::globalInitialize();
+    PlatformEncoder::globalInitialize();
     (void)ReplayConfig::getGpuAccelName();
 
+#ifdef GEODE_IS_WINDOWS
     m_glContext = wglGetCurrentContext();
-    m_hasPbo = glGenBuffers && glBindBuffer && glBufferData && glMapBuffer && glUnmapBuffer;
+#elif defined(GEODE_IS_MACOS)
+    m_glContext = CGLGetCurrentContext();
+#endif
+    m_hasPbo = hasGlPboSupport();
     if (m_hasPbo) {
         glGenBuffers(2, m_pbos);
     }
 
-    m_hasBlit = glBlitFramebuffer && glGenFramebuffers && glBindFramebuffer &&
-                glGenRenderbuffers && glBindRenderbuffer && glRenderbufferStorage &&
-                glFramebufferRenderbuffer && glCheckFramebufferStatus;
+    m_hasBlit = hasGlBlitSupport();
 
     m_blitRetryAfter = {};
     m_failedBlitW = 0;
@@ -104,15 +189,15 @@ void FrameGrabber::setCapturing(bool active) {
 
 void FrameGrabber::resetGlResources(bool glContextValid) noexcept {
     if (glContextValid && m_initialized) {
-        if (m_pbos[0] != 0 && glDeleteBuffers) {
-            glDeleteBuffers(2, m_pbos);
-        }
-        if (m_fbo && glDeleteFramebuffers) {
-            glDeleteFramebuffers(1, &m_fbo);
-        }
-        if (m_rbo && glDeleteRenderbuffers) {
-            glDeleteRenderbuffers(1, &m_rbo);
-        }
+#ifdef GEODE_IS_WINDOWS
+        if (m_pbos[0] != 0 && glDeleteBuffers) glDeleteBuffers(2, m_pbos);
+        if (m_fbo && glDeleteFramebuffers) glDeleteFramebuffers(1, &m_fbo);
+        if (m_rbo && glDeleteRenderbuffers) glDeleteRenderbuffers(1, &m_rbo);
+#else
+        if (m_pbos[0] != 0) glDeleteBuffers(2, m_pbos);
+        if (m_fbo) glDeleteFramebuffers(1, &m_fbo);
+        if (m_rbo) glDeleteRenderbuffers(1, &m_rbo);
+#endif
     }
     m_pbos[0] = m_pbos[1] = 0;
     m_fbo = 0;
@@ -143,25 +228,28 @@ void FrameGrabber::setFrameCallback(FrameCallback callback) {
     m_callback = std::move(callback);
 }
 
-std::shared_ptr<CapturedFrame> FrameGrabber::acquireFrame(size_t requiredBytes) {
+std::shared_ptr<CapturedFrame> FrameGrabber::acquireFrame(int width, int height, size_t requiredBytes) {
     std::shared_ptr<CapturedFrame> frame;
     size_t poolSizeAfter = 0;
     {
         std::lock_guard<std::mutex> lock(m_poolMutex);
         for (size_t i = m_framePool.size(); i > 0; --i) {
             auto& candidate = m_framePool[i - 1];
-            if (!candidate || !candidate->buffer) {
+            if (!candidate || !candidate->hasBuffer()) {
                 m_framePool.erase(m_framePool.begin() + static_cast<std::ptrdiff_t>(i - 1));
                 continue;
             }
-            if (candidate->byteSize != requiredBytes) {
+            const bool sizeMismatch = (candidate->byteSize != requiredBytes) ||
+                                      (width > 0 && candidate->width != width) ||
+                                      (height > 0 && candidate->height != height);
+            if (sizeMismatch) {
                 // Evict stale buffers from a previous resolution so they don't linger
-                if (isMediaBufferUnique(candidate->buffer.get())) {
+                if (isFrameBufferUnique(*candidate)) {
                     m_framePool.erase(m_framePool.begin() + static_cast<std::ptrdiff_t>(i - 1));
                 }
                 continue;
             }
-            if (isMediaBufferUnique(candidate->buffer.get())) {
+            if (isFrameBufferUnique(*candidate)) {
                 frame = std::move(candidate);
                 m_framePool.erase(m_framePool.begin() + static_cast<std::ptrdiff_t>(i - 1));
                 break;
@@ -171,9 +259,17 @@ std::shared_ptr<CapturedFrame> FrameGrabber::acquireFrame(size_t requiredBytes) 
     }
     if (!frame) {
         frame = std::make_shared<CapturedFrame>();
+#ifdef GEODE_IS_WINDOWS
         if (FAILED(MFCreateMemoryBuffer(static_cast<DWORD>(requiredBytes), frame->buffer.put())) || !frame->buffer) {
             return nullptr;
         }
+#elif defined(GEODE_IS_MACOS)
+        if (!allocateIOSurfacePixelBuffer(width, height, frame->pixelBuffer.put())) {
+            return nullptr;
+        }
+#endif
+        frame->width = width;
+        frame->height = height;
         frame->byteSize = requiredBytes;
         ++m_allocCount;
     }
@@ -194,16 +290,17 @@ std::shared_ptr<CapturedFrame> FrameGrabber::acquireFrame(size_t requiredBytes) 
 }
 
 void FrameGrabber::recycleFrame(std::shared_ptr<CapturedFrame> frame) {
-    if (!frame || !frame->buffer || frame.use_count() != 1) return;
+    if (!frame || !frame->hasBuffer() || frame.use_count() != 1) return;
     if (!m_capturing.load(std::memory_order_acquire)) return;
-    if (!isMediaBufferUnique(frame->buffer.get())) return;
+    if (!isFrameBufferUnique(*frame)) return;
 
     std::lock_guard<std::mutex> lock(m_poolMutex);
     // Prune dead or mismatched-size unique buffers before checking the byte budget
     for (size_t i = m_framePool.size(); i > 0; --i) {
         auto& item = m_framePool[i - 1];
-        if (!item || !item->buffer ||
-            (item->byteSize != frame->byteSize && isMediaBufferUnique(item->buffer.get()))) {
+        if (!item || !item->hasBuffer() ||
+            ((item->byteSize != frame->byteSize || item->width != frame->width || item->height != frame->height) &&
+             isFrameBufferUnique(*item))) {
             m_framePool.erase(m_framePool.begin() + static_cast<std::ptrdiff_t>(i - 1));
         }
     }
@@ -303,23 +400,59 @@ static DestRect computeAspectFitRect(int srcW, int srcH, int dstW, int dstH) noe
     return {x0, y0, x0 + fitW, y0 + fitH, hasBars};
 }
 
+static void copyBgraRows(
+    const uint8_t* src,
+    int width,
+    int height,
+    uint8_t* dst,
+    size_t dstStride,
+    bool flipVertical
+) {
+    const size_t rowBytes = static_cast<size_t>(width) * 4;
+    if (!flipVertical && dstStride == rowBytes) {
+        std::memcpy(dst, src, rowBytes * static_cast<size_t>(height));
+        return;
+    }
+    for (int y = 0; y < height; ++y) {
+        int srcY = flipVertical ? (height - 1 - y) : y;
+        std::memcpy(dst + static_cast<size_t>(y) * dstStride,
+                    src + static_cast<size_t>(srcY) * rowBytes,
+                    rowBytes);
+    }
+}
+
 // Nearest-neighbour BGRA resize with aspect-preserving letterbox/pillarbox bars
 // (only used when FBO blit is unavailable)
-static void resizeNearest(const uint8_t* src, int sw, int sh, uint8_t* dst, int dw, int dh) {
+static void resizeNearestStrided(
+    const uint8_t* src,
+    int sw,
+    int sh,
+    uint8_t* dst,
+    int dw,
+    int dh,
+    size_t dstStride,
+    bool flipVertical
+) {
     const uint32_t* s = reinterpret_cast<const uint32_t*>(src);
-    uint32_t* d = reinterpret_cast<uint32_t*>(dst);
     DestRect rect = computeAspectFitRect(sw, sh, dw, dh);
     if (rect.hasBars) {
-        std::fill_n(d, static_cast<size_t>(dw) * dh, 0xFF000000u);
+        for (int y = 0; y < dh; ++y) {
+            uint32_t* rowDst = reinterpret_cast<uint32_t*>(dst + static_cast<size_t>(y) * dstStride);
+            std::fill_n(rowDst, static_cast<size_t>(dw), 0xFF000000u);
+        }
     }
     int fitW = rect.x1 - rect.x0;
     int fitH = rect.y1 - rect.y0;
     if (fitW <= 0 || fitH <= 0) return;
 
     for (int y = 0; y < fitH; ++y) {
+        int dstY = rect.y0 + y;
         int sy = std::min(sh - 1, static_cast<int>((static_cast<int64_t>(y) * sh) / fitH));
+        if (flipVertical) {
+            sy = (sh - 1) - sy;
+        }
         const uint32_t* row = s + static_cast<size_t>(sy) * sw;
-        uint32_t* out = d + static_cast<size_t>(rect.y0 + y) * dw + rect.x0;
+        uint32_t* out = reinterpret_cast<uint32_t*>(dst + static_cast<size_t>(dstY) * dstStride) + rect.x0;
         for (int x = 0; x < fitW; ++x) {
             int sx = std::min(sw - 1, static_cast<int>((static_cast<int64_t>(x) * sw) / fitW));
             out[x] = row[sx];
@@ -386,7 +519,11 @@ void FrameGrabber::captureCurrentFrame() {
         m_nextCaptureTime = now;
     }
 
+#ifdef GEODE_IS_WINDOWS
     HGLRC curCtx = wglGetCurrentContext();
+#elif defined(GEODE_IS_MACOS)
+    CGLContextObj curCtx = CGLGetCurrentContext();
+#endif
     if (!m_initialized) {
         initialize();
     } else if (curCtx && curCtx != m_glContext) {
@@ -398,19 +535,23 @@ void FrameGrabber::captureCurrentFrame() {
 
     // Real size of the window back buffer (GL_VIEWPORT may be a sub-region)
     int srcW = 0, srcH = 0;
+#ifdef GEODE_IS_WINDOWS
     if (auto view = CCEGLView::get()) {
         auto fs = view->getFrameSize();
         srcW = static_cast<int>(fs.width);
         srcH = static_cast<int>(fs.height);
-        if (srcH > 0) {
-            ReplayConfig::s_nativeFrameHeight.store(srcH, std::memory_order_relaxed);
-        }
     }
+#elif defined(GEODE_IS_MACOS)
+    getMacOpenGLDrawableSize(srcW, srcH);
+#endif
     if (srcW <= 0 || srcH <= 0) {
         GLint viewport[4] = {0, 0, 0, 0};
         glGetIntegerv(GL_VIEWPORT, viewport);
         srcW = viewport[2];
         srcH = viewport[3];
+    }
+    if (srcH > 0) {
+        ReplayConfig::s_nativeFrameHeight.store(srcH, std::memory_order_relaxed);
     }
     if (srcW < 16 || srcH < 16) return;
 
@@ -430,20 +571,24 @@ void FrameGrabber::captureCurrentFrame() {
         }
     }
 
-    GLint prevRead = 0, prevDraw = 0, prevPack = 4;
+    GLint prevRead = 0, prevDraw = 0, prevPack = 4, prevPackRowLen = 0;
     GLint prevReadBuffer = GL_BACK, prevDrawBuffer = GL_BACK;
-    if (glBindFramebuffer) {
+    if (hasGlFramebufferBind()) {
         glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prevRead);
         glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevDraw);
     }
     glGetIntegerv(GL_READ_BUFFER, &prevReadBuffer);
     glGetIntegerv(GL_DRAW_BUFFER, &prevDrawBuffer);
     glGetIntegerv(GL_PACK_ALIGNMENT, &prevPack);
+    glGetIntegerv(GL_PACK_ROW_LENGTH, &prevPackRowLen);
     glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    glPixelStorei(GL_PACK_ROW_LENGTH, 0);
 
-    // 1. Scale the back buffer to the session-fixed encoder size with aspect-preserving bars
+    // 1. Scale the back buffer to the session-fixed encoder size with aspect-preserving bars.
+    // On macOS, flip Y directly in the GPU blit so CVPixelBuffer receives top-down rows without CPU flip.
     int readW = srcW & ~1;
     int readH = srcH & ~1;
+    bool currentTopDown = false;
     if (m_hasBlit && ensureScaleTarget(dstW, dstH, now)) {
         DestRect rect = computeAspectFitRect(srcW, srcH, dstW, dstH);
         GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
@@ -463,14 +608,20 @@ void FrameGrabber::captureCurrentFrame() {
         int fitW = rect.x1 - rect.x0;
         int fitH = rect.y1 - rect.y0;
         GLenum filter = (srcW == fitW && srcH == fitH) ? GL_NEAREST : GL_LINEAR;
+#ifdef GEODE_IS_MACOS
+        glBlitFramebuffer(0, 0, srcW, srcH, rect.x0, rect.y1, rect.x1, rect.y0, GL_COLOR_BUFFER_BIT, filter);
+        currentTopDown = true;
+#else
         glBlitFramebuffer(0, 0, srcW, srcH, rect.x0, rect.y0, rect.x1, rect.y1, GL_COLOR_BUFFER_BIT, filter);
+        currentTopDown = false;
+#endif
         glBindFramebuffer(GL_READ_FRAMEBUFFER, m_fbo);
         glReadBuffer(GL_COLOR_ATTACHMENT0);
 
         if (scissor) glEnable(GL_SCISSOR_TEST);
         readW = dstW;
         readH = dstH;
-    } else if (glBindFramebuffer) {
+    } else if (hasGlFramebufferBind()) {
         glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
         glReadBuffer(GL_BACK);
     }
@@ -478,27 +629,56 @@ void FrameGrabber::captureCurrentFrame() {
     size_t readBytes = static_cast<size_t>(readW) * readH * 4;
     size_t dstBytes = static_cast<size_t>(dstW) * dstH * 4;
 
-    auto deliver = [&](const uint8_t* pixels, int w, int h, std::chrono::steady_clock::time_point ts) {
-        auto frame = acquireFrame(dstBytes);
-        if (!frame || !frame->buffer) return;
+    auto deliver = [&](const uint8_t* pixels, int w, int h, bool topDown, std::chrono::steady_clock::time_point ts) {
+        auto frame = acquireFrame(dstW, dstH, dstBytes);
+        if (!frame || !frame->hasBuffer()) return;
+#ifdef GEODE_IS_WINDOWS
         BYTE* dst = nullptr;
         if (FAILED(frame->buffer->Lock(&dst, nullptr, nullptr)) || !dst) {
             recycleFrame(std::move(frame));
             return;
         }
+        const size_t dstStride = static_cast<size_t>(dstW) * 4;
         if (w == dstW && h == dstH) {
-            memcpy(dst, pixels, dstBytes);
+            copyBgraRows(pixels, w, h, dst, dstStride, false);
         } else {
-            resizeNearest(pixels, w, h, dst, dstW, dstH);
+            resizeNearestStrided(pixels, w, h, dst, dstW, dstH, dstStride, false);
         }
         frame->buffer->Unlock();
         frame->buffer->SetCurrentLength(static_cast<DWORD>(dstBytes));
+        frame->stride = dstW * 4;
+#elif defined(GEODE_IS_MACOS)
+        if (CVPixelBufferLockBaseAddress(frame->pixelBuffer.get(), 0) != kCVReturnSuccess) {
+            recycleFrame(std::move(frame));
+            return;
+        }
+        uint8_t* dst = static_cast<uint8_t*>(CVPixelBufferGetBaseAddress(frame->pixelBuffer.get()));
+        size_t dstStride = CVPixelBufferGetBytesPerRow(frame->pixelBuffer.get());
+        if (!dst || dstStride < static_cast<size_t>(dstW) * 4) {
+            CVPixelBufferUnlockBaseAddress(frame->pixelBuffer.get(), 0);
+            recycleFrame(std::move(frame));
+            return;
+        }
+        const bool flipY = !topDown;
+        if (w == dstW && h == dstH) {
+            copyBgraRows(pixels, w, h, dst, dstStride, flipY);
+        } else {
+            resizeNearestStrided(pixels, w, h, dst, dstW, dstH, dstStride, flipY);
+        }
+        CVPixelBufferUnlockBaseAddress(frame->pixelBuffer.get(), 0);
+        frame->stride = static_cast<int>(dstStride);
+#endif
         frame->width = dstW;
         frame->height = dstH;
-        frame->stride = dstW * 4;
         frame->timestamp = ts;
         m_callback(std::move(frame));
     };
+
+#ifdef GEODE_IS_MACOS
+    constexpr GLenum kReadPixelType = GL_UNSIGNED_INT_8_8_8_8_REV;
+#else
+    constexpr GLenum kReadPixelType = GL_UNSIGNED_BYTE;
+#endif
 
     if (m_hasPbo) {
         // 2a. Async readback: start transfer for this frame, consume previous one
@@ -507,13 +687,14 @@ void FrameGrabber::captureCurrentFrame() {
 
         ensurePbo(cur, readBytes);
         glBindBuffer(GL_PIXEL_PACK_BUFFER, m_pbos[cur]);
-        glReadPixels(0, 0, readW, readH, GL_BGRA, GL_UNSIGNED_BYTE, nullptr);
+        glReadPixels(0, 0, readW, readH, GL_BGRA, kReadPixelType, nullptr);
         m_pboWidth[cur] = readW;
         m_pboHeight[cur] = readH;
         m_pboTime[cur] = now;
+        m_pboTopDown[cur] = currentTopDown;
         m_pboPending[cur] = true;
 
-        if (glBindFramebuffer) {
+        if (hasGlFramebufferBind()) {
             glBindFramebuffer(GL_READ_FRAMEBUFFER, prevRead);
             glBindFramebuffer(GL_DRAW_FRAMEBUFFER, prevDraw);
         }
@@ -524,7 +705,7 @@ void FrameGrabber::captureCurrentFrame() {
             glBindBuffer(GL_PIXEL_PACK_BUFFER, m_pbos[prev]);
             auto src = static_cast<const uint8_t*>(glMapBuffer(GL_PIXEL_PACK_BUFFER, GL_READ_ONLY));
             if (src) {
-                deliver(src, m_pboWidth[prev], m_pboHeight[prev], m_pboTime[prev]);
+                deliver(src, m_pboWidth[prev], m_pboHeight[prev], m_pboTopDown[prev], m_pboTime[prev]);
                 glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
             }
             m_pboPending[prev] = false;
@@ -536,19 +717,20 @@ void FrameGrabber::captureCurrentFrame() {
         if (m_syncScratch.size() < readBytes) {
             m_syncScratch.resize(readBytes);
         }
-        glReadPixels(0, 0, readW, readH, GL_BGRA, GL_UNSIGNED_BYTE, m_syncScratch.data());
-        if (glBindFramebuffer) {
+        glReadPixels(0, 0, readW, readH, GL_BGRA, kReadPixelType, m_syncScratch.data());
+        if (hasGlFramebufferBind()) {
             glBindFramebuffer(GL_READ_FRAMEBUFFER, prevRead);
             glBindFramebuffer(GL_DRAW_FRAMEBUFFER, prevDraw);
         }
         glReadBuffer(prevReadBuffer);
         glDrawBuffer(prevDrawBuffer);
-        deliver(m_syncScratch.data(), readW, readH, now);
+        deliver(m_syncScratch.data(), readW, readH, currentTopDown, now);
     }
 
+    glPixelStorei(GL_PACK_ROW_LENGTH, prevPackRowLen);
     glPixelStorei(GL_PACK_ALIGNMENT, prevPack);
 }
 
 } // namespace replay
 
-#endif // GEODE_IS_WINDOWS
+#endif // GEODE_IS_WINDOWS || GEODE_IS_MACOS

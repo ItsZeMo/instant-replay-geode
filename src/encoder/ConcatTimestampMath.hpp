@@ -32,13 +32,14 @@ struct ConcatTimestampState {
         return std::max<int64_t>(0, srcPts - segCut + outputBase);
     }
 
-    // Recomputes video DTS monotonically while keeping PTS >= DTS and preserving B-frame reorder lead.
-    void adjustVideoTimestamps(int64_t rawDts, int64_t segCut, int64_t& inOutPts, int64_t& outNewDts) noexcept {
+    // Recomputes video DTS monotonically. Windows MF requires PTS >= DTS (clampPtsToDts = true);
+    // macOS VideoToolbox uses signed ctts offsets where B-frames may have PTS < DTS (clampPtsToDts = false).
+    void adjustVideoTimestamps(int64_t rawDts, int64_t segCut, int64_t& inOutPts, int64_t& outNewDts, bool clampPtsToDts = true) noexcept {
         int64_t newDts = std::max<int64_t>(0, rawDts - segCut + outputBase);
         if (lastVideoDts >= 0 && newDts <= lastVideoDts) {
             newDts = lastVideoDts + 1000LL;
         }
-        if (inOutPts < newDts) {
+        if (clampPtsToDts && inOutPts < newDts) {
             inOutPts = newDts;
         }
         lastVideoDts = newDts;

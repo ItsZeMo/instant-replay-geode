@@ -4,7 +4,9 @@
 
 #ifdef GEODE_IS_WINDOWS
 
+#include "../config/CodecUtils.hpp"
 #include "../config/ReplayConfig.hpp"
+#include "VideoEncoderTypes.hpp"
 #include <windows.h>
 #include <mfapi.h>
 #include <mfidl.h>
@@ -12,6 +14,7 @@
 #include <mferror.h>
 #include <codecapi.h>
 #include <icodecapi.h>
+#include <filesystem>
 #include <string>
 #include <vector>
 #include <memory>
@@ -19,22 +22,6 @@
 #include <functional>
 
 namespace replay {
-
-// Result of merging rolling segments into the final MP4.
-struct ConcatResult {
-    bool success = false;
-    std::string error;            // Human readable reason when success == false
-    double durationSeconds = 0.0; // Duration actually written to the output file
-};
-
-// Detailed result of encoder initialization or sample write operations.
-struct EncoderOpResult {
-    bool ok = false;
-    HRESULT hr = S_OK;
-    std::string message;
-
-    explicit operator bool() const noexcept { return ok; }
-};
 
 class MediaFoundationEncoder {
 public:
@@ -47,7 +34,7 @@ public:
     static std::string formatHr(HRESULT hr);
 
     EncoderOpResult start(
-        const std::wstring& outputPath,
+        const std::filesystem::path& outputPath,
         int width,
         int height,
         int fps,
@@ -62,8 +49,8 @@ public:
         int gameSampleRate = 48000,
         const std::function<void()>& onBeforeFallback = nullptr,
         bool allowFallback = true,
-        const GUID& forcedSubtype = GUID_NULL,
-        bool useForcedHardware = false,
+        bool hasForcedCodec = false,
+        VideoCodecFamily forcedFamily = VideoCodecFamily::H264,
         bool forcedHardware = true
     );
 
@@ -75,6 +62,8 @@ public:
     bool isRecording() const noexcept { return m_recording; }
     bool isVideoQueueSaturated(size_t maxPendingFrames, size_t maxQueuedBytes) const;
     int encodedGameSampleRate() const noexcept { return m_gameSampleRate; }
+    bool hasActiveCodec() const noexcept { return m_activeSubtype != GUID_NULL; }
+    VideoCodecFamily activeCodecFamily() const noexcept;
     const GUID& activeSubtype() const noexcept { return m_activeSubtype; }
     bool activeHardware() const noexcept { return m_activeHardware; }
     std::string activeCodecName() const;
@@ -88,8 +77,8 @@ public:
     // (cut is aligned to the nearest video keyframe). Any read/write/finalize
     // failure is reported and the partial output file is deleted.
     static ConcatResult concatenateSegments(
-        const std::vector<std::wstring>& segmentPaths,
-        const std::wstring& finalOutputPath,
+        const std::vector<std::filesystem::path>& segmentPaths,
+        const std::filesystem::path& finalOutputPath,
         double trimStartSeconds = 0.0
     );
 

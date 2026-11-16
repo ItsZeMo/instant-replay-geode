@@ -2,10 +2,10 @@
 
 #include <Geode/Geode.hpp>
 
-#ifdef GEODE_IS_WINDOWS
+#if defined(GEODE_IS_WINDOWS) || defined(GEODE_IS_MACOS)
 
 #include "../config/ReplayConfig.hpp"
-#include "../encoder/MediaFoundationEncoder.hpp"
+#include "../encoder/PlatformEncoder.hpp"
 #include "../capture/FrameGrabber.hpp"
 #include "../capture/AudioGrabber.hpp"
 #include "MicMixFifo.hpp"
@@ -25,7 +25,7 @@
 namespace replay {
 
 struct SegmentInfo {
-    std::wstring filePath;
+    std::filesystem::path filePath;
     std::chrono::steady_clock::time_point startTime;
     double durationSeconds = 0.0;
     std::string formatKey; // segments can only be merged with segments of the same format
@@ -78,8 +78,8 @@ private:
     void stopReplay();
 
     struct PreparedEncoder {
-        std::unique_ptr<MediaFoundationEncoder> encoder;
-        std::wstring path;
+        std::unique_ptr<PlatformEncoder> encoder;
+        std::filesystem::path path;
         std::string formatKey;
         std::filesystem::path tempDir;
         int gameSampleRate = 48000;
@@ -216,9 +216,9 @@ private:
     // Segment file ownership: files used by a running export are never deleted
     // directly, deletion is deferred until the export releases them.
     // Both require m_segmentMutex to be held.
-    void deleteSegmentFileLocked(const std::wstring& path);
+    void deleteSegmentFileLocked(const std::filesystem::path& path);
     void flushDeferredDeletesLocked();
-    void releaseExportSegments(const std::vector<std::wstring>& paths);
+    void releaseExportSegments(const std::vector<std::filesystem::path>& paths);
 
     // Single-track microphone mixer (recordMic && !splitAudioTracks)
     void resetMicMixer();
@@ -265,9 +265,9 @@ private:
     std::mutex m_stopMutex;
     std::mutex m_lifecycleMutex;
 
-    std::unique_ptr<MediaFoundationEncoder> m_encoder;
+    std::unique_ptr<PlatformEncoder> m_encoder;
     std::deque<std::shared_ptr<CapturedFrame>> m_inFlightFrames; // worker thread only (#1, #7)
-    std::wstring m_currentSegmentPath;
+    std::filesystem::path m_currentSegmentPath;
     std::string m_currentFormatKey;
     std::chrono::steady_clock::time_point m_currentSegmentStart{};
     std::chrono::steady_clock::time_point m_lastVideoCaptureTime{};
@@ -316,13 +316,17 @@ private:
     std::chrono::steady_clock::time_point m_nextEncoderRetryTime{};
 
     std::vector<SegmentInfo> m_activeSegments;
-    std::multiset<std::wstring> m_exportLockedSegments;
-    std::vector<std::wstring> m_deferredDeletes;
+    std::multiset<std::filesystem::path> m_exportLockedSegments;
+    std::vector<std::filesystem::path> m_deferredDeletes;
     std::filesystem::path m_lastTempDir;
     mutable std::mutex m_segmentMutex;
 
     // Exclusive per-PID session lock inside pid_<PID> temp folder
+#ifdef GEODE_IS_WINDOWS
     HANDLE m_sessionLockHandle = INVALID_HANDLE_VALUE;
+#else
+    int m_sessionLockFd = -1;
+#endif
     std::filesystem::path m_sessionLockDir;
     std::filesystem::path m_persistedTempBase;
     std::mutex m_sessionLockMutex;
@@ -363,4 +367,4 @@ private:
 
 } // namespace replay
 
-#endif // GEODE_IS_WINDOWS
+#endif // GEODE_IS_WINDOWS || GEODE_IS_MACOS

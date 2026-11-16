@@ -1,6 +1,6 @@
 #include "ReplayNotification.hpp"
 
-#ifdef GEODE_IS_WINDOWS
+#if defined(GEODE_IS_WINDOWS) || defined(GEODE_IS_MACOS)
 
 #include <cocos2d.h>
 #include <cocos-ext.h>
@@ -101,4 +101,4 @@ void ReplayNotification::animateOut() {
 
 } // namespace replay
 
-#endif // GEODE_IS_WINDOWS
+#endif // GEODE_IS_WINDOWS || GEODE_IS_MACOS
