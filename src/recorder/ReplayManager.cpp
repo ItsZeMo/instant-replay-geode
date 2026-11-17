@@ -484,6 +484,62 @@ void ReplayManager::joinExportThread() {
     }
 }
 
+// Exiting while a replay is still being merged keeps waiting (file integrity first), but says so
+// in the log with progress instead of silently freezing the game (W3).
+void ReplayManager::waitForExportBeforeExit() {
+    if (!m_exportInFlight.load()) return;
+    auto lastLog = std::chrono::steady_clock::time_point{};
+    while (m_exportInFlight.load()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (lastLog == std::chrono::steady_clock::time_point{} || now - lastLog >= std::chrono::seconds(2)) {
+            lastLog = now;
+            const int pct = getExportProgressPercent();
+            geode::log::info("Instant Replay: waiting for replay export to finish before exit ({}%)", std::max(0, pct));
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+}
+
+// Removes our own "replay_*.mp4.part" leftovers (export interrupted by a crash or kill) that are
+// older than one hour. Runs off the main thread (W3).
+void ReplayManager::cleanupStalePartialReplays() {
+#ifdef GEODE_IS_WINDOWS
+    auto cfg = ReplayConfig::get().snapshot();
+    geode::async::runtime().spawnBlocking<void>([cfg]() {
+        std::error_code ec;
+        const std::filesystem::path dir = cfg.getRecordingsDirectory(false);
+        if (dir.empty() || !std::filesystem::is_directory(dir, ec)) return;
+        const auto now = std::filesystem::file_time_type::clock::now();
+        std::filesystem::directory_iterator it(dir, ec);
+        std::filesystem::directory_iterator end;
+        int removed = 0;
+        while (!ec && it != end) {
+            std::error_code entryEc;
+            const auto path = it->path();
+            const bool isFile = it->is_regular_file(entryEc);
+            it.increment(ec);
+            if (!isFile) continue;
+            const std::string name = geode::utils::string::pathToString(path.filename());
+            const std::string_view kPrefix = "replay_";
+            const std::string_view kSuffix = ".mp4.part";
+            if (name.size() <= kPrefix.size() + kSuffix.size() ||
+                name.compare(0, kPrefix.size(), kPrefix) != 0 ||
+                name.compare(name.size() - kSuffix.size(), kSuffix.size(), kSuffix) != 0) {
+                continue;
+            }
+            const auto modified = std::filesystem::last_write_time(path, entryEc);
+            if (entryEc || now - modified < std::chrono::hours(1)) continue;
+            if (std::filesystem::remove(path, entryEc)) {
+                ++removed;
+            }
+        }
+        if (removed > 0) {
+            geode::log::info("Instant Replay: removed {} stale partial replay file(s) from an interrupted export", removed);
+        }
+    });
+#endif
+}
+
 void ReplayManager::joinStopThread() {
     std::lock_guard<std::mutex> lock(m_stopMutex);
     if (m_stopThread.joinable()) {
@@ -543,6 +599,7 @@ void ReplayManager::initialize() {
         }
     }
     cleanupTempDir();
+    cleanupStalePartialReplays();
 
     // Frame grabber callback (render thread -> worker queue)
     FrameGrabber::get()->setFrameCallback([this](std::shared_ptr<CapturedFrame> frame) {
@@ -610,6 +667,7 @@ void ReplayManager::shutdown() {
 
     stopReplay();
     joinFinalizeThread();
+    waitForExportBeforeExit();
     joinExportThread();
     AudioGrabber::get()->cleanup();
     FrameGrabber::get()->cleanup(true);
@@ -2540,12 +2598,25 @@ bool ReplayManager::handleSaveRequest(
         std::string baseStem = oss.str();
 
         std::filesystem::path finalPath = saveDir / (baseStem + ".mp4");
+        auto partPathFor = [](const std::filesystem::path& p) {
+            std::filesystem::path part = p;
+            part += ".part";
+            return part;
+        };
         std::error_code ec;
-        for (int suffix = 2; std::filesystem::exists(finalPath, ec); ++suffix) {
+        for (int suffix = 2; std::filesystem::exists(finalPath, ec) || std::filesystem::exists(partPathFor(finalPath), ec); ++suffix) {
             finalPath = saveDir / (baseStem + "_" + std::to_string(suffix) + ".mp4");
         }
+        // Merge into "<name>.mp4.part" and rename only after a successful finalize, so a killed
+        // process never leaves a moov-less "replay_*.mp4" behind (W3).
+#ifdef GEODE_IS_WINDOWS
+        const std::filesystem::path writePath = partPathFor(finalPath);
+#endif
 
         ConcatResult result;
+#ifdef GEODE_IS_WINDOWS
+        m_exportProgressPermille.store(0, std::memory_order_relaxed);
+#endif
         {
             MediaThreadScope mediaScope;
 #ifdef GEODE_IS_WINDOWS
@@ -2559,13 +2630,27 @@ bool ReplayManager::handleSaveRequest(
                 desc.micAudioFrames = info.micAudioFrames;
                 segDescs.push_back(std::move(desc));
             }
-            result = PlatformEncoder::concatenateSegments(segDescs, finalPath, trimStartSeconds);
+            result = PlatformEncoder::concatenateSegments(segDescs, writePath, trimStartSeconds, &m_exportProgressPermille);
 #else
             result = PlatformEncoder::concatenateSegments(segsToMerge, finalPath, trimStartSeconds);
 #endif
         }
 
         releaseExportSegments(segsToMerge);
+#ifdef GEODE_IS_WINDOWS
+        if (result.success) {
+            if (!MoveFileExW(writePath.c_str(), finalPath.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+                const DWORD moveErr = GetLastError();
+                result.success = false;
+                result.error = "cannot rename finished replay (error " + std::to_string(moveErr) + ")";
+            }
+        }
+        if (!result.success) {
+            std::error_code rmEc;
+            std::filesystem::remove(writePath, rmEc);
+        }
+#endif
+        m_exportProgressPermille.store(-1, std::memory_order_relaxed);
 
         std::string finalPathStr = geode::utils::string::pathToString(finalPath);
         double savedDuration = (result.durationSeconds > 0.0)
@@ -2997,13 +3082,15 @@ void ReplayManager::showSaveFeedback(SaveReplayResult result) {
                 2.0f
             )->show();
             break;
-        case SaveReplayResult::AlreadySaving:
-            geode::Notification::create(
-                "Previous replay is still saving...",
-                geode::NotificationIcon::Info,
-                1.5f
-            )->show();
+        case SaveReplayResult::AlreadySaving: {
+            const int pct = ReplayManager::get()->getExportProgressPercent();
+            std::string msg = "Previous replay is still saving...";
+            if (pct >= 0) {
+                msg += " (" + std::to_string(pct) + "%)";
+            }
+            geode::Notification::create(msg, geode::NotificationIcon::Info, 1.5f)->show();
             break;
+        }
         case SaveReplayResult::Started:
             break;
     }

@@ -1320,7 +1320,12 @@ void ReplayPopup::updateStatusDisplay(float dt) {
         if (!captureReady) {
             m_statusLabel->setString("Capture Hook Failed (Check Log)");
         } else if (mgr->isSaving()) {
-            m_statusLabel->setString("Saving Replay...");
+            const int pct = mgr->getExportProgressPercent();
+            if (pct >= 0) {
+                m_statusLabel->setString(("Saving Replay... " + std::to_string(pct) + "%").c_str());
+            } else {
+                m_statusLabel->setString("Saving Replay...");
+            }
         } else if (isStopping) {
             m_statusLabel->setString(mgr->isRestartPending() ? "Stopping (Restart Queued)..." : "Stopping...");
         } else if (isRec) {

@@ -9,6 +9,7 @@
 #include "../capture/FrameGrabber.hpp"
 #include "../capture/AudioGrabber.hpp"
 #include "MicMixFifo.hpp"
+#include <algorithm>
 #include <string>
 #include <vector>
 #include <deque>
@@ -68,6 +69,11 @@ public:
     bool isReplayLocked() const noexcept { return m_running.load() || m_stopping.load(); }
     bool isExportInFlight() const noexcept { return m_exportInFlight.load(); }
     bool isSaving() const noexcept { return m_savePending.load() || m_exportInFlight.load(); }
+    // Export progress in percent (0-100) while a replay is being merged, -1 when unknown/idle (W3).
+    int getExportProgressPercent() const noexcept {
+        const int permille = m_exportProgressPermille.load(std::memory_order_relaxed);
+        return (permille < 0) ? -1 : std::min(100, permille / 10);
+    }
     static bool isCaptureBackendReady() noexcept;
     bool isBackendUnavailable() const noexcept { return m_backendUnavailable.load() || !isCaptureBackendReady(); }
 
@@ -218,6 +224,8 @@ private:
     void cleanupTempDir();
     void joinFinalizeThread();
     void joinExportThread();
+    void waitForExportBeforeExit();
+    void cleanupStalePartialReplays();
     void joinStopThread();
     void finishStopCleanup();
 
@@ -265,6 +273,7 @@ private:
     std::atomic<bool> m_savePending{false};
     std::atomic<bool> m_saveRequested{false};
     std::atomic<bool> m_exportInFlight{false};
+    std::atomic<int> m_exportProgressPermille{-1};
     std::atomic<bool> m_shuttingDown{false};
     std::atomic<bool> m_backendUnavailable{false};
     uint64_t m_sessionId = 0; // guarded by m_queueMutex (#12, #13)
