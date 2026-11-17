@@ -455,6 +455,132 @@ void AudioGrabber::stopMicCapture() {
 }
 
 #ifdef GEODE_IS_WINDOWS
+namespace {
+
+// Endpoint notifications arrive on an MMDevice thread: only raise a flag there, the capture
+// thread re-evaluates the device and does all COM teardown itself (W6).
+class MicEndpointNotifier final : public IMMNotificationClient {
+public:
+    explicit MicEndpointNotifier(std::atomic<bool>& changed) noexcept : m_changed(changed) {}
+
+    ULONG STDMETHODCALLTYPE AddRef() override { return static_cast<ULONG>(InterlockedIncrement(&m_refs)); }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const LONG refs = InterlockedDecrement(&m_refs);
+        if (refs == 0) delete this;
+        return static_cast<ULONG>(refs);
+    }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+        if (!ppv) return E_POINTER;
+        if (riid == __uuidof(IUnknown) || riid == __uuidof(IMMNotificationClient)) {
+            *ppv = static_cast<IMMNotificationClient*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+
+    HRESULT STDMETHODCALLTYPE OnDeviceStateChanged(LPCWSTR, DWORD) override { signal(); return S_OK; }
+    HRESULT STDMETHODCALLTYPE OnDeviceAdded(LPCWSTR) override { signal(); return S_OK; }
+    HRESULT STDMETHODCALLTYPE OnDeviceRemoved(LPCWSTR) override { signal(); return S_OK; }
+    HRESULT STDMETHODCALLTYPE OnDefaultDeviceChanged(EDataFlow flow, ERole, LPCWSTR) override {
+        if (flow == eCapture || flow == eAll) signal();
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE OnPropertyValueChanged(LPCWSTR, const PROPERTYKEY) override { return S_OK; }
+
+private:
+    ~MicEndpointNotifier() = default;
+    void signal() noexcept { m_changed.store(true, std::memory_order_release); }
+
+    std::atomic<bool>& m_changed;
+    LONG m_refs = 1;
+};
+
+std::wstring endpointId(IMMDevice* device) {
+    std::wstring id;
+    LPWSTR raw = nullptr;
+    if (device && SUCCEEDED(device->GetId(&raw)) && raw) {
+        id = raw;
+        CoTaskMemFree(raw);
+    }
+    return id;
+}
+
+std::string endpointName(IMMDevice* device) {
+    std::string name;
+    ComRef<IPropertyStore> props;
+    if (device && SUCCEEDED(device->OpenPropertyStore(STGM_READ, props.put())) && props) {
+        PROPVARIANT pv;
+        PropVariantInit(&pv);
+        if (SUCCEEDED(props->GetValue(kPKEY_Device_FriendlyName, &pv)) && pv.vt == VT_LPWSTR && pv.pwszVal) {
+            name = geode::utils::string::wideToUtf8(pv.pwszVal);
+        }
+        PropVariantClear(&pv);
+    }
+    return name.empty() ? std::string("unknown device") : name;
+}
+
+// The device the user wants right now: the selected endpoint while it is active, otherwise the
+// system default capture device (eConsole first so Bluetooth headsets stay out of HFP mode).
+ComRef<IMMDevice> resolveWantedMic(IMMDeviceEnumerator* enumerator, const std::wstring& selectedId, bool& outIsFallback) {
+    outIsFallback = false;
+    ComRef<IMMDevice> device;
+    if (!selectedId.empty()) {
+        if (SUCCEEDED(enumerator->GetDevice(selectedId.c_str(), device.put())) && device) {
+            DWORD state = 0;
+            if (FAILED(device->GetState(&state)) || state != DEVICE_STATE_ACTIVE) {
+                device.reset();
+            }
+        } else {
+            device.reset();
+        }
+        if (device) return device;
+        outIsFallback = true;
+    }
+    if (FAILED(enumerator->GetDefaultAudioEndpoint(eCapture, eConsole, device.put())) || !device) {
+        device.reset();
+        if (FAILED(enumerator->GetDefaultAudioEndpoint(eCapture, eCommunications, device.put())) || !device) {
+            device.reset();
+        }
+    }
+    return device;
+}
+
+bool isAllZeroBytes(const BYTE* data, size_t bytes) noexcept {
+    if (!data) return true;
+    for (size_t i = 0; i < bytes; ++i) {
+        if (data[i] != 0) return false;
+    }
+    return true;
+}
+
+} // namespace
+
+// Logs one line per microphone state transition (W6).
+static void updateWinMicStatus(std::atomic<MicCaptureStatus>& status, MicCaptureStatus next, const std::string& deviceName) {
+    const MicCaptureStatus prev = status.exchange(next, std::memory_order_acq_rel);
+    if (prev == next) return;
+    switch (next) {
+        case MicCaptureStatus::Active:
+            geode::log::info("Instant Replay: microphone capture active on '{}'", deviceName);
+            break;
+        case MicCaptureStatus::UsingFallbackDevice:
+            geode::log::warn("Instant Replay: selected microphone unavailable, using default input '{}'", deviceName);
+            break;
+        case MicCaptureStatus::NoInputDevice:
+            geode::log::warn("Instant Replay: no microphone input device available");
+            break;
+        case MicCaptureStatus::DigitalSilenceDetected:
+            geode::log::warn(
+                "Instant Replay: microphone '{}' delivers digital silence (check Settings > Privacy > Microphone access for desktop apps)",
+                deviceName);
+            break;
+        default:
+            break;
+    }
+}
+
 void AudioGrabber::micCaptureThreadFunc() {
     HRESULT coHr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
     DWORD mmcssTaskIdx = 0;
@@ -464,15 +590,36 @@ void AudioGrabber::micCaptureThreadFunc() {
     LARGE_INTEGER qpcFreq{};
     QueryPerformanceFrequency(&qpcFreq);
 
-    auto sleepInterruptible = [this](int totalMs) {
+    // Follow device arrival/removal and default-device changes, so a reconnected selected mic is
+    // picked up again and "Default System Device" follows Windows' default (W6).
+    std::atomic<bool> deviceChanged{false};
+    MicEndpointNotifier* notifier = nullptr;
+    ComRef<IMMDeviceEnumerator> notifyEnumerator;
+    if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_ALL,
+                                   __uuidof(IMMDeviceEnumerator), (void**)notifyEnumerator.put())) && notifyEnumerator) {
+        notifier = new MicEndpointNotifier(deviceChanged);
+        if (FAILED(notifyEnumerator->RegisterEndpointNotificationCallback(notifier))) {
+            notifier->Release();
+            notifier = nullptr;
+        }
+    }
+
+    auto sleepInterruptible = [this, &deviceChanged](int totalMs) {
         int elapsed = 0;
-        while (elapsed < totalMs && m_micRunning.load()) {
+        while (elapsed < totalMs && m_micRunning.load() && !deviceChanged.load(std::memory_order_acquire)) {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
             elapsed += 50;
         }
     };
 
+    const std::string selectedIdUtf8 = ReplayManager::get()->getSessionConfig().getMicDeviceId();
+    const std::wstring selectedId = (!selectedIdUtf8.empty() && selectedIdUtf8 != "default")
+        ? geode::utils::string::utf8ToWide(selectedIdUtf8)
+        : std::wstring();
+    std::wstring lastDeviceId;
+
     while (m_micRunning.load()) {
+        deviceChanged.store(false, std::memory_order_release);
         ComRef<IMMDeviceEnumerator> enumerator;
         HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_ALL,
                                       __uuidof(IMMDeviceEnumerator), (void**)enumerator.put());
@@ -481,35 +628,16 @@ void AudioGrabber::micCaptureThreadFunc() {
             continue;
         }
 
-        ComRef<IMMDevice> device;
-        std::string targetId = ReplayManager::get()->getSessionConfig().getMicDeviceId();
-
-        if (!targetId.empty() && targetId != "default") {
-            std::wstring wideId = geode::utils::string::utf8ToWide(targetId);
-            if (!wideId.empty()) {
-                if (SUCCEEDED(enumerator->GetDevice(wideId.c_str(), device.put())) && device) {
-                    DWORD state = 0;
-                    if (FAILED(device->GetState(&state)) || state != DEVICE_STATE_ACTIVE) {
-                        device.reset();
-                    }
-                } else {
-                    device.reset();
-                }
-            }
-        }
-
+        bool usingFallback = false;
+        ComRef<IMMDevice> device = resolveWantedMic(enumerator.get(), selectedId, usingFallback);
         if (!device) {
-            // Prefer eConsole first so Bluetooth headsets are not forced into low-quality HFP profile
-            hr = enumerator->GetDefaultAudioEndpoint(eCapture, eConsole, device.put());
-            if (FAILED(hr)) {
-                hr = enumerator->GetDefaultAudioEndpoint(eCapture, eCommunications, device.put());
-            }
-        }
-
-        if (FAILED(hr) || !device) {
+            updateWinMicStatus(m_micStatus, MicCaptureStatus::NoInputDevice, {});
+            lastDeviceId.clear();
             sleepInterruptible(1000);
             continue;
         }
+        const std::wstring deviceId = endpointId(device.get());
+        const std::string deviceName = endpointName(device.get());
 
         ComRef<IAudioClient> audioClient;
         hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, NULL, (void**)audioClient.put());
@@ -543,11 +671,20 @@ void AudioGrabber::micCaptureThreadFunc() {
         }
 
         bool deviceLost = false;
+        bool switchDevice = false;
         if (SUCCEEDED(hr) && audioClient) {
             ComRef<IAudioCaptureClient> captureClient;
             hr = audioClient->GetService(__uuidof(IAudioCaptureClient), (void**)captureClient.put());
             if (SUCCEEDED(hr) && captureClient) {
                 audioClient->Start();
+
+                const MicCaptureStatus liveStatus = usingFallback ? MicCaptureStatus::UsingFallbackDevice : MicCaptureStatus::Active;
+                if (deviceId != lastDeviceId && !lastDeviceId.empty() &&
+                    m_micStatus.load(std::memory_order_acquire) == liveStatus) {
+                    geode::log::info("Instant Replay: microphone capture switched to '{}'", deviceName);
+                }
+                updateWinMicStatus(m_micStatus, liveStatus, deviceName);
+                lastDeviceId = deviceId;
 
                 bool isFloat = false;
                 if (pwfx->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) {
@@ -563,11 +700,25 @@ void AudioGrabber::micCaptureThreadFunc() {
                     timeBeginPeriod(1);
                 }
 
+                // Digital silence detector: ~3 s of AUDCLNT_BUFFERFLAGS_SILENT or exact zeros usually means
+                // Windows privacy settings block microphone access for desktop apps (W6).
+                const int64_t silenceThresholdFrames = static_cast<int64_t>(std::max<DWORD>(1, pwfx->nSamplesPerSec)) * 3;
+                int64_t silentFrames = 0;
+
                 while (m_micRunning.load()) {
                     if (eventDriven) {
                         WaitForSingleObject(hWakeEvent, 20);
                     } else {
                         std::this_thread::sleep_for(std::chrono::milliseconds(4));
+                    }
+
+                    if (deviceChanged.exchange(false, std::memory_order_acq_rel)) {
+                        bool wantedFallback = false;
+                        ComRef<IMMDevice> wanted = resolveWantedMic(enumerator.get(), selectedId, wantedFallback);
+                        if (wanted && endpointId(wanted.get()) != deviceId) {
+                            switchDevice = true;
+                            break;
+                        }
                     }
 
                     UINT32 packetLength = 0;
@@ -594,6 +745,20 @@ void AudioGrabber::micCaptureThreadFunc() {
                             int channels = pwfx->nChannels;
                             int sampleRate = pwfx->nSamplesPerSec;
                             size_t totalSamples = static_cast<size_t>(numFrames) * channels;
+
+                            const bool silentPacket = (flags & AUDCLNT_BUFFERFLAGS_SILENT) ||
+                                isAllZeroBytes(pData, static_cast<size_t>(numFrames) * pwfx->nBlockAlign);
+                            if (silentPacket) {
+                                silentFrames += numFrames;
+                                if (silentFrames >= silenceThresholdFrames) {
+                                    updateWinMicStatus(m_micStatus, MicCaptureStatus::DigitalSilenceDetected, deviceName);
+                                }
+                            } else {
+                                silentFrames = 0;
+                                if (m_micStatus.load(std::memory_order_acquire) == MicCaptureStatus::DigitalSilenceDetected) {
+                                    updateWinMicStatus(m_micStatus, liveStatus, deviceName);
+                                }
+                            }
 
                             // Compute packet start timestamp using overflow-safe 64-bit QPC arithmetic (#6)
                             auto now = std::chrono::steady_clock::now();
@@ -671,11 +836,26 @@ void AudioGrabber::micCaptureThreadFunc() {
         if (hWakeEvent) CloseHandle(hWakeEvent);
         if (pwfx) CoTaskMemFree(pwfx);
 
+        if (deviceLost) {
+            geode::log::info("Instant Replay: microphone '{}' was lost, re-selecting input device", deviceName);
+        }
         if (m_micRunning.load()) {
             m_micResampler.reset();
-            sleepInterruptible(deviceLost ? 500 : 1000);
+            if (!switchDevice) {
+                sleepInterruptible(deviceLost ? 500 : 1000);
+            }
         }
     }
+
+    if (notifier) {
+        if (notifyEnumerator) {
+            notifyEnumerator->UnregisterEndpointNotificationCallback(notifier);
+        }
+        notifier->Release();
+        notifier = nullptr;
+    }
+    notifyEnumerator.reset();
+    m_micStatus.store(MicCaptureStatus::Idle, std::memory_order_release);
 
     if (hMmcss) {
         AvRevertMmThreadCharacteristics(hMmcss);

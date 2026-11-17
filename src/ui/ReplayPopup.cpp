@@ -1343,6 +1343,10 @@ void ReplayPopup::updateStatusDisplay(float dt) {
                     m_statusLabel->setString("Replay Active (Mic Blocked - Use Steam)");
                 } else if (micSt == MicCaptureStatus::DigitalSilenceDetected) {
                     m_statusLabel->setString("Replay Active (Mic Silent - Check Privacy)");
+                } else if (micSt == MicCaptureStatus::UsingFallbackDevice) {
+                    m_statusLabel->setString("Replay Active (Mic: Using Default Device)");
+                } else if (micSt == MicCaptureStatus::NoInputDevice) {
+                    m_statusLabel->setString("Replay Active (No Microphone Found)");
                 } else {
                     m_statusLabel->setString("Replay Active (Settings Locked)");
                 }
