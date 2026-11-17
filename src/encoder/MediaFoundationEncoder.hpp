@@ -7,6 +7,7 @@
 #include "../config/BitrateMath.hpp"
 #include "../config/CodecUtils.hpp"
 #include "../config/ReplayConfig.hpp"
+#include "SegmentAudioLayout.hpp"
 #include "VideoEncoderTypes.hpp"
 #include <windows.h>
 #include <mfapi.h>
@@ -19,6 +20,7 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <atomic>
 #include <mutex>
 #include <functional>
 
@@ -79,10 +81,24 @@ public:
     // cannot be remuxed into one file without re-encoding.
     const std::string& formatKey() const noexcept { return m_formatKey; }
 
-    // Remuxes the segments (oldest first) into finalOutputPath without re-encoding.
-    // trimStartSeconds drops that much from the beginning of the first segment
-    // (cut is aligned to the nearest video keyframe). Any read/write/finalize
-    // failure is reported and the partial output file is deleted.
+    struct SegmentDesc {
+        std::filesystem::path path;
+        double durationSeconds = 0.0;  // used for export progress only
+        int64_t gameAudioFrames = -1;  // real (non-padding) frames written to the game track, -1 = unknown
+        int64_t micAudioFrames = -1;   // real frames written to the split microphone track, -1 = unknown
+    };
+
+    // Merges the segments (oldest first) into finalOutputPath: video is remuxed without
+    // re-encoding, audio tracks are decoded, stripped of the segment pre-roll / AAC padding
+    // and re-encoded as one continuous AAC stream per track (W2). trimStartSeconds drops that
+    // much from the beginning of the first segment (cut aligned to the nearest video keyframe).
+    // Any read/write/finalize failure is reported and the partial output file is deleted.
+    static ConcatResult concatenateSegments(
+        const std::vector<SegmentDesc>& segments,
+        const std::filesystem::path& finalOutputPath,
+        double trimStartSeconds = 0.0,
+        std::atomic<int>* progressPermille = nullptr
+    );
     static ConcatResult concatenateSegments(
         const std::vector<std::filesystem::path>& segmentPaths,
         const std::filesystem::path& finalOutputPath,
@@ -108,6 +124,8 @@ private:
     bool createVideoSample(IMFMediaBuffer* videoBuffer, int64_t timestampHns, IMFSample** ppSample, HRESULT& outHr);
     bool createAudioSample(const float* pcmFloat, int numSamples, int channels, int sampleRate,
                            int64_t timestampHns, IMFSample** ppSample, HRESULT& outHr);
+    EncoderOpResult writeAudioLocked(bool isGameAudio, const float* pcmFloat, int numSamples, int channels,
+                                     int sampleRate, int64_t timestampHns);
 
     IMFSinkWriter* m_sinkWriter = nullptr;
     DWORD m_videoStreamIndex = 0;
@@ -125,6 +143,8 @@ private:
     bool m_activeHardware = true;
     int m_activeBitrateMbps = 0;
     int m_activeMaxBitrateMbps = 0;
+    bool m_gamePrerollWritten = false;
+    bool m_micPrerollWritten = false;
     CodecBitrateTable m_familyBitrates{};
 
     int64_t m_videoFrameDurationHns = 0;

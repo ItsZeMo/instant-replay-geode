@@ -37,6 +37,7 @@ set(IR_SOURCES
 if (WIN32)
     list(APPEND IR_SOURCES
         src/encoder/MediaFoundationEncoder.cpp
+        src/encoder/MfSegmentConcat.cpp
     )
 elseif (APPLE AND NOT IOS)
     set(IR_OBJCXX_SOURCES

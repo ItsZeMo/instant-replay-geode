@@ -5,6 +5,7 @@
 #include <mfreadwrite.h>
 #include <mferror.h>
 
+#include <atomic>
 #include <cassert>
 #include <chrono>
 #include <cmath>
@@ -23,6 +24,8 @@
 #include "config/BitrateMath.hpp"
 #include "config/CodecUtils.hpp"
 #include "encoder/ConcatTimestampMath.hpp"
+#include "encoder/MfSegmentConcat.hpp"
+#include "encoder/SegmentAudioLayout.hpp"
 #include "recorder/MicMixFifo.hpp"
 
 #pragma comment(lib, "mfplat.lib")
@@ -864,6 +867,265 @@ void testCodecFallbackBitratesW1() {
 
     std::cout << "  PASS Test W1\n";
 }
+
+// Writes one segment the way MediaFoundationEncoder does since W2: H.264 video plus AAC tracks that
+// start with kSegmentAudioPrerollHns of silence, with the real audio shifted by the pre-roll.
+void writePrerollSegment(
+    const std::wstring& path,
+    double videoDurationSec,
+    const std::vector<std::vector<int16_t>>& tracks, // interleaved stereo int16 per audio track
+    UINT32 fps = 30
+) {
+    DeleteFileW(path.c_str());
+    LocalComRef<IMFAttributes> attr;
+    CHECK_HR(MFCreateAttributes(attr.put(), 2));
+    attr->SetUINT32(MF_SINK_WRITER_DISABLE_THROTTLING, TRUE);
+    attr->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, FALSE);
+    LocalComRef<IMFSinkWriter> writer;
+    CHECK_HR(MFCreateSinkWriterFromURL(path.c_str(), nullptr, attr.get(), writer.put()));
+
+    const UINT32 width = 128, height = 72;
+    DWORD videoIdx = 0;
+    {
+        LocalComRef<IMFMediaType> vOut, vIn;
+        CHECK_HR(MFCreateMediaType(vOut.put()));
+        vOut->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+        vOut->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
+        vOut->SetUINT32(MF_MT_AVG_BITRATE, 500000);
+        vOut->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+        MFSetAttributeSize(vOut.get(), MF_MT_FRAME_SIZE, width, height);
+        MFSetAttributeRatio(vOut.get(), MF_MT_FRAME_RATE, fps, 1);
+        MFSetAttributeRatio(vOut.get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+        CHECK_HR(writer->AddStream(vOut.get(), &videoIdx));
+        CHECK_HR(MFCreateMediaType(vIn.put()));
+        vIn->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+        vIn->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
+        vIn->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+        MFSetAttributeSize(vIn.get(), MF_MT_FRAME_SIZE, width, height);
+        MFSetAttributeRatio(vIn.get(), MF_MT_FRAME_RATE, fps, 1);
+        MFSetAttributeRatio(vIn.get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+        CHECK_HR(writer->SetInputMediaType(videoIdx, vIn.get(), nullptr));
+    }
+    std::vector<DWORD> audioIdx(tracks.size(), 0);
+    for (size_t t = 0; t < tracks.size(); ++t) {
+        LocalComRef<IMFMediaType> aOut, aIn;
+        CHECK_HR(MFCreateMediaType(aOut.put()));
+        aOut->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+        aOut->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_AAC);
+        aOut->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
+        aOut->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, 48000);
+        aOut->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, 2);
+        aOut->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, t == 0 ? 24000 : 16000);
+        CHECK_HR(writer->AddStream(aOut.get(), &audioIdx[t]));
+        CHECK_HR(MFCreateMediaType(aIn.put()));
+        aIn->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+        aIn->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM);
+        aIn->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
+        aIn->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, 48000);
+        aIn->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, 2);
+        aIn->SetUINT32(MF_MT_AUDIO_BLOCK_ALIGNMENT, 4);
+        aIn->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 48000 * 4);
+        CHECK_HR(writer->SetInputMediaType(audioIdx[t], aIn.get(), nullptr));
+    }
+    CHECK_HR(writer->BeginWriting());
+
+    auto writeAudio = [&](size_t t, const int16_t* data, int64_t frames, int64_t startFrame) {
+        const DWORD bytes = static_cast<DWORD>(frames * 4);
+        LocalComRef<IMFMediaBuffer> buf;
+        CHECK_HR(MFCreateMemoryBuffer(bytes, buf.put()));
+        BYTE* p = nullptr;
+        CHECK_HR(buf->Lock(&p, nullptr, nullptr));
+        if (data) memcpy(p, data, bytes); else memset(p, 0, bytes);
+        buf->Unlock();
+        buf->SetCurrentLength(bytes);
+        LocalComRef<IMFSample> smp;
+        CHECK_HR(MFCreateSample(smp.put()));
+        smp->AddBuffer(buf.get());
+        smp->SetSampleTime((startFrame * 10000000LL) / 48000LL);
+        smp->SetSampleDuration((frames * 10000000LL) / 48000LL);
+        CHECK_HR(writer->WriteSample(audioIdx[t], smp.get()));
+    };
+
+    const int64_t preroll = replay::segmentAudioPrerollFrames(48000);
+    std::vector<int64_t> written(tracks.size(), 0);
+    for (size_t t = 0; t < tracks.size(); ++t) writeAudio(t, nullptr, preroll, 0);
+
+    const int numFrames = static_cast<int>(std::llround(videoDurationSec * fps));
+    const LONGLONG frameDurHns = 10000000LL / fps;
+    const DWORD frameBytes = width * height * 4;
+    for (int f = 0; f < numFrames; ++f) {
+        LocalComRef<IMFMediaBuffer> buf;
+        CHECK_HR(MFCreateMemoryBuffer(frameBytes, buf.put()));
+        BYTE* p = nullptr;
+        CHECK_HR(buf->Lock(&p, nullptr, nullptr));
+        memset(p, static_cast<int>((f * 7) & 0xFF), frameBytes);
+        buf->Unlock();
+        buf->SetCurrentLength(frameBytes);
+        LocalComRef<IMFSample> smp;
+        CHECK_HR(MFCreateSample(smp.put()));
+        smp->AddBuffer(buf.get());
+        smp->SetSampleTime(static_cast<LONGLONG>(f) * frameDurHns);
+        smp->SetSampleDuration(frameDurHns);
+        CHECK_HR(writer->WriteSample(videoIdx, smp.get()));
+        // Interleave ~10 ms audio packets up to the end of this frame, like WASAPI/FMOD delivery.
+        const int64_t target = ((f + 1) * frameDurHns * 48000LL) / 10000000LL;
+        for (size_t t = 0; t < tracks.size(); ++t) {
+            const int64_t total = static_cast<int64_t>(tracks[t].size() / 2);
+            while (written[t] < std::min(target, total)) {
+                const int64_t n = std::min<int64_t>(480, std::min(target, total) - written[t]);
+                writeAudio(t, tracks[t].data() + written[t] * 2, n, preroll + written[t]);
+                written[t] += n;
+            }
+        }
+    }
+    for (size_t t = 0; t < tracks.size(); ++t) {
+        const int64_t total = static_cast<int64_t>(tracks[t].size() / 2);
+        while (written[t] < total) {
+            const int64_t n = std::min<int64_t>(480, total - written[t]);
+            writeAudio(t, tracks[t].data() + written[t] * 2, n, preroll + written[t]);
+            written[t] += n;
+        }
+    }
+    CHECK_HR(writer->Finalize());
+}
+
+// Decodes the N-th audio track to the left channel (float), placed by sample timestamps.
+std::vector<float> decodeAudioTrack(const std::wstring& path, int ordinal) {
+    LocalComRef<IMFSourceReader> reader;
+    CHECK_HR(MFCreateSourceReaderFromURL(path.c_str(), nullptr, reader.put()));
+    reader->SetStreamSelection(static_cast<DWORD>(MF_SOURCE_READER_ALL_STREAMS), FALSE);
+    DWORD stream = MAXDWORD;
+    int seen = 0;
+    for (DWORD s = 0; s < 16; ++s) {
+        LocalComRef<IMFMediaType> t;
+        HRESULT hr = reader->GetNativeMediaType(s, 0, t.put());
+        if (hr == MF_E_INVALIDSTREAMNUMBER) break;
+        CHECK_HR(hr);
+        GUID major = GUID_NULL;
+        t->GetGUID(MF_MT_MAJOR_TYPE, &major);
+        if (major == MFMediaType_Audio && seen++ == ordinal) { stream = s; break; }
+    }
+    CHECK(stream != MAXDWORD);
+    CHECK_HR(reader->SetStreamSelection(stream, TRUE));
+    LocalComRef<IMFMediaType> pcm;
+    CHECK_HR(MFCreateMediaType(pcm.put()));
+    pcm->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+    pcm->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_Float);
+    CHECK_HR(reader->SetCurrentMediaType(stream, nullptr, pcm.get()));
+    std::vector<float> left;
+    while (true) {
+        DWORD flags = 0;
+        LONGLONG ts = 0;
+        LocalComRef<IMFSample> smp;
+        CHECK_HR(reader->ReadSample(stream, 0, nullptr, &flags, &ts, smp.put()));
+        if (smp) {
+            LocalComRef<IMFMediaBuffer> buf;
+            CHECK_HR(smp->ConvertToContiguousBuffer(buf.put()));
+            BYTE* p = nullptr;
+            DWORD len = 0;
+            CHECK_HR(buf->Lock(&p, nullptr, &len));
+            const float* f = reinterpret_cast<const float*>(p);
+            const size_t n = len / 8;
+            const size_t pos = static_cast<size_t>(std::llround(static_cast<double>(ts) * 48000.0 / 1e7));
+            if (left.size() < pos + n) left.resize(pos + n, 0.0f);
+            for (size_t k = 0; k < n; ++k) left[pos + k] = f[k * 2];
+            buf->Unlock();
+        }
+        if (flags & MF_SOURCE_READERF_ENDOFSTREAM) break;
+    }
+    return left;
+}
+
+std::vector<int16_t> sineSegment(int64_t firstFrame, int64_t frames, double hz, double amp) {
+    std::vector<int16_t> pcm(static_cast<size_t>(frames) * 2);
+    for (int64_t i = 0; i < frames; ++i) {
+        const double t = static_cast<double>(firstFrame + i) / 48000.0;
+        const auto v = static_cast<int16_t>(std::lround(std::sin(2.0 * 3.14159265358979323846 * hz * t) * amp));
+        pcm[static_cast<size_t>(i) * 2] = v;
+        pcm[static_cast<size_t>(i) * 2 + 1] = v;
+    }
+    return pcm;
+}
+
+// Every 5 ms window from `fromSec` to the end minus 25 ms stays within +-1 dB of the sine's RMS.
+int countSeamDropouts(const std::vector<float>& left, double amp, double fromSec, double* outMinDb) {
+    const size_t win = 240;
+    const double nominal = amp / 32768.0 / std::sqrt(2.0);
+    const double lo = nominal * std::pow(10.0, -1.0 / 20.0);
+    const double hi = nominal * std::pow(10.0, 1.0 / 20.0);
+    int bad = 0;
+    double minDb = 0.0;
+    const size_t start = static_cast<size_t>(fromSec * 48000.0);
+    for (size_t w0 = start; w0 + win + 1200 <= left.size(); w0 += win) {
+        double acc = 0.0;
+        for (size_t k = 0; k < win; ++k) acc += static_cast<double>(left[w0 + k]) * left[w0 + k];
+        const double rms = std::sqrt(acc / win);
+        minDb = std::min(minDb, 20.0 * std::log10(std::max(rms, 1e-9) / nominal));
+        if (rms < lo || rms > hi) ++bad;
+    }
+    if (outMinDb) *outMinDb = minDb;
+    return bad;
+}
+
+void testExportAudioSeamsW2() {
+    std::cout << "[Test W2] Export re-encodes continuous AAC: no dropouts at segment seams...\n";
+    auto tmp = std::filesystem::temp_directory_path() / L"ir_host_test_w2";
+    std::filesystem::create_directories(tmp);
+
+    constexpr int64_t kSegFrames = 96000; // 2.0 s per segment
+    constexpr double kAmp = 16000.0;
+    std::vector<replay::mfconcat::SegmentInput> inputs;
+    for (int seg = 0; seg < 3; ++seg) {
+        auto path = (tmp / (L"w2_seg" + std::to_wstring(seg) + L".mp4")).wstring();
+        writePrerollSegment(path, 2.0, {
+            sineSegment(seg * kSegFrames, kSegFrames, 441.0, kAmp),
+            sineSegment(seg * kSegFrames, kSegFrames, 300.0, kAmp)
+        });
+        replay::mfconcat::SegmentInput in;
+        in.path = path;
+        in.durationSeconds = 2.0;
+        in.audioFrames[0] = kSegFrames;
+        in.audioFrames[1] = kSegFrames;
+        inputs.push_back(in);
+    }
+
+    replay::mfconcat::Options opt;
+    opt.audioPrerollHns = replay::kSegmentAudioPrerollHns;
+    std::atomic<int> progress{-1};
+    opt.progressPermille = &progress;
+    int warnings = 0;
+    opt.logWarn = [&warnings](const std::string& msg) { ++warnings; std::cout << "  warn: " << msg << "\n"; };
+
+    auto out = (tmp / L"w2_out.mp4.part").wstring(); // exporter writes a temporary *.mp4.part (W3)
+    auto res = replay::mfconcat::concatenate(inputs, out, 0.0, opt);
+    if (!res.success) std::cerr << "  concat error: " << res.error << "\n";
+    CHECK(res.success);
+    CHECK(std::abs(res.durationSeconds - 6.0) < 0.05);
+    CHECK(progress.load() == 1000);
+    CHECK(warnings == 0);
+
+    for (int track = 0; track < 2; ++track) {
+        auto left = decodeAudioTrack(out, track);
+        CHECK(left.size() >= static_cast<size_t>(3 * kSegFrames - 2048));
+        double minDb = 0.0;
+        // Skip the first 20 ms: the output's own AAC stream start (single, unavoidable).
+        const int bad = countSeamDropouts(left, kAmp, 0.020, &minDb);
+        std::cout << "  track " << track << ": windows outside +-1 dB = " << bad << " (min " << minDb << " dB)\n";
+        CHECK(bad == 0);
+    }
+
+    // Trimmed export keeps the stitched audio continuous as well.
+    auto outTrim = (tmp / L"w2_trim.mp4").wstring();
+    auto resTrim = replay::mfconcat::concatenate(inputs, outTrim, 0.7, opt);
+    CHECK(resTrim.success);
+    CHECK(resTrim.durationSeconds > 4.0 && resTrim.durationSeconds <= 6.0);
+    auto leftTrim = decodeAudioTrack(outTrim, 0);
+    CHECK(countSeamDropouts(leftTrim, kAmp, 0.020, nullptr) == 0);
+
+    std::error_code ec;
+    std::filesystem::remove_all(tmp, ec);
+    std::cout << "  PASS Test W2\n";
+}
 } // namespace
 
 int main() {
@@ -872,6 +1134,7 @@ int main() {
     CHECK_HR(MFStartup(MF_VERSION));
 
     testConcatAndC1SeamMath();
+    testExportAudioSeamsW2();
     testFrameBudgetAnd4KPool();
     testGameAudioRing();
     testMicMixFifo();

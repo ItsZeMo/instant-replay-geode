@@ -1,5 +1,6 @@
 #include "MediaFoundationEncoder.hpp"
 #include "ConcatTimestampMath.hpp"
+#include "MfSegmentConcat.hpp"
 
 #ifdef GEODE_IS_WINDOWS
 
@@ -190,6 +191,8 @@ EncoderOpResult MediaFoundationEncoder::start(
     m_activeHardware = hardwareAcceleration;
     m_activeBitrateMbps = 0;
     m_activeMaxBitrateMbps = 0;
+    m_gamePrerollWritten = false;
+    m_micPrerollWritten = false;
 
     bool enableHardware = hardwareAcceleration;
     const CodecTargetSpec resolvedSpec = resolveRequestedCodecSpec(
@@ -296,9 +299,10 @@ EncoderOpResult MediaFoundationEncoder::start(
         if (started) {
             std::string codecLabel = std::string(subtypeName(attempt.subtype)) + (attempt.hardware ? " (HW)" : " (SW)");
             char key[180];
-            snprintf(key, sizeof(key), "%s|%s|%dx%d|%d|a%d|s%d",
+            snprintf(key, sizeof(key), "%s|%s|%dx%d|%d|a%d|s%d|pre%lld",
                      subtypeName(attempt.subtype), attempt.hardware ? "hw" : "sw",
-                     width, height, fps, params.gameSampleRate, splitAudio ? 1 : 0);
+                     width, height, fps, params.gameSampleRate, splitAudio ? 1 : 0,
+                     static_cast<long long>(kSegmentAudioPrerollHns / 10000));
             m_formatKey = key;
             m_activeSubtype = attempt.subtype;
             m_activeHardware = attempt.hardware;
@@ -697,20 +701,7 @@ EncoderOpResult MediaFoundationEncoder::writeGameAudio(
     int64_t timestampHns
 ) {
     std::lock_guard<std::mutex> lock(m_mutex);
-    if (!m_recording || !m_sinkWriter) {
-        return makeMfFailure(MF_E_NOT_INITIALIZED, "encoder not recording");
-    }
-
-    ComRef<IMFSample> sample;
-    HRESULT hr = E_FAIL;
-    if (!createAudioSample(pcmFloat, numSamples, channels, sampleRate, timestampHns, sample.put(), hr)) {
-        return makeMfFailure(hr, hrToString(hr));
-    }
-    hr = m_sinkWriter->WriteSample(m_gameAudioStreamIndex, sample.get());
-    if (FAILED(hr)) {
-        return makeMfFailure(hr, hrToString(hr));
-    }
-    return {true, S_OK, {}};
+    return writeAudioLocked(true, pcmFloat, numSamples, channels, sampleRate, timestampHns);
 }
 
 EncoderOpResult MediaFoundationEncoder::writeMicAudio(
@@ -721,16 +712,54 @@ EncoderOpResult MediaFoundationEncoder::writeMicAudio(
     int64_t timestampHns
 ) {
     std::lock_guard<std::mutex> lock(m_mutex);
-    if (!m_recording || !m_sinkWriter || !m_splitAudio) {
+    if (!m_splitAudio) {
         return makeMfFailure(MF_E_NOT_INITIALIZED, "encoder not recording");
+    }
+    return writeAudioLocked(false, pcmFloat, numSamples, channels, sampleRate, timestampHns);
+}
+
+// Caller must hold m_mutex. Every AAC track starts with kSegmentAudioPrerollHns of silence and all
+// real audio is shifted by it, because MF's AAC encoder cannot reproduce the first ~11 ms of a stream;
+// the exporter drops the pre-roll again (W2).
+EncoderOpResult MediaFoundationEncoder::writeAudioLocked(
+    bool isGameAudio,
+    const float* pcmFloat,
+    int numSamples,
+    int channels,
+    int sampleRate,
+    int64_t timestampHns
+) {
+    if (!m_recording || !m_sinkWriter) {
+        return makeMfFailure(MF_E_NOT_INITIALIZED, "encoder not recording");
+    }
+    const DWORD streamIndex = isGameAudio ? m_gameAudioStreamIndex : m_micAudioStreamIndex;
+    bool& prerollWritten = isGameAudio ? m_gamePrerollWritten : m_micPrerollWritten;
+
+    if (!prerollWritten) {
+        const int rate = (sampleRate > 0) ? sampleRate : 48000;
+        const int prerollFrames = static_cast<int>(segmentAudioPrerollFrames(rate));
+        if (prerollFrames > 0) {
+            std::vector<float> silence(static_cast<size_t>(prerollFrames) * 2, 0.0f);
+            ComRef<IMFSample> prerollSample;
+            HRESULT prerollHr = E_FAIL;
+            if (!createAudioSample(silence.data(), prerollFrames, 2, rate, 0, prerollSample.put(), prerollHr)) {
+                return makeMfFailure(prerollHr, hrToString(prerollHr));
+            }
+            prerollHr = m_sinkWriter->WriteSample(streamIndex, prerollSample.get());
+            if (FAILED(prerollHr)) {
+                return makeMfFailure(prerollHr, hrToString(prerollHr));
+            }
+        }
+        prerollWritten = true;
     }
 
     ComRef<IMFSample> sample;
     HRESULT hr = E_FAIL;
-    if (!createAudioSample(pcmFloat, numSamples, channels, sampleRate, timestampHns, sample.put(), hr)) {
+    if (!createAudioSample(pcmFloat, numSamples, channels, sampleRate,
+                           timestampHns + kSegmentAudioPrerollHns, sample.put(), hr)) {
         return makeMfFailure(hr, hrToString(hr));
     }
-    hr = m_sinkWriter->WriteSample(m_micAudioStreamIndex, sample.get());
+    hr = m_sinkWriter->WriteSample(streamIndex, sample.get());
     if (FAILED(hr)) {
         return makeMfFailure(hr, hrToString(hr));
     }
@@ -775,296 +804,35 @@ bool MediaFoundationEncoder::finishLocked() {
 }
 
 // ---------------------------------------------------------------------------
-// Segment merge (remux, no re-encode)
+// Segment merge (video remux + continuous AAC re-encode, see MfSegmentConcat.cpp)
 // ---------------------------------------------------------------------------
 
-namespace {
-
-ConcatResult concatenateImpl(
-    const std::vector<std::wstring>& segmentPaths,
-    const std::wstring& finalOutputPath,
-    double trimStartSeconds
-) {
-    ConcatResult res;
-    auto fail = [&res](std::string msg) -> ConcatResult& {
-        res.success = false;
-        res.error = std::move(msg);
-        return res;
-    };
-
-    if (segmentPaths.empty()) return fail("no recorded segments");
-
-    ComRef<IMFAttributes> readerAttr;
-    HRESULT hr = MFCreateAttributes(readerAttr.put(), 1);
-    if (FAILED(hr)) return fail("MFCreateAttributes: " + hrToString(hr));
-    readerAttr->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, FALSE);
-
-    // 1. Discover the stream layout from the first segment
-    struct StreamInfo { DWORD readerIndex; DWORD writerIndex; bool isVideo; };
-    std::vector<StreamInfo> streams;
-    LONGLONG videoFrameDurationHns = 0;
-
-    ComRef<IMFSinkWriter> writer;
-    {
-        ComRef<IMFSourceReader> firstReader;
-        hr = MFCreateSourceReaderFromURL(segmentPaths[0].c_str(), readerAttr.get(), firstReader.put());
-        if (FAILED(hr) || !firstReader) return fail("cannot open first segment: " + hrToString(hr));
-
-        ComRef<IMFAttributes> writerAttr;
-        hr = MFCreateAttributes(writerAttr.put(), 1);
-        if (FAILED(hr)) return fail("MFCreateAttributes: " + hrToString(hr));
-        writerAttr->SetUINT32(MF_SINK_WRITER_DISABLE_THROTTLING, TRUE);
-
-        hr = MFCreateSinkWriterFromURL(finalOutputPath.c_str(), NULL, writerAttr.get(), writer.put());
-        if (FAILED(hr) || !writer) return fail("cannot create output file: " + hrToString(hr));
-
-        for (DWORD s = 0; s < 16; ++s) {
-            ComRef<IMFMediaType> type;
-            hr = firstReader->GetNativeMediaType(s, 0, type.put());
-            if (hr == MF_E_INVALIDSTREAMNUMBER) break;
-            if (FAILED(hr) || !type) return fail("cannot read stream type: " + hrToString(hr));
-
-            GUID major = GUID_NULL;
-            type->GetGUID(MF_MT_MAJOR_TYPE, &major);
-            const bool isVideo = (major == MFMediaType_Video);
-            if (isVideo && videoFrameDurationHns == 0) {
-                UINT32 fpsNum = 0, fpsDen = 1;
-                if (SUCCEEDED(MFGetAttributeRatio(type.get(), MF_MT_FRAME_RATE, &fpsNum, &fpsDen)) &&
-                    fpsNum > 0 && fpsDen > 0) {
-                    videoFrameDurationHns = (10000000LL * static_cast<LONGLONG>(fpsDen)) / static_cast<LONGLONG>(fpsNum);
-                }
-            }
-
-            DWORD outIndex = 0;
-            hr = writer->AddStream(type.get(), &outIndex);
-            if (FAILED(hr)) return fail("cannot add output stream: " + hrToString(hr));
-            hr = writer->SetInputMediaType(outIndex, type.get(), NULL);
-            if (FAILED(hr)) return fail("cannot configure output stream: " + hrToString(hr));
-            streams.push_back({s, outIndex, isVideo});
-        }
-        if (streams.empty()) return fail("first segment has no streams");
-
-        hr = writer->BeginWriting();
-        if (FAILED(hr)) return fail("BeginWriting: " + hrToString(hr));
-    }
-
-    // 2. Scan first segment's video stream for keyframe cut point AND initial B-frame DTS lead (#21).
-    LONGLONG cutHns = 0;
-    LONGLONG firstVideoDts = 0;
-    bool hasFirstVideoDts = false;
-    const LONGLONG trimHns = static_cast<LONGLONG>(std::max(0.0, trimStartSeconds) * 1e7);
-    auto videoIt = std::find_if(streams.begin(), streams.end(), [](const StreamInfo& s) { return s.isVideo; });
-
-    if (videoIt != streams.end()) {
-        ComRef<IMFSourceReader> scan;
-        hr = MFCreateSourceReaderFromURL(segmentPaths[0].c_str(), readerAttr.get(), scan.put());
-        if (FAILED(hr) || !scan) return fail("cannot open first segment: " + hrToString(hr));
-        scan->SetStreamSelection(static_cast<DWORD>(MF_SOURCE_READER_ALL_STREAMS), FALSE);
-        scan->SetStreamSelection(videoIt->readerIndex, TRUE);
-
-        struct KeyCandidate {
-            LONGLONG pts = -1;
-            LONGLONG dts = 0;
-            bool hasDts = false;
-        };
-        KeyCandidate initialSample, lastKeyBefore, firstKeyAfter;
-        int emptyScans = 0;
-
-        while (true) {
-            DWORD flags = 0;
-            LONGLONG ts = 0;
-            ComRef<IMFSample> sample;
-            hr = scan->ReadSample(videoIt->readerIndex, 0, nullptr, &flags, &ts, sample.put());
-            if (FAILED(hr) || (flags & MF_SOURCE_READERF_ERROR)) return fail("cannot scan first segment: " + hrToString(hr));
-            if (sample) {
-                UINT64 rawDts = 0;
-                bool sampleHasDts = SUCCEEDED(sample->GetUINT64(MFSampleExtension_DecodeTimestamp, &rawDts));
-                LONGLONG sampleDts = static_cast<LONGLONG>(rawDts);
-
-                if (initialSample.pts < 0) {
-                    initialSample = {ts, sampleDts, sampleHasDts};
-                    if (trimHns <= 0) break;
-                }
-
-                UINT32 clean = 0;
-                bool isKey = SUCCEEDED(sample->GetUINT32(MFSampleExtension_CleanPoint, &clean)) && clean != 0;
-                if (ts <= trimHns) {
-                    if (isKey) lastKeyBefore = {ts, sampleDts, sampleHasDts};
-                } else {
-                    if (isKey && firstKeyAfter.pts < 0) {
-                        firstKeyAfter = {ts, sampleDts, sampleHasDts};
-                        break;
-                    }
-                    if (ts - trimHns > 50000000LL) break; // scan up to 5s past trimHns
-                }
-                emptyScans = 0;
-            } else if (++emptyScans > 100000) {
-                return fail("reader stalled while scanning first segment");
-            }
-            if (flags & MF_SOURCE_READERF_ENDOFSTREAM) break;
-        }
-
-        if (trimHns <= 0) {
-            cutHns = 0;
-            hasFirstVideoDts = initialSample.hasDts;
-            firstVideoDts = initialSample.dts;
-        } else {
-            constexpr LONGLONG kMaxKeyframeDriftHns = 20000000LL; // 2s
-            KeyCandidate chosen = {0, initialSample.dts, initialSample.hasDts};
-            if (lastKeyBefore.pts >= 0 && (trimHns - lastKeyBefore.pts) <= kMaxKeyframeDriftHns) {
-                chosen = lastKeyBefore;
-            } else if (firstKeyAfter.pts >= 0 && (firstKeyAfter.pts - trimHns) <= kMaxKeyframeDriftHns) {
-                chosen = firstKeyAfter;
-            } else if (lastKeyBefore.pts >= 0) {
-                chosen = lastKeyBefore;
-            } else if (firstKeyAfter.pts >= 0) {
-                chosen = firstKeyAfter;
-            }
-            cutHns = chosen.pts;
-            hasFirstVideoDts = chosen.hasDts;
-            firstVideoDts = chosen.dts;
-        }
-    } else if (trimHns > 0) {
-        cutHns = trimHns;
-    }
-
-    // Shift all streams equally by any initial B-frame decode lead (cutHns - firstVideoDts)
-    // so rebased DTS starts at >= 0 without clamping multiple initial packets to DTS == 0 (#21).
-    const LONGLONG initialPtsShift = (hasFirstVideoDts && firstVideoDts < cutHns)
-        ? (cutHns - firstVideoDts)
-        : 0;
-
-    // 3. Remux every segment, rebasing timestamps so they continue seamlessly
-    ConcatTimestampState concatState(initialPtsShift);
-    size_t samplesWritten = 0;
-
-    for (size_t segIdx = 0; segIdx < segmentPaths.size(); ++segIdx) {
-        const auto& path = segmentPaths[segIdx];
-        const std::string segLabel = "segment " + std::to_string(segIdx + 1) + "/" + std::to_string(segmentPaths.size());
-
-        ComRef<IMFSourceReader> reader;
-        hr = MFCreateSourceReaderFromURL(path.c_str(), readerAttr.get(), reader.put());
-        if (FAILED(hr) || !reader) return fail("cannot open " + segLabel + ": " + hrToString(hr));
-
-        reader->SetStreamSelection(static_cast<DWORD>(MF_SOURCE_READER_ALL_STREAMS), FALSE);
-        struct MappedStream { DWORD writerIndex; bool isVideo; };
-        std::map<DWORD, MappedStream> streamMap;
-        std::set<DWORD> remaining;
-        for (const auto& st : streams) {
-            ComRef<IMFMediaType> native;
-            hr = reader->GetNativeMediaType(st.readerIndex, 0, native.put());
-            if (FAILED(hr) || !native) return fail(segLabel + " is missing a stream: " + hrToString(hr));
-            hr = reader->SetStreamSelection(st.readerIndex, TRUE);
-            if (FAILED(hr)) return fail("cannot select stream in " + segLabel + ": " + hrToString(hr));
-            streamMap[st.readerIndex] = {st.writerIndex, st.isVideo};
-            remaining.insert(st.readerIndex);
-        }
-
-        const LONGLONG segCut = (segIdx == 0) ? cutHns : 0;
-        bool seenFirstVideoKey = (segCut <= 0);
-        concatState.beginSegment();
-        int emptyReads = 0;
-
-        while (!remaining.empty()) {
-            DWORD actualStream = 0;
-            DWORD flags = 0;
-            LONGLONG timestamp = 0;
-            ComRef<IMFSample> sample;
-            hr = reader->ReadSample(
-                static_cast<DWORD>(MF_SOURCE_READER_ANY_STREAM), 0, &actualStream, &flags, &timestamp, sample.put());
-            if (FAILED(hr) || (flags & MF_SOURCE_READERF_ERROR)) {
-                return fail("cannot read " + segLabel + ": " + hrToString(hr));
-            }
-            if (flags & MF_SOURCE_READERF_ENDOFSTREAM) {
-                remaining.erase(actualStream);
-            }
-            if (!sample) {
-                if (++emptyReads > 100000) return fail("reader stalled on " + segLabel);
-                continue;
-            }
-            emptyReads = 0;
-
-            auto mapIt = streamMap.find(actualStream);
-            if (mapIt == streamMap.end()) continue;
-            if (timestamp < segCut) continue; // trimmed away (before the replay start)
-
-            if (mapIt->second.isVideo && !seenFirstVideoKey) {
-                UINT32 clean = 0;
-                if (FAILED(sample->GetUINT32(MFSampleExtension_CleanPoint, &clean)) || clean == 0) {
-                    continue;
-                }
-                seenFirstVideoKey = true;
-            }
-
-            LONGLONG sampleDuration = 0;
-            sample->GetSampleDuration(&sampleDuration);
-
-            // Preserve exact relative presentation timestamps across all streams;
-            // outputBase advances past the true end of all written samples so AAC packets never overlap.
-            int64_t sampleTime = concatState.computeSampleTime(timestamp, segCut);
-
-            if (mapIt->second.isVideo) {
-                UINT64 dts = 0;
-                if (SUCCEEDED(sample->GetUINT64(MFSampleExtension_DecodeTimestamp, &dts))) {
-                    int64_t newDts = 0;
-                    concatState.adjustVideoTimestamps(static_cast<int64_t>(dts), segCut, sampleTime, newDts);
-                    sample->SetUINT64(MFSampleExtension_DecodeTimestamp, static_cast<UINT64>(newDts));
-                }
-            }
-            sample->SetSampleTime(sampleTime);
-
-            hr = writer->WriteSample(mapIt->second.writerIndex, sample.get());
-            if (FAILED(hr)) {
-                return fail("write failed (" + segLabel + "): " + hrToString(hr));
-            }
-            ++samplesWritten;
-
-            int64_t prevAudioEnd = 0;
-            if (!concatState.recordWrittenSample(
-                    mapIt->second.writerIndex, mapIt->second.isVideo, sampleTime, sampleDuration, &prevAudioEnd)) {
-                geode::log::warn(
-                    "MediaFoundationEncoder: audio stream {} packet at {} overlaps prior end {} in {}",
-                    mapIt->second.writerIndex, sampleTime, prevAudioEnd, segLabel);
-            }
-        }
-
-        bool anomalyWarn = false;
-        int64_t excessOverAudioHns = 0;
-        concatState.endSegment(videoFrameDurationHns, &anomalyWarn, &excessOverAudioHns);
-        if (anomalyWarn) {
-            geode::log::warn(
-                "MediaFoundationEncoder: video end exceeded primary audio end by {:.2f} ms (>1.5 frames) in {}, falling back to max segment end",
-                static_cast<double>(excessOverAudioHns) / 10000.0, segLabel);
-        }
-    }
-
-    if (samplesWritten == 0) return fail("no media samples were written");
-
-    hr = writer->Finalize();
-    if (FAILED(hr)) return fail("finalizing MP4 failed: " + hrToString(hr));
-
-    res.success = true;
-    res.durationSeconds = static_cast<double>(std::max<LONGLONG>(0, concatState.outputBase - initialPtsShift)) / 1e7;
-    return res;
-}
-
-} // namespace
-
 ConcatResult MediaFoundationEncoder::concatenateSegments(
-    const std::vector<std::filesystem::path>& segmentPaths,
+    const std::vector<SegmentDesc>& segments,
     const std::filesystem::path& finalOutputPath,
-    double trimStartSeconds
+    double trimStartSeconds,
+    std::atomic<int>* progressPermille
 ) {
-    std::vector<std::wstring> wideSegments;
-    wideSegments.reserve(segmentPaths.size());
-    for (const auto& p : segmentPaths) {
-        wideSegments.push_back(p.wstring());
+    std::vector<mfconcat::SegmentInput> inputs;
+    inputs.reserve(segments.size());
+    for (const auto& seg : segments) {
+        mfconcat::SegmentInput in;
+        in.path = seg.path.wstring();
+        in.durationSeconds = seg.durationSeconds;
+        in.audioFrames[0] = seg.gameAudioFrames;
+        in.audioFrames[1] = seg.micAudioFrames;
+        inputs.push_back(std::move(in));
     }
-    const std::wstring wideOut = finalOutputPath.wstring();
+
+    mfconcat::Options options;
+    options.audioPrerollHns = kSegmentAudioPrerollHns;
+    options.progressPermille = progressPermille;
+    options.logInfo = [](const std::string& msg) { geode::log::info("{}", msg); };
+    options.logWarn = [](const std::string& msg) { geode::log::warn("{}", msg); };
 
     ConcatResult res;
     try {
-        res = concatenateImpl(wideSegments, wideOut, trimStartSeconds);
+        res = mfconcat::concatenate(inputs, finalOutputPath.wstring(), trimStartSeconds, options);
     } catch (const std::exception& e) {
         res.success = false;
         res.error = std::string("exception: ") + e.what();
@@ -1074,6 +842,21 @@ ConcatResult MediaFoundationEncoder::concatenateSegments(
         std::filesystem::remove(finalOutputPath, ec);
     }
     return res;
+}
+
+ConcatResult MediaFoundationEncoder::concatenateSegments(
+    const std::vector<std::filesystem::path>& segmentPaths,
+    const std::filesystem::path& finalOutputPath,
+    double trimStartSeconds
+) {
+    std::vector<SegmentDesc> segments;
+    segments.reserve(segmentPaths.size());
+    for (const auto& p : segmentPaths) {
+        SegmentDesc desc;
+        desc.path = p;
+        segments.push_back(std::move(desc));
+    }
+    return concatenateSegments(segments, finalOutputPath, trimStartSeconds, nullptr);
 }
 
 } // namespace replay

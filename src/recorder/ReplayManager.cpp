@@ -1707,7 +1707,9 @@ void ReplayManager::flushTrailingSilenceForClose(const ReplayConfig& cfg) {
                 static_cast<int>((std::max<int64_t>(m_lastVideoHns, 1000000LL) * gameRate) / 10000000LL),
                 1024, gameRate / 2);
             std::vector<float> silence(static_cast<size_t>(silenceSamples) * 2, 0.0f);
-            m_encoder->writeGameAudio(silence.data(), silenceSamples, 2, gameRate, 0);
+            if (m_encoder->writeGameAudio(silence.data(), silenceSamples, 2, gameRate, 0)) {
+                m_gameAudioSamples += silenceSamples;
+            }
         }
     }
 
@@ -1717,7 +1719,9 @@ void ReplayManager::flushTrailingSilenceForClose(const ReplayConfig& cfg) {
             static_cast<int>((std::max<int64_t>(m_lastVideoHns, 1000000LL) * kMicRate) / 10000000LL),
             1024, kMicRate / 2);
         std::vector<float> silence(static_cast<size_t>(silenceSamples) * 2, 0.0f);
-        m_encoder->writeMicAudio(silence.data(), silenceSamples, 2, kMicRate, 0);
+        if (m_encoder->writeMicAudio(silence.data(), silenceSamples, 2, kMicRate, 0)) {
+            m_micAudioSamples += silenceSamples;
+        }
     }
 }
 
@@ -1738,6 +1742,14 @@ ReplayManager::PendingFinalizeInfo ReplayManager::finalizeCurrentSegment(bool sy
     double frameDur = 1.0 / static_cast<double>(std::max(1, cfg.targetFps.load()));
     double segDuration = hasVideo ? (static_cast<double>(m_lastVideoHns) / 1e7 + frameDur) : 0.0;
 
+    SegmentInfo segInfo;
+    segInfo.filePath = segPath;
+    segInfo.startTime = segStart;
+    segInfo.durationSeconds = segDuration;
+    segInfo.formatKey = segFormat;
+    segInfo.gameAudioFrames = m_gameAudioSamples;
+    segInfo.micAudioFrames = (cfg.recordMic.load() && cfg.splitAudioTracks.load()) ? m_micAudioSamples : -1;
+
     m_currentSegmentPath.clear();
     m_currentFormatKey.clear();
 
@@ -1750,7 +1762,7 @@ ReplayManager::PendingFinalizeInfo ReplayManager::finalizeCurrentSegment(bool sy
         reclaimInFlightFrames(false);
         std::lock_guard<std::mutex> lock(m_segmentMutex);
         if (ok && hasVideo && segDuration > 0.25) {
-            m_activeSegments.push_back({segPath, segStart, segDuration, segFormat});
+            m_activeSegments.push_back(segInfo);
         } else {
             deleteSegmentFileLocked(segPath);
         }
@@ -1759,14 +1771,13 @@ ReplayManager::PendingFinalizeInfo ReplayManager::finalizeCurrentSegment(bool sy
 
     auto prom = std::make_shared<std::promise<bool>>();
     std::shared_future<bool> fut = prom->get_future().share();
-    PendingFinalizeInfo info{{segPath, segStart, segDuration, segFormat}, fut};
+    PendingFinalizeInfo info{segInfo, fut};
 
     std::lock_guard<std::mutex> lock(m_finalizeMutex);
     m_pendingFinalize = info;
     m_finalizeInFlight.store(true);
-    m_finalizeThread = std::thread([this, enc = std::move(oldEncoder), segPath = std::move(segPath),
-                                    segStart, segDuration, segFormat = std::move(segFormat),
-                                    hasVideo, cfg, prom = std::move(prom)]() mutable {
+    m_finalizeThread = std::thread([this, enc = std::move(oldEncoder), segInfo,
+                                    segDuration, hasVideo, cfg, prom = std::move(prom)]() mutable {
         bool ok = false;
         {
             MediaThreadScope mediaScope;
@@ -1778,9 +1789,9 @@ ReplayManager::PendingFinalizeInfo ReplayManager::finalizeCurrentSegment(bool sy
         {
             std::lock_guard<std::mutex> segLock(m_segmentMutex);
             if (keep) {
-                m_activeSegments.push_back({segPath, segStart, segDuration, segFormat});
+                m_activeSegments.push_back(segInfo);
             } else {
-                deleteSegmentFileLocked(segPath);
+                deleteSegmentFileLocked(segInfo.filePath);
             }
         }
         prom->set_value(keep);
@@ -2461,6 +2472,7 @@ bool ReplayManager::handleSaveRequest(
         }
 
         std::vector<std::filesystem::path> segsToMerge;
+        std::vector<SegmentInfo> segInfosToMerge;
         double totalSeconds = 0.0;
         double maxDuration = static_cast<double>(std::max(1, cfgCopy.durationSeconds.load()));
         std::string requiredFormat;
@@ -2471,6 +2483,7 @@ bool ReplayManager::handleSaveRequest(
                 break;
             }
             segsToMerge.insert(segsToMerge.begin(), it->filePath);
+            segInfosToMerge.insert(segInfosToMerge.begin(), *it);
             totalSeconds += it->durationSeconds;
             if (totalSeconds >= maxDuration) break;
         }
@@ -2535,7 +2548,21 @@ bool ReplayManager::handleSaveRequest(
         ConcatResult result;
         {
             MediaThreadScope mediaScope;
+#ifdef GEODE_IS_WINDOWS
+            std::vector<MediaFoundationEncoder::SegmentDesc> segDescs;
+            segDescs.reserve(segInfosToMerge.size());
+            for (const auto& info : segInfosToMerge) {
+                MediaFoundationEncoder::SegmentDesc desc;
+                desc.path = info.filePath;
+                desc.durationSeconds = info.durationSeconds;
+                desc.gameAudioFrames = info.gameAudioFrames;
+                desc.micAudioFrames = info.micAudioFrames;
+                segDescs.push_back(std::move(desc));
+            }
+            result = PlatformEncoder::concatenateSegments(segDescs, finalPath, trimStartSeconds);
+#else
             result = PlatformEncoder::concatenateSegments(segsToMerge, finalPath, trimStartSeconds);
+#endif
         }
 
         releaseExportSegments(segsToMerge);

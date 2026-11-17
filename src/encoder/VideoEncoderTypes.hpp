@@ -4,18 +4,13 @@
 #include <cstdio>
 #include <string>
 
+#include "ConcatResult.hpp"
+
 #ifdef GEODE_IS_WINDOWS
 #include <windows.h>
 #endif
 
 namespace replay {
-
-// Result of merging rolling segments into the final MP4.
-struct ConcatResult {
-    bool success = false;
-    std::string error;            // Human readable reason when success == false
-    double durationSeconds = 0.0; // Duration actually written to the output file
-};
 
 // Detailed result of encoder initialization or sample write operations.
 struct EncoderOpResult {

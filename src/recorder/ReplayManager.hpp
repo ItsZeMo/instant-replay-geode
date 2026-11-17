@@ -29,6 +29,10 @@ struct SegmentInfo {
     std::chrono::steady_clock::time_point startTime;
     double durationSeconds = 0.0;
     std::string formatKey; // segments can only be merged with segments of the same format
+    // Real audio frames written per track (excludes encoder pre-roll / AAC padding); the Windows
+    // exporter uses them to stitch decoded audio sample-exactly (W2). -1 = unknown / no track.
+    int64_t gameAudioFrames = -1;
+    int64_t micAudioFrames = -1;
 };
 
 enum class SaveReplayResult {
