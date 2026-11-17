@@ -36,24 +36,30 @@ instant-replay-geode/
 └── src/
     ├── main.cpp                         # Hooks ($on_game(Exiting), CCEGLView / NSOpenGLContext flushBuffer, FMODAudioEngine, menus), keybinds
     ├── config/
+    │   ├── BitrateMath.hpp              # Pure bitrate math: codec/FPS/output-size factors, per-family CodecBitrateTable (W1, W9)
     │   ├── CodecUtils.hpp               # Pure codec parsing (resolveRequestedCodecSpec) & H.264 4096x2304 aspect clamping
     │   └── ReplayConfig.hpp             # Thread-safe singleton configuration, snapshots, Retina size, disk checks & mod.json sync
     ├── platform/
     │   ├── MacPlatformUtils.hpp / .mm   # Cocoa folders, Retina GL drawable size, CGL-locked flushBuffer hook, PID identity check
-    │   └── MacVideoCapabilities.hpp/.mm # VTCopyVideoEncoderList hardware/SW gating & cached >4K VideoToolbox size probes
+    │   ├── MacVideoCapabilities.hpp/.mm # VTCopyVideoEncoderList hardware/SW gating & cached >4K VideoToolbox size probes
+    │   └── WinVideoCapabilities.hpp/.cpp# Background MFTEnumEx probe of HW/SW AV1 / HEVC / H.264 encoders (Windows, W4)
     ├── capture/
     │   ├── FrameBudget.hpp              # Dynamic byte-budgeted pool/queue/in-flight frame helpers
     │   ├── FrameGrabber.hpp / .cpp      # OpenGL FBO scaling + async PBO readback + IMFMediaBuffer / BT.709 CVPixelBuffer pool
     │   ├── GameAudioRing.hpp            # Lock-free SPSC ring buffer + packet metadata ring for FMOD audio
     │   └── AudioGrabber.hpp/.cpp/.mm    # FMOD DSP capture + WASAPI (Win) / CoreAudio + TCC mic capture (Mac)
     ├── encoder/
-    │   ├── VideoEncoderTypes.hpp        # Shared ConcatResult & EncoderOpResult structs
+    │   ├── VideoEncoderTypes.hpp        # Shared EncoderOpResult struct (+ ConcatResult.hpp, Geode-free)
     │   ├── PlatformEncoder.hpp          # Platform encoder type alias (MediaFoundationEncoder / VideoToolboxEncoder)
     │   ├── ConcatTimestampMath.hpp      # Audio-driven cross-segment timestamp state & B-frame monotonic DTS math
-    │   ├── MediaFoundationEncoder.*     # IMFSinkWriter encoding & IMFSourceReader MP4 remuxing (Windows)
+    │   ├── SegmentAudioLayout.hpp       # Windows segment AAC pre-roll (50 ms) constants (W2)
+    │   ├── MediaFoundationEncoder.*     # IMFSinkWriter encoding, fallback cascade, segment audio pre-roll (Windows)
+    │   ├── MfSegmentConcat.hpp/.cpp     # Geode-free MF exporter: video remux + continuous AAC re-encode (Windows, host-tested)
     │   └── VideoToolboxEncoder.hpp/.mm  # AVAssetWriter + VT encoding, deferred AAC FIFO & AVAssetReader remuxing (macOS)
     ├── recorder/
     │   ├── MicMixFifo.hpp               # Timeline-anchored stereo mic mixing FIFO (drift/pause/overlap/rebase)
+    │   ├── SegmentRules.hpp             # Segment duration (max of video / game audio) & keep rule (W14)
+    │   ├── AudioQueuePolicy.hpp         # Duration-bounded audio chunk queue helper (W15)
     │   └── ReplayManager.hpp / .cpp     # Rolling segment lifecycle, async finalizer, worker thread, audio horizon & export thread
     └── ui/
         ├── ReplayPopup.hpp / .cpp       # 4-tab in-game dashboard & settings popup (F9)
@@ -74,7 +80,7 @@ instant-replay-geode/
 
 2. **Audio Capture (`src/capture/AudioGrabber.cpp`, `src/capture/AudioGrabberMac.mm`)**
    - **Game Audio:** Custom FMOD DSP attached to the tail of the Master `ChannelGroup`. Writes normalized 2-channel stereo float PCM into a pre-allocated **lock-free SPSC ring buffer + 8192-entry packet metadata ring** (`GameAudioRing`, 262144 stereo frames / ~5.46s @ 48 kHz) with zero heap allocations or mutex locks on the FMOD mixer thread.
-   - **Microphone Audio:** Event-driven WASAPI capture (Windows) and CoreAudio `AudioQueue` (macOS), started only when both `enabled` and `recordMic` are true and stopped immediately in `ReplayManager::stopReplay()`. On macOS, checks `[AVCaptureDevice authorizationStatusForMediaType:]` + bundle `NSMicrophoneUsageDescription` before touching CoreAudio (`BlockedNoUsageDescription` alerts when non-Steam launches are muted by TCC after 3s silence or denied without usage key, vs `PermissionDenied` / `DigitalSilenceDetected`), and falls back to the system default input when a chosen mic disconnects (reattaching when it returns).
+   - **Microphone Audio:** Event-driven WASAPI capture (Windows) and CoreAudio `AudioQueue` (macOS), started only when both `enabled` and `recordMic` are true and stopped immediately in `ReplayManager::stopReplay()`. On Windows an `IMMNotificationClient` flags device arrival/removal and default-device changes; the capture thread re-resolves the wanted device (selected mic while active, else the default) and reports `Active` / `UsingFallbackDevice` / `NoInputDevice` / `DigitalSilenceDetected` (W6). On macOS, checks `[AVCaptureDevice authorizationStatusForMediaType:]` + bundle `NSMicrophoneUsageDescription` before touching CoreAudio (`BlockedNoUsageDescription` alerts when non-Steam launches are muted by TCC after 3s silence or denied without usage key, vs `PermissionDenied` / `DigitalSilenceDetected`), and falls back to the system default input when a chosen mic disconnects (reattaching when it returns).
 
 3. **Worker Thread & Rolling Segments (`src/recorder/ReplayManager.cpp`)**
    - Takes an immutable `ReplayConfig` snapshot (`m_sessionConfig`) at `startReplay()`, locks the session output resolution and video bitrates once.
@@ -83,12 +89,12 @@ instant-replay-geode/
    - **Per-Stream Error & Recovery Handling:** Stops immediately on fatal storage errors (`ERROR_DISK_FULL`/`ENOSPC`, access denied, write-protect), tolerates transient `retryable` encoder backpressure (e.g. deferred macOS AAC buffering up to 10s), and attempts 1 encoder recreation/fallback on repeated non-storage write failures.
 
 4. **Platform Encoders & Fallback Cascade (`MediaFoundationEncoder` / `VideoToolboxEncoder`)**
-   - **Windows (`MediaFoundationEncoder.cpp`):** `IMFSinkWriter` with `MF_SINK_WRITER_DISABLE_THROTTLING = TRUE` and fallback cascade `Cached -> Requested (HW) -> HEVC (HW) -> H.264 (HW) -> H.264 (SW)`.
+   - **Windows (`MediaFoundationEncoder.cpp`):** `IMFSinkWriter` with `MF_SINK_WRITER_DISABLE_THROTTLING = TRUE` and fallback cascade `Cached -> Requested (HW) -> HEVC (HW) -> H.264 (HW) -> H.264 (SW)`. Each attempt uses its own family's bitrate from the session `CodecBitrateTable` (W1); video types carry BT.709 / limited-range metadata and H.264 uses High profile with level 5.2 (6.2 when needed) so NVENC does not clamp the peak bitrate, with one retry without these extensions (W12, W13). Mean/max bitrates are read back via `ICodecAPI`. Every segment AAC track starts with 50 ms of silence pre-roll (`SegmentAudioLayout.hpp`, W2).
    - **macOS (`VideoToolboxEncoder.mm`):** `AVAssetWriter` + VideoToolbox (`VTCompressionSession` probe, `VTCopyVideoEncoderList` + `AVAssetWriter canApplyOutputSettings` gating so unsupported codecs like AV1 or non-writable SW HEVC switch cleanly to `H.264`; `H.264 (SW)` preferred in software mode if the selected codec is unsupported), BT.709 color properties, buffered deferred AAC FIFO (`kMaxPendingAudioSeconds = 10.0`), 60s `finishWriting` timeouts, `@try/@catch` ObjC exception guards with `-fobjc-arc-exceptions`, and `-fobjc-arc`.
 
 5. **Saving & Segment Export (`concatenateSegments`)**
    - On `F6`, performs a hot-swap onto the pre-warmed encoder, locks selected segment paths in `m_exportLockedSegments`, and scans segment 0 for a keyframe near `trimStartSeconds`.
-   - **Windows (`MediaFoundationEncoder.cpp`):** remuxes compressed video/audio tracks chronologically via `IMFSourceReader`/`IMFSinkWriter`.
+   - **Windows (`MfSegmentConcat.cpp`):** remuxes compressed video chronologically via `IMFSourceReader`/`IMFSinkWriter`; decodes every segment's AAC tracks to PCM, drops the pre-roll and trailing AAC padding using the real frame counts recorded in `SegmentInfo`, stitches them sample-exactly and re-encodes one continuous AAC stream per track (`192 kbps` / `128 kbps`), the counterpart of macOS N1 (W2). Writes `replay_*.mp4.part` and renames on success; progress is exposed via `ReplayManager::getExportProgressPercent()` (W3).
    - **macOS (`VideoToolboxEncoder.mm`):** passes through compressed video rebased directly from raw track timings (`allowNegativeDts = true`, `clampPtsToDts = false`, `1 MHz` `mediaTimeScale` preserved, zero empty edit on H.264 B-frames), decodes all audio tracks via `AVAssetReaderTrackOutput` to Float32 interleaved LPCM (resolving AAC priming & remainder edits automatically), and encodes uninterrupted AAC streams (`192 kbps` first track / `128 kbps` split track) with sample-exact seam padding/trimming and per-iteration `@autoreleasepool` cleanup (M9). Uses `expectsMediaDataInRealTime = YES` + 10s stall watchdog (M1) and 1-sample HNS overlap tolerance (`ConcatTimestampState::audioOverlapToleranceHns`, N4).
 
 ---

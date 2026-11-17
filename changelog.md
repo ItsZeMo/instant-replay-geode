@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+- **Windows review fixes (W1-W18):**
+  - Codec fallbacks (AV1 -> HEVC / H.264) now record at the bitrate of the codec actually used, and custom codec strings use their parsed codec's bitrate factor.
+  - Saved replays no longer have a short audio dropout every 30 seconds: segment audio carries a 50 ms pre-roll and the export re-encodes one continuous AAC stream per track.
+  - Replays are written to `replay_*.mp4.part` and renamed when finished; saving shows its progress in the menu, the log and on repeated F6, and exiting during a save logs the wait.
+  - The menu shows the codec that is actually recording; Windows probes AV1 / HEVC / H.264 encoder support and greys out unsupported codecs; one notification when the encoder falls back.
+  - Windows microphone capture reports its status, follows the default device, returns to the selected mic when it is reconnected and hints at Windows privacy settings on digital silence.
+  - Every save request logs its outcome; repeated encoder starts and the WASAPI start-up discontinuity no longer spam the log.
+  - VBR / CQ bitrate scales with the size actually recorded (Native 4K equals the 2160p preset) and the bitrate field is labelled as a 1080p60 base; CBR stays exact.
+  - Recorded video signals BT.709 limited range; NVENC H.264 uses High profile so it no longer clamps the peak bitrate.
+  - 4K frame-drop bursts are explained in the log and the encoder in-flight budget scales with the frame size.
+  - Segment length counts game audio as well as video; the microphone queue is bounded by time; the "replay is OFF" hint shows the real toggle keybind; clearing a custom codec restores the previous preset; the FMOD capture DSP is re-attached if the audio system is recreated; temp-folder cleanup treats processes it cannot inspect as alive.
+  - CI runs the Windows host tests (`host-tests-win`).
+
 ## v1.0.5
 - **SDK, Build & Documentation:**
   - Updated target Geode SDK to `v5.11.2` (Geometry Dash `2.2081`) and added native Universal macOS (`arm64` + `x86_64`, `11.0+`) support alongside Windows x64 (`build`, `build-mac`, and `host-tests-mac` CI jobs).
