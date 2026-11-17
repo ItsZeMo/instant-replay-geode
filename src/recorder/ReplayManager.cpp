@@ -526,10 +526,10 @@ void ReplayManager::initialize() {
     {
         const auto& caps = getMacVideoEncoderCaps();
         geode::log::info(
-            "Instant Replay: VideoToolbox compatibility - AV1(HW={},SW={}), HEVC(HW={},SW={}), H.264(HW={},SW={})",
-            caps.av1Hardware, caps.av1Software,
-            caps.hevcHardware, caps.hevcSoftware,
-            caps.h264Hardware, caps.h264Software);
+            "Instant Replay: VideoToolbox compatibility - AV1(HW={},SW={}), HEVC(HW={},SW={} [writable={}]), H.264(HW={},SW={} [writable={}])",
+            caps.av1Hardware, caps.hasSoftware(VideoCodecFamily::AV1),
+            caps.hevcHardware, caps.hevcSoftware, caps.hevcSoftwareWritable,
+            caps.h264Hardware, caps.h264Software, caps.h264SoftwareWritable);
     }
 #endif
     ReplayConfig::get().loadFromSettings();

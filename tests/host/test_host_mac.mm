@@ -1266,6 +1266,53 @@ void testContinuousSineWaveSeamContinuity() {
     std::cout << "  PASS Test 11 (T-N1b)\n";
 }
 
+// T-N3: isPresetCodecSupported(HEVC, false) must match actual AVAssetWriter start() without fallback.
+void testHevcSoftwareWritableConsistency() {
+    std::cout << "[Test 12 / T-N3] HEVC SW writable capability matches AVAssetWriter start()...\n";
+    replay::VideoToolboxEncoder::resetCodecCache();
+    const auto& caps = replay::getMacVideoEncoderCaps();
+    const bool presetSupported = replay::ReplayConfig::isPresetCodecSupported(replay::CodecType::HEVC, false);
+    CHECK(presetSupported == (caps.hevcSoftware && caps.hevcSoftwareWritable));
+
+    auto testDir = std::filesystem::temp_directory_path() / "InstantReplayMacHostTest_N3";
+    std::error_code ec;
+    std::filesystem::remove_all(testDir, ec);
+    std::filesystem::create_directories(testDir, ec);
+
+    {
+        replay::VideoToolboxEncoder enc;
+        auto seg = testDir / "hevc_sw_strict.mp4";
+        auto res = enc.start(
+            seg, 320, 180, 60, 8, 12, 80, replay::RateControlMode::ADAPTIVE_VBR,
+            false, replay::CodecType::HEVC, false, "", 48000, nullptr, false);
+        enc.finish();
+        CHECK(res.ok == presetSupported);
+    }
+
+    if (!presetSupported) {
+        replay::ReplayConfig cfg;
+        cfg.codec = replay::CodecType::HEVC;
+        cfg.hardwareAcceleration = false;
+        CHECK(cfg.sanitizeCodecSettings());
+        CHECK(cfg.codec.load() == replay::CodecType::H264);
+
+        replay::VideoToolboxEncoder encFb;
+        auto segFb = testDir / "hevc_sw_fb.mp4";
+        auto resFb = encFb.start(
+            segFb, 320, 180, 60, 8, 12, 80, replay::RateControlMode::ADAPTIVE_VBR,
+            false, replay::CodecType::HEVC, false, "", 48000, nullptr, true);
+        CHECK(resFb.ok);
+        CHECK(encFb.activeCodecFamily() == replay::VideoCodecFamily::H264);
+        CHECK(!encFb.activeHardware());
+        encFb.finish();
+    }
+
+    std::filesystem::remove_all(testDir, ec);
+    std::cout << "  PASS Test 12 (T-N3: hevcSW_vt=" << caps.hevcSoftware
+              << ", hevcSW_writable=" << caps.hevcSoftwareWritable
+              << ", presetSupported=" << presetSupported << ")\n";
+}
+
 } // namespace
 
 int main() {
@@ -1281,6 +1328,7 @@ int main() {
         test10SegmentAacContinuity();
         testAudioVideoMarkersContinuousSync();
         testContinuousSineWaveSeamContinuity();
+        testHevcSoftwareWritableConsistency();
     }
     std::cout << "ALL MACOS HOST TESTS PASSED!\n";
     return 0;

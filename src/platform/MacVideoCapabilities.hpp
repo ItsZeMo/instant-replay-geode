@@ -12,10 +12,13 @@ struct MacVideoEncoderCaps {
     bool enumerated = false;
     bool av1Hardware = false;
     bool av1Software = false;
+    bool av1SoftwareWritable = false;
     bool hevcHardware = false;
     bool hevcSoftware = false;
+    bool hevcSoftwareWritable = false;
     bool h264Hardware = false;
     bool h264Software = false;
+    bool h264SoftwareWritable = false;
 
     bool hasHardware(VideoCodecFamily family) const noexcept {
         switch (family) {
@@ -29,9 +32,9 @@ struct MacVideoEncoderCaps {
 
     bool hasSoftware(VideoCodecFamily family) const noexcept {
         switch (family) {
-            case VideoCodecFamily::AV1:  return av1Software;
-            case VideoCodecFamily::HEVC: return hevcSoftware;
-            case VideoCodecFamily::H264: return h264Software;
+            case VideoCodecFamily::AV1:  return av1Software && av1SoftwareWritable;
+            case VideoCodecFamily::HEVC: return hevcSoftware && hevcSoftwareWritable;
+            case VideoCodecFamily::H264: return h264Software && h264SoftwareWritable;
             case VideoCodecFamily::VP9:
             default:                     return false;
         }
