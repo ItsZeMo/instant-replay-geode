@@ -68,6 +68,8 @@ public:
     bool finish();
     bool isRecording() const noexcept { return m_recording; }
     bool isVideoQueueSaturated(size_t maxPendingFrames, size_t maxQueuedBytes) const;
+    // Sink writer video backlog (frames received but not yet encoded, bytes queued) for drop diagnostics (W11).
+    bool videoQueueStats(uint64_t& outPendingFrames, uint64_t& outQueuedBytes) const;
     int encodedGameSampleRate() const noexcept { return m_gameSampleRate; }
     bool hasActiveCodec() const noexcept { return m_activeSubtype != GUID_NULL; }
     VideoCodecFamily activeCodecFamily() const noexcept;

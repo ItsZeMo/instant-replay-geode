@@ -63,6 +63,9 @@ static constexpr size_t HARD_MAX_QUEUED_VIDEO_BYTES = 256ull * 1024 * 1024;
 static constexpr size_t MAX_IN_FLIGHT_ENCODER_FRAMES = 16;
 static constexpr size_t MIN_IN_FLIGHT_ENCODER_FRAMES = 4;
 static constexpr size_t MAX_IN_FLIGHT_ENCODER_BYTES = 256ull * 1024 * 1024;
+// Large frames (4K BGRA = 33 MB) get room for ~12 in-flight frames instead of 8, capped at 512 MiB (W11).
+static constexpr size_t IN_FLIGHT_BUDGET_FRAMES = 12;
+static constexpr size_t MAX_SCALED_IN_FLIGHT_ENCODER_BYTES = 512ull * 1024 * 1024;
 static constexpr size_t MAX_MIC_MIX_FRAMES = static_cast<size_t>(AudioGrabber::kMicSampleRate) * 5; // ~5s stereo cap
 static constexpr int MAX_ENCODER_START_FAILURES = 3;
 static constexpr int MAX_CONSECUTIVE_WRITE_ERRORS = 5;
@@ -1857,10 +1860,18 @@ ReplayManager::PendingFinalizeInfo ReplayManager::finalizeCurrentSegment(bool sy
     m_finalizeThread = std::thread([this, enc = std::move(oldEncoder), segInfo,
                                     segDuration, hasVideo, cfg, prom = std::move(prom)]() mutable {
         bool ok = false;
+        const auto finalizeStart = std::chrono::steady_clock::now();
         {
             MediaThreadScope mediaScope;
             ok = enc->finish();
             enc.reset();
+        }
+        const double finalizeMs = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - finalizeStart).count();
+        if (finalizeMs > 2000.0) {
+            geode::log::info("Instant Replay: background segment finalize took {:.0f} ms", finalizeMs);
+        } else {
+            geode::log::debug("Instant Replay: background segment finalize took {:.0f} ms", finalizeMs);
         }
 
         bool keep = (ok && hasVideo && segDuration > 0.25);
@@ -2129,6 +2140,7 @@ void ReplayManager::startPrepareNextSegment(const ReplayConfig& cfg) {
     m_prepareFailedLastAttempt.store(false);
     m_prepareCancel.store(false);
     m_prepareInFlight.store(true);
+    m_prepareStartedAt = std::chrono::steady_clock::now();
 
     std::lock_guard<std::mutex> lock(m_prepareMutex);
     m_prepareThread = std::thread([this, cfg, segIdx, width, height, effBitrate, effMaxBitrate, gameSampleRate,
@@ -2238,17 +2250,44 @@ void ReplayManager::abortPendingSave() {
 
 bool ReplayManager::canAcceptEncoderFrame(size_t frameBytes) const {
     const size_t inFlightBytes = sumFrameBufferBytes(m_inFlightFrames, [](const CapturedFrame& f) { return f.byteSize; });
+    const size_t inFlightBudget = effectiveFrameByteBudget(
+        MAX_IN_FLIGHT_ENCODER_BYTES, frameBytes, IN_FLIGHT_BUDGET_FRAMES, MAX_SCALED_IN_FLIGHT_ENCODER_BYTES);
     if (!canAcceptInFlightFrameBytes(
             m_inFlightFrames.size(), inFlightBytes, frameBytes,
-            MAX_IN_FLIGHT_ENCODER_FRAMES, MAX_IN_FLIGHT_ENCODER_BYTES, MIN_IN_FLIGHT_ENCODER_FRAMES)) {
+            MAX_IN_FLIGHT_ENCODER_FRAMES, inFlightBudget, MIN_IN_FLIGHT_ENCODER_FRAMES)) {
         return false;
     }
-    const size_t writerByteLimit = std::max<size_t>(
-        MAX_IN_FLIGHT_ENCODER_BYTES, frameBytes * MIN_IN_FLIGHT_ENCODER_FRAMES);
+    const size_t writerByteLimit = std::max<size_t>(inFlightBudget, frameBytes * MIN_IN_FLIGHT_ENCODER_FRAMES);
     if (m_encoder && m_encoder->isVideoQueueSaturated(MAX_IN_FLIGHT_ENCODER_FRAMES, writerByteLimit)) {
         return false;
     }
     return true;
+}
+
+// Explains every 5 s window with dropped frames: which limit dropped them, the encoder backlog and
+// how close it was to a segment rotation (W11).
+void ReplayManager::logFrameDropWindow(uint64_t queueDrops, uint64_t inFlightDrops, std::chrono::steady_clock::time_point now) {
+    const uint64_t dropped = queueDrops + inFlightDrops;
+    const int fps = std::max(1, m_sessionConfig.targetFps.load());
+    const size_t inFlightBytes = sumFrameBufferBytes(m_inFlightFrames, [](const CapturedFrame& f) { return f.byteSize; });
+    uint64_t pendingFrames = 0;
+    uint64_t queuedBytes = 0;
+    bool haveStats = false;
+#ifdef GEODE_IS_WINDOWS
+    if (m_encoder) {
+        haveStats = m_encoder->videoQueueStats(pendingFrames, queuedBytes);
+    }
+#endif
+    const double sinceRotation = (m_lastRotationTime == std::chrono::steady_clock::time_point{})
+        ? -1.0
+        : std::chrono::duration<double>(now - m_lastRotationTime).count();
+    geode::log::info(
+        "Instant Replay: dropped {} video frame(s) (~{} ms) in the last 5 s: worker queue full={}, encoder backlog={}; "
+        "inFlight={} ({} MB), writer pending={} queued={} MB{}; rotation #{} {:.1f} s ago",
+        dropped, (dropped * 1000) / static_cast<uint64_t>(fps), queueDrops, inFlightDrops,
+        m_inFlightFrames.size(), inFlightBytes / (1024 * 1024),
+        pendingFrames, queuedBytes / (1024 * 1024), haveStats ? "" : " (stats n/a)",
+        m_rotationCount, sinceRotation);
 }
 
 bool ReplayManager::writeEncodedVideoFrame(
@@ -2854,6 +2893,9 @@ void ReplayManager::workerThreadFunc(ReplayConfig sessionConfig) {
             uint64_t sDrops = m_staleDropCount.load(std::memory_order_relaxed);
             uint64_t dq = qDrops - m_lastLoggedQueueDrops;
             uint64_t df = fDrops - m_lastLoggedInFlightDrops;
+            if (dq > 0 || df > 0) {
+                logFrameDropWindow(dq, df, now);
+            }
             if (dq > 0 || df > 0 || sDrops > 0) {
                 geode::log::debug(
                     "ReplayManager: 5s drops queue={} inFlight={} (totals: queue={}, inFlight={}, stale={})",
@@ -2970,7 +3012,9 @@ void ReplayManager::workerThreadFunc(ReplayConfig sessionConfig) {
                     if (!splitRecovered) {
                         bool wasHealthy = (m_videoWriteErrors == 0 && m_gameAudioWriteErrors == 0 && m_micAudioWriteErrors == 0);
                         bool rotated = false;
-                        if (hasPreparedReady && !m_finalizeInFlight.load()) {
+                        const auto switchStart = std::chrono::steady_clock::now();
+                        const bool asyncSwitch = hasPreparedReady && !m_finalizeInFlight.load();
+                        if (asyncSwitch) {
                             finalizeCurrentSegment(false, sessionConfig);
                             rotated = activatePreparedOrStartNew(sessionConfig, boundaryTime, true, true);
                         } else {
@@ -2979,6 +3023,22 @@ void ReplayManager::workerThreadFunc(ReplayConfig sessionConfig) {
                         }
 
                         if (rotated) {
+                            const auto switchEnd = std::chrono::steady_clock::now();
+                            ++m_rotationCount;
+                            m_lastRotationTime = switchEnd;
+                            const double switchMs = std::chrono::duration<double, std::milli>(switchEnd - switchStart).count();
+                            const double prepareLead = (m_prepareStartedAt == std::chrono::steady_clock::time_point{})
+                                ? -1.0
+                                : std::chrono::duration<double>(switchStart - m_prepareStartedAt).count();
+                            if (switchMs > 50.0) {
+                                geode::log::info(
+                                    "Instant Replay: rotation #{} ({}) blocked the worker for {:.1f} ms (prepare started {:.1f} s earlier, inFlight={})",
+                                    m_rotationCount, asyncSwitch ? "pre-warmed" : "synchronous", switchMs, prepareLead, m_inFlightFrames.size());
+                            } else {
+                                geode::log::debug(
+                                    "Instant Replay: rotation #{} ({}) took {:.1f} ms (prepare started {:.1f} s earlier, inFlight={})",
+                                    m_rotationCount, asyncSwitch ? "pre-warmed" : "synchronous", switchMs, prepareLead, m_inFlightFrames.size());
+                            }
                             if (wasHealthy) {
                                 m_writeRecoveryAttempted = false;
                             }

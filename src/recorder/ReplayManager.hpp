@@ -138,6 +138,7 @@ private:
     void workerThreadFunc(ReplayConfig sessionConfig);
     void reclaimInFlightFrames(bool forceClear = false);
     bool canAcceptEncoderFrame(size_t frameBytes) const;
+    void logFrameDropWindow(uint64_t queueDrops, uint64_t inFlightDrops, std::chrono::steady_clock::time_point now);
     WriteCheckResult handleEncoderWriteError(
         const char* streamLabel,
         const EncoderOpResult& res,
@@ -377,6 +378,10 @@ private:
     std::chrono::steady_clock::time_point m_lastDropLogTime{};
     uint64_t m_lastLoggedQueueDrops = 0;
     uint64_t m_lastLoggedInFlightDrops = 0;
+    // Rotation diagnostics for drop bursts (worker thread only, W11)
+    uint64_t m_rotationCount = 0;
+    std::chrono::steady_clock::time_point m_lastRotationTime{};
+    std::chrono::steady_clock::time_point m_prepareStartedAt{};
 
     // Asynchronous segment finalizer thread (prevents 30s rotation from stalling worker thread)
     std::thread m_finalizeThread;

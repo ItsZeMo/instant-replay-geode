@@ -624,6 +624,23 @@ void testFrameBudgetAnd4KPool() {
     CHECK(runPoolSim(kPoolBaseBytes) > 100);
     CHECK(runPoolSim(effP4k) == 0);
 
+    // W11: the encoder in-flight byte budget scales to ~12 frames for large frames, capped at 512 MiB.
+    constexpr size_t kScaledInFlightCeiling = 512ull * 1024 * 1024;
+    CHECK(replay::effectiveFrameByteBudget(kInFlightMaxBytes, sz1080, 12, kScaledInFlightCeiling) == kInFlightMaxBytes);
+    const size_t budget4k = replay::effectiveFrameByteBudget(kInFlightMaxBytes, sz4k, 12, kScaledInFlightCeiling);
+    CHECK(budget4k == sz4k * 12 && budget4k <= kScaledInFlightCeiling);
+    {
+        std::vector<std::unique_ptr<Buf>> inFlight;
+        for (int i = 0; i < 32; ++i) {
+            size_t total = replay::sumFrameBufferBytes(inFlight, getSz);
+            if (replay::canAcceptInFlightFrameBytes(inFlight.size(), total, sz4k, kInFlightMaxFrames, budget4k, kInFlightMinFrames)) {
+                inFlight.push_back(std::make_unique<Buf>(Buf{sz4k}));
+            }
+        }
+        CHECK(inFlight.size() == 12); // was 8 with the flat 256 MiB budget
+    }
+    CHECK(replay::effectiveFrameByteBudget(kInFlightMaxBytes, sz8k, 12, kScaledInFlightCeiling) == kScaledInFlightCeiling);
+
     std::cout << "  PASS Test 7\n";
 }
 
