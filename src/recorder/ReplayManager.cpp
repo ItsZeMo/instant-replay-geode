@@ -2538,6 +2538,7 @@ bool ReplayManager::handleSaveRequest(
 
     if (candidateSegments.empty() && !extraPending.future.valid()) {
         abortPendingSave();
+        geode::log::warn("Instant Replay: save requested but the replay buffer is empty");
         geode::Loader::get()->queueInMainThread([]() {
             geode::Notification::create("Instant Replay: replay is empty", geode::NotificationIcon::Warning)->show();
         });
@@ -2617,6 +2618,7 @@ bool ReplayManager::handleSaveRequest(
         }
 
         if (segsToMerge.empty()) {
+            geode::log::warn("Instant Replay: save requested but the replay buffer is empty");
             geode::Loader::get()->queueInMainThread([]() {
                 geode::Notification::create("Instant Replay: replay is empty", geode::NotificationIcon::Warning)->show();
             });
@@ -2667,6 +2669,11 @@ bool ReplayManager::handleSaveRequest(
         const std::filesystem::path writePath = partPathFor(finalPath);
 #endif
 
+        geode::log::info(
+            "Instant Replay: saving replay: {} segment(s), {:.1f} s buffered, trimming {:.1f} s -> {}",
+            segsToMerge.size(), totalSeconds, trimStartSeconds, geode::utils::string::pathToString(finalPath));
+        const auto exportStart = std::chrono::steady_clock::now();
+
         ConcatResult result;
 #ifdef GEODE_IS_WINDOWS
         m_exportProgressPermille.store(0, std::memory_order_relaxed);
@@ -2711,13 +2718,25 @@ bool ReplayManager::handleSaveRequest(
             ? result.durationSeconds
             : std::max(0.0, totalSeconds - trimStartSeconds);
 
+        // Exactly one result line per save, logged here so it is recorded even during exit (W7).
+        const double mergeSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - exportStart).count();
+        if (result.success) {
+            std::error_code sizeEc;
+            const auto bytes = std::filesystem::file_size(finalPath, sizeEc);
+            geode::log::info("Instant Replay: replay saved: {} ({:.1f} s, {:.1f} MB, merged in {:.1f} s)",
+                             finalPathStr, savedDuration,
+                             sizeEc ? 0.0 : static_cast<double>(bytes) / (1024.0 * 1024.0), mergeSeconds);
+        } else {
+            geode::log::error("Instant Replay: save failed after {:.1f} s ({})", mergeSeconds,
+                              result.error.empty() ? std::string("unknown error") : result.error);
+        }
+
         geode::Loader::get()->queueInMainThread([result, finalPathStr, savedDuration, showNotif]() {
             if (!result.success) {
                 std::string msg = "Instant Replay: save failed";
                 if (!result.error.empty()) {
                     msg += " (" + result.error + ")";
                 }
-                geode::log::error("{}", msg);
                 geode::Notification::create(msg, geode::NotificationIcon::Error, 3.0f)->show();
                 return;
             }
@@ -3130,6 +3149,7 @@ SaveReplayResult ReplayManager::saveReplay() {
 void ReplayManager::showSaveFeedback(SaveReplayResult result) {
     switch (result) {
         case SaveReplayResult::NotRunning:
+            geode::log::warn("Instant Replay: save requested but recording is off");
             geode::Notification::create(
                 "Instant Replay is OFF (Ctrl+F6 to enable)",
                 geode::NotificationIcon::Warning,
@@ -3138,6 +3158,7 @@ void ReplayManager::showSaveFeedback(SaveReplayResult result) {
             break;
         case SaveReplayResult::AlreadySaving: {
             const int pct = ReplayManager::get()->getExportProgressPercent();
+            geode::log::warn("Instant Replay: save requested while the previous replay is still saving ({}%)", std::max(0, pct));
             std::string msg = "Previous replay is still saving...";
             if (pct >= 0) {
                 msg += " (" + std::to_string(pct) + "%)";
