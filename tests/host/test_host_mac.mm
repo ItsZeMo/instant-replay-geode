@@ -1313,6 +1313,30 @@ void testHevcSoftwareWritableConsistency() {
               << ", presetSupported=" << presetSupported << ")\n";
 }
 
+// T-N4: 10,000 consecutive 1024-sample AAC packets at 44.1 kHz & 48 kHz produce 0 false overlap warnings.
+void testAacRoundingOverlapTolerance() {
+    std::cout << "[Test 13 / T-N4] ConcatTimestampState 10,000 AAC packet rounding tolerance...\n";
+    for (int rate : {44100, 48000}) {
+        replay::ConcatTimestampState state(0);
+        state.beginSegment();
+        const int64_t tol = replay::ConcatTimestampState::audioOverlapToleranceHns(rate);
+        const int64_t fixedDur = static_cast<int64_t>(std::llround(1024.0 * 10'000'000.0 / rate));
+        int overlaps = 0;
+        for (int pkt = 0; pkt < 10000; ++pkt) {
+            const int64_t ptsHns = static_cast<int64_t>(
+                std::llround(static_cast<double>(pkt) * 1024.0 * 10'000'000.0 / rate));
+            if (!state.recordWrittenSample(1, false, ptsHns, fixedDur, nullptr, tol)) {
+                ++overlaps;
+            }
+        }
+        CHECK(overlaps == 0);
+        // Real > 1 sample overlap still triggers warning cleanly.
+        const int64_t nextEnd = state.lastAudioEndByWriterStream[1];
+        CHECK(!state.recordWrittenSample(1, false, nextEnd - tol - 100, fixedDur, nullptr, tol));
+    }
+    std::cout << "  PASS Test 13 (T-N4)\n";
+}
+
 } // namespace
 
 int main() {
@@ -1329,6 +1353,7 @@ int main() {
         testAudioVideoMarkersContinuousSync();
         testContinuousSineWaveSeamContinuity();
         testHevcSoftwareWritableConsistency();
+        testAacRoundingOverlapTolerance();
     }
     std::cout << "ALL MACOS HOST TESTS PASSED!\n";
     return 0;

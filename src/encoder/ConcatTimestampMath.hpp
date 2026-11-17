@@ -59,13 +59,21 @@ struct ConcatTimestampState {
         outNewDts = newDts;
     }
 
-    // Records written sample bounds; returns false if audio overlaps the prior written packet on the stream.
+    // One-sample HNS tolerance (ceil(1e7 / sampleRate)) absorbs independent 100ns integer rounding
+    // of packet PTS vs duration (e.g. 1024/48000s = 213333.33 HNS, N4) without masking real overlaps.
+    static constexpr int64_t audioOverlapToleranceHns(int sampleRate = 44100) noexcept {
+        if (sampleRate <= 0) return 227LL;
+        return (10'000'000LL + sampleRate - 1) / sampleRate;
+    }
+
+    // Records written sample bounds; returns false if audio overlaps the prior written packet beyond toleranceHns.
     bool recordWrittenSample(
         uint32_t writerIndex,
         bool isVideo,
         int64_t sampleTime,
         int64_t sampleDuration,
-        int64_t* outPrevAudioEnd = nullptr
+        int64_t* outPrevAudioEnd = nullptr,
+        int64_t toleranceHns = audioOverlapToleranceHns(44100)
     ) {
         const int64_t dur = std::max<int64_t>(sampleDuration, 1LL);
         const int64_t sampleEnd = sampleTime + dur;
@@ -79,7 +87,8 @@ struct ConcatTimestampState {
         } else {
             auto it = lastAudioEndByWriterStream.find(writerIndex);
             if (it != lastAudioEndByWriterStream.end()) {
-                if (sampleTime < it->second) {
+                const int64_t tol = std::max<int64_t>(0, toleranceHns);
+                if (sampleTime + tol < it->second) {
                     overlap = true;
                     if (outPrevAudioEnd) *outPrevAudioEnd = it->second;
                 }

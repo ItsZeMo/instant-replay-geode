@@ -1668,6 +1668,22 @@ ConcatResult concatenateImpl(
 
         ConcatTimestampState concatState(0);
         size_t samplesWritten = 0;
+        size_t audioOverlapCount = 0;
+        int64_t maxAudioOverlapHns = 0;
+        uint32_t maxAudioOverlapStream = 0;
+
+        auto recordSampleWithOverlapTracking = [&](uint32_t streamId, bool isVideo, int64_t startHns, int64_t durHns, int sampleRate) {
+            int64_t prevAudioEnd = 0;
+            const int64_t tol = isVideo ? 0 : ConcatTimestampState::audioOverlapToleranceHns(sampleRate);
+            if (!concatState.recordWrittenSample(streamId, isVideo, startHns, durHns, &prevAudioEnd, tol)) {
+                ++audioOverlapCount;
+                const int64_t ov = std::max<int64_t>(1, prevAudioEnd - startHns);
+                if (ov > maxAudioOverlapHns) {
+                    maxAudioOverlapHns = ov;
+                    maxAudioOverlapStream = streamId;
+                }
+            }
+        };
 
         // 3. Remux every segment inside its own autoreleasepool (M9) so file descriptors & AVAsset objects drop each iteration.
         for (size_t segIdx = 0; segIdx < segmentPaths.size(); ++segIdx) {
@@ -1900,7 +1916,7 @@ ConcatResult concatenateImpl(
                                             curLayout.pendingPadSamples -= chunkFrames;
                                             const int64_t sHns = llround(static_cast<double>(startSample) * kHnsPerSecond / sr);
                                             const int64_t eHns = llround(static_cast<double>(curLayout.totalOutputSamples) * kHnsPerSecond / sr);
-                                            (void)concatState.recordWrittenSample(cur.streamId, false, sHns, std::max<int64_t>(1, eHns - sHns));
+                                            recordSampleWithOverlapTracking(cur.streamId, false, sHns, std::max<int64_t>(1, eHns - sHns), sr);
                                             lastProgress = std::chrono::steady_clock::now();
                                             maybeMarkTrackFinished();
                                             samplesWritten++;
@@ -1986,9 +2002,7 @@ ConcatResult concatenateImpl(
                                             curLayout.totalOutputSamples += static_cast<int64_t>(keptFrames);
                                             const int64_t sHns = llround(static_cast<double>(startSample) * kHnsPerSecond / sr);
                                             const int64_t eHns = llround(static_cast<double>(curLayout.totalOutputSamples) * kHnsPerSecond / sr);
-                                            int64_t prevAudioEnd = 0;
-                                            (void)concatState.recordWrittenSample(
-                                                cur.streamId, false, sHns, std::max<int64_t>(1, eHns - sHns), &prevAudioEnd);
+                                            recordSampleWithOverlapTracking(cur.streamId, false, sHns, std::max<int64_t>(1, eHns - sHns), sr);
 
                                             lastProgress = std::chrono::steady_clock::now();
                                             maybeMarkTrackFinished();
@@ -2103,12 +2117,9 @@ ConcatResult concatenateImpl(
                                         lastProgress = std::chrono::steady_clock::now();
                                         maybeMarkTrackFinished();
 
-                                        int64_t prevAudioEnd = 0;
-                                        if (!concatState.recordWrittenSample(cur.streamId, cur.isVideo, sampleTime, durHns, &prevAudioEnd)) {
-                                            geode::log::warn(
-                                                "VideoToolboxEncoder: audio stream {} packet at {} overlaps prior end {} in {}",
-                                                cur.streamId, sampleTime, prevAudioEnd, segLabel);
-                                        }
+                                        recordSampleWithOverlapTracking(
+                                            cur.streamId, cur.isVideo, sampleTime, durHns,
+                                            curLayout.sampleRate > 0 ? curLayout.sampleRate : 44100);
                                         samplesWritten++;
                                     }
 
@@ -2143,6 +2154,13 @@ ConcatResult concatenateImpl(
 
         if (samplesWritten == 0) {
             return fail("no media samples were written");
+        }
+        if (audioOverlapCount > 0) {
+            geode::log::warn(
+                "VideoToolboxEncoder: audio overlap across export (count={}, maxOverlap={:.3f} ms on stream {})",
+                audioOverlapCount,
+                static_cast<double>(maxAudioOverlapHns) / 10000.0,
+                maxAudioOverlapStream);
         }
 
         for (auto& tr : layout) {
