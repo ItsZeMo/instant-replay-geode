@@ -305,6 +305,7 @@ private:
     int m_videoHeight = 0;
     int m_sessionEffBitrateMbps = 0;
     int m_sessionEffMaxBitrateMbps = 0;
+    CodecBitrateTable m_sessionBitrateTable{}; // per-family session bitrates for codec fallbacks (W1)
     int64_t m_lastVideoHns = -1;
     int64_t m_gameAudioSamples = 0;
     int64_t m_micAudioSamples = 0;

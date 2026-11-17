@@ -4,6 +4,7 @@
 
 #ifdef GEODE_IS_WINDOWS
 
+#include "../config/BitrateMath.hpp"
 #include "../config/CodecUtils.hpp"
 #include "../config/ReplayConfig.hpp"
 #include "VideoEncoderTypes.hpp"
@@ -54,6 +55,10 @@ public:
         bool forcedHardware = true
     );
 
+    // Per-family session bitrates used by the fallback cascade in start() (W1). When unset, every
+    // attempt uses the bitrate passed to start().
+    void setFamilyBitrateTable(const CodecBitrateTable& table) noexcept { m_familyBitrates = table; }
+
     EncoderOpResult writeVideoFrame(IMFMediaBuffer* videoBuffer, int width, int height, int64_t timestampHns);
     EncoderOpResult writeGameAudio(const float* pcmFloat, int numSamples, int channels, int sampleRate, int64_t timestampHns);
     EncoderOpResult writeMicAudio(const float* pcmFloat, int numSamples, int channels, int sampleRate, int64_t timestampHns);
@@ -66,6 +71,8 @@ public:
     VideoCodecFamily activeCodecFamily() const noexcept;
     const GUID& activeSubtype() const noexcept { return m_activeSubtype; }
     bool activeHardware() const noexcept { return m_activeHardware; }
+    int activeBitrateMbps() const noexcept { return m_activeBitrateMbps; }
+    int activeMaxBitrateMbps() const noexcept { return m_activeMaxBitrateMbps; }
     std::string activeCodecName() const;
 
     // Identifies the stream layout of the current segment. Segments with different keys
@@ -116,6 +123,9 @@ private:
     std::string m_formatKey;
     GUID m_activeSubtype = GUID_NULL;
     bool m_activeHardware = true;
+    int m_activeBitrateMbps = 0;
+    int m_activeMaxBitrateMbps = 0;
+    CodecBitrateTable m_familyBitrates{};
 
     int64_t m_videoFrameDurationHns = 0;
 

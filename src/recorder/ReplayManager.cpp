@@ -691,6 +691,7 @@ void ReplayManager::startReplay() {
     m_videoHeight = 0;
     m_sessionEffBitrateMbps = 0;
     m_sessionEffMaxBitrateMbps = 0;
+    m_sessionBitrateTable = {};
     // Note: m_segmentIndex is intentionally NOT reset so segment filenames never
     // collide with files still being read by an in-flight export thread.
     m_lastVideoHns = -1;
@@ -795,6 +796,7 @@ void ReplayManager::finishStopCleanup() {
     m_lastWrittenVideoCaptureTime = {};
     m_sessionEffBitrateMbps = 0;
     m_sessionEffMaxBitrateMbps = 0;
+    m_sessionBitrateTable = {};
 
     {
         std::lock_guard<std::mutex> lock(m_queueMutex);
@@ -1795,10 +1797,12 @@ ReplayManager::PendingFinalizeInfo ReplayManager::finalizeCurrentSegment(bool sy
 
 void ReplayManager::ensureSessionBitrates(const ReplayConfig& cfg) {
     if (m_sessionEffBitrateMbps <= 0 && m_videoHeight > 0) {
-        m_sessionEffBitrateMbps = cfg.getEffectiveBitrateMbpsForHeight(m_videoHeight);
-        m_sessionEffMaxBitrateMbps = std::max(
-            cfg.getEffectiveMaxBitrateMbpsForHeight(m_videoHeight),
-            m_sessionEffBitrateMbps);
+        // Lock bitrates for every codec family once per session, so fallback encoders and
+        // pre-warmed rotations of the active codec all use the same per-family values (W1).
+        m_sessionBitrateTable = cfg.getCodecBitrateTableForHeight(m_videoHeight);
+        const EffectiveBitrates requested = m_sessionBitrateTable.forFamily(cfg.requestedCodecSpec().family);
+        m_sessionEffBitrateMbps = requested.meanMbps;
+        m_sessionEffMaxBitrateMbps = std::max(requested.maxMbps, requested.meanMbps);
     }
 }
 
@@ -1850,6 +1854,9 @@ bool ReplayManager::startNewSegment(
     int gameSampleRate = AudioGrabber::get()->getEncodedGameSampleRate();
     int effBitrate = m_sessionEffBitrateMbps;
     int effMaxBitrate = std::max(m_sessionEffMaxBitrateMbps, effBitrate);
+#ifdef GEODE_IS_WINDOWS
+    m_encoder->setFamilyBitrateTable(m_sessionBitrateTable);
+#endif
 
     m_lastStartError = m_encoder->start(
         m_currentSegmentPath,
@@ -1975,6 +1982,17 @@ void ReplayManager::startPrepareNextSegment(const ReplayConfig& cfg) {
     VideoCodecFamily forcedFamily = m_encoder->activeCodecFamily();
     bool forcedHardware = m_encoder->activeHardware();
     bool allowFallback = !hasForcedCodec;
+#ifdef GEODE_IS_WINDOWS
+    // The next segment is forced to the active (possibly fallback) codec: give it that family's bitrate
+    // so rotations keep the bitrate the first segment actually started with (W1).
+    if (hasForcedCodec && m_sessionBitrateTable.valid) {
+        const EffectiveBitrates active = m_sessionBitrateTable.forFamily(forcedFamily);
+        if (active.meanMbps > 0) {
+            effBitrate = active.meanMbps;
+            effMaxBitrate = std::max(active.maxMbps, active.meanMbps);
+        }
+    }
+#endif
 
     m_prepareFailedLastAttempt.store(false);
     m_prepareCancel.store(false);

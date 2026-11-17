@@ -4,6 +4,7 @@
 
 #if defined(GEODE_IS_WINDOWS) || defined(GEODE_IS_MACOS)
 
+#include "BitrateMath.hpp"
 #include "CodecUtils.hpp"
 #include <Geode/loader/SettingV3.hpp>
 #include <Geode/utils/string.hpp>
@@ -330,56 +331,46 @@ struct ReplayConfig {
     }
 
     double getFpsMultiplier() const noexcept {
-        int fps = targetFps.load();
-        if (fps <= 60) return 1.00;
-        if (fps == 120) return 1.40;
-        if (fps >= 240) return 1.95;
-        return 1.00 + (fps - 60) * 0.0053;
+        return fpsBitrateMultiplier(targetFps.load());
     }
 
-    double getCodecMultiplier() const noexcept {
-        switch (codec.load()) {
-            case CodecType::AV1: return 0.70;  // AV1: ~30% more efficient than H.264
-            case CodecType::HEVC: return 0.85; // HEVC: ~15% more efficient than H.264
-            case CodecType::H264: return 1.10; // H.264: standard baseline + packet overhead
-            default: return 1.00;
-        }
+    // Codec family the user asked for (presets and free-form custom strings like "av1_nvenc").
+    CodecTargetSpec requestedCodecSpec() const {
+        return resolveRequestedCodecSpec(static_cast<int>(codec.load()), hardwareAcceleration.load(), getCustomCodec());
     }
 
-    int getEffectiveBitrateMbpsForHeight(int sessionFrameHeight) const noexcept {
-        RateControlMode rc = rateControl.load();
-        int br = bitrateMbps.load();
-        if (rc == RateControlMode::CONSTANT_CBR) {
-            return std::clamp(br, 5, 250);
-        }
-        double mult = resolutionMultiplierForHeight(resolution.load(), sessionFrameHeight)
-                    * getFpsMultiplier()
-                    * getCodecMultiplier();
-        if (rc == RateControlMode::CONSTANT_QUALITY) {
-            double qMult = static_cast<double>(std::clamp(qualityLevel.load(), 20, 100)) / 80.0;
-            int val = static_cast<int>(br * mult * qMult + 0.5);
-            return std::clamp(val, 5, 250);
-        }
-        int val = static_cast<int>(br * mult + 0.5);
-        return std::clamp(val, 5, 250);
+    // Uses the family parsed from CUSTOM strings too, so "av1_nvenc" gets the AV1 factor (W1).
+    double getCodecMultiplier() const {
+        return codecBitrateMultiplier(requestedCodecSpec().family);
     }
 
-    int getEffectiveMaxBitrateMbpsForHeight(int sessionFrameHeight) const noexcept {
-        if (rateControl.load() == RateControlMode::CONSTANT_CBR) {
-            return getEffectiveBitrateMbpsForHeight(sessionFrameHeight);
-        }
-        double mult = resolutionMultiplierForHeight(resolution.load(), sessionFrameHeight)
-                    * getFpsMultiplier()
-                    * getCodecMultiplier();
-        int val = static_cast<int>(maxBitrateMbps.load() * mult + 0.5);
-        return std::clamp(val, 10, 300);
+    EffectiveBitrates getEffectiveBitratesForHeight(int sessionFrameHeight, VideoCodecFamily family) const {
+        return computeEffectiveBitrates(
+            bitrateMbps.load(), maxBitrateMbps.load(), qualityLevel.load(), static_cast<int>(rateControl.load()),
+            resolutionMultiplierForHeight(resolution.load(), sessionFrameHeight), getFpsMultiplier(), family);
     }
 
-    int getEffectiveBitrateMbps() const noexcept {
+    // Per-family bitrates for one session: lets the encoder fallback cascade (AV1 -> HEVC -> H.264)
+    // use the bitrate an explicit selection of the fallback codec would get (W1).
+    CodecBitrateTable getCodecBitrateTableForHeight(int sessionFrameHeight) const {
+        return computeCodecBitrateTable(
+            bitrateMbps.load(), maxBitrateMbps.load(), qualityLevel.load(), static_cast<int>(rateControl.load()),
+            resolutionMultiplierForHeight(resolution.load(), sessionFrameHeight), getFpsMultiplier());
+    }
+
+    int getEffectiveBitrateMbpsForHeight(int sessionFrameHeight) const {
+        return getEffectiveBitratesForHeight(sessionFrameHeight, requestedCodecSpec().family).meanMbps;
+    }
+
+    int getEffectiveMaxBitrateMbpsForHeight(int sessionFrameHeight) const {
+        return getEffectiveBitratesForHeight(sessionFrameHeight, requestedCodecSpec().family).maxMbps;
+    }
+
+    int getEffectiveBitrateMbps() const {
         return getEffectiveBitrateMbpsForHeight(s_nativeFrameHeight.load(std::memory_order_relaxed));
     }
 
-    int getEffectiveMaxBitrateMbps() const noexcept {
+    int getEffectiveMaxBitrateMbps() const {
         return getEffectiveMaxBitrateMbpsForHeight(s_nativeFrameHeight.load(std::memory_order_relaxed));
     }
 
@@ -437,7 +428,7 @@ struct ReplayConfig {
         return name + " (Software)";
     }
 
-    double estimateSizeMBForDuration(double durSeconds) const noexcept {
+    double estimateSizeMBForDuration(double durSeconds) const {
         double videoMbps = static_cast<double>(getEffectiveBitrateMbps());
         double audioMbps = 0.192; // Game audio AAC
         if (splitAudioTracks.load() && recordMic.load()) {
@@ -446,13 +437,13 @@ struct ReplayConfig {
         return ((videoMbps + audioMbps) * durSeconds) / 8.0;
     }
 
-    double getEstimatedFileSizeMB() const noexcept {
+    double getEstimatedFileSizeMB() const {
         return estimateSizeMBForDuration(static_cast<double>(durationSeconds.load()));
     }
 
     // Rolling segment buffer in TEMP keeps up to duration + 60s of completed 30s segments
     // plus the active 30s segment being recorded before the next purge (duration + 90s peak).
-    double getEstimatedTempBufferSizeMB() const noexcept {
+    double getEstimatedTempBufferSizeMB() const {
         return estimateSizeMBForDuration(static_cast<double>(durationSeconds.load()) + 90.0);
     }
 

@@ -20,6 +20,7 @@
 
 #include "capture/FrameBudget.hpp"
 #include "capture/GameAudioRing.hpp"
+#include "config/BitrateMath.hpp"
 #include "config/CodecUtils.hpp"
 #include "encoder/ConcatTimestampMath.hpp"
 #include "recorder/MicMixFifo.hpp"
@@ -807,6 +808,62 @@ void testH264BoundsAndCodecSpecC3() {
     std::cout << "  PASS Test 10\n";
 }
 
+
+void testCodecFallbackBitratesW1() {
+    std::cout << "[Test W1] Per-family session bitrates for codec fallbacks & CUSTOM multipliers...\n";
+    using replay::VideoCodecFamily;
+    const int vbr = replay::kRateControlAdaptiveVbr;
+
+    // Dev PC settings: base 80 / max 120 Mbps, 2160p preset (x2.4), 60 FPS, Adaptive VBR.
+    const double fps60 = replay::fpsBitrateMultiplier(60);
+    const auto table = replay::computeCodecBitrateTable(80, 120, 80, vbr, 2.4, fps60);
+    auto explicitSelection = [&](VideoCodecFamily f) {
+        return replay::computeEffectiveBitrates(80, 120, 80, vbr, 2.4, fps60, f);
+    };
+    CHECK(table.valid);
+    CHECK(table.forFamily(VideoCodecFamily::AV1).meanMbps == 134);
+    CHECK(table.forFamily(VideoCodecFamily::AV1).maxMbps == 202);
+
+    // AV1 -> HEVC and AV1 -> H.264 fallbacks get exactly what an explicit HEVC / H.264 selection gets.
+    const auto hevc = table.forFamily(VideoCodecFamily::HEVC);
+    const auto h264 = table.forFamily(VideoCodecFamily::H264);
+    CHECK(hevc.meanMbps == explicitSelection(VideoCodecFamily::HEVC).meanMbps && hevc.meanMbps == 163);
+    CHECK(hevc.maxMbps == explicitSelection(VideoCodecFamily::HEVC).maxMbps && hevc.maxMbps == 245);
+    CHECK(h264.meanMbps == explicitSelection(VideoCodecFamily::H264).meanMbps && h264.meanMbps == 211);
+    CHECK(h264.maxMbps == 300); // 316.8 clamped to the 300 Mbps ceiling
+
+    // Exhaustive: every base/res/fps/rc combination keeps the table identical to direct per-family math.
+    for (int base : {5, 12, 35, 50, 80, 133, 250}) {
+        for (double res : {0.5, 1.0, 1.6, 2.4}) {
+            for (int fps : {30, 60, 120, 144, 240}) {
+                for (int rc : {replay::kRateControlAdaptiveVbr, replay::kRateControlCbr, replay::kRateControlQuality}) {
+                    const auto t = replay::computeCodecBitrateTable(base, base * 2, 65, rc, res, replay::fpsBitrateMultiplier(fps));
+                    for (auto fam : {VideoCodecFamily::H264, VideoCodecFamily::HEVC, VideoCodecFamily::AV1}) {
+                        const auto d = replay::computeEffectiveBitrates(base, base * 2, 65, rc, res, replay::fpsBitrateMultiplier(fps), fam);
+                        CHECK(t.forFamily(fam).meanMbps == d.meanMbps && t.forFamily(fam).maxMbps == d.maxMbps);
+                        CHECK(d.maxMbps >= d.meanMbps);
+                    }
+                }
+            }
+        }
+    }
+
+    // CBR is an explicit target: never scaled per codec.
+    const auto cbr = replay::computeCodecBitrateTable(80, 120, 80, replay::kRateControlCbr, 2.4, fps60);
+    CHECK(cbr.forFamily(VideoCodecFamily::AV1).meanMbps == 80 && cbr.forFamily(VideoCodecFamily::H264).meanMbps == 80);
+
+    // CUSTOM strings use the parsed family's multiplier instead of a flat x1.00.
+    auto customMult = [](const char* s) {
+        return replay::codecBitrateMultiplier(replay::resolveRequestedCodecSpec(3, true, s).family);
+    };
+    CHECK(std::abs(customMult("av1_nvenc") - 0.70) < 1e-9);
+    CHECK(std::abs(customMult("software_h264") - 1.10) < 1e-9);
+    CHECK(std::abs(customMult("hevc_amf") - 0.85) < 1e-9);
+    // Preset H.264 and custom "h264" resolve to the same family -> same effective bitrate.
+    CHECK(replay::resolveRequestedCodecSpec(3, true, "h264").family == replay::resolveRequestedCodecSpec(2, true, "").family);
+
+    std::cout << "  PASS Test W1\n";
+}
 } // namespace
 
 int main() {
@@ -819,6 +876,7 @@ int main() {
     testGameAudioRing();
     testMicMixFifo();
     testH264BoundsAndCodecSpecC3();
+    testCodecFallbackBitratesW1();
 
     MFShutdown();
     CoUninitialize();

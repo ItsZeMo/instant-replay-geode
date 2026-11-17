@@ -188,6 +188,8 @@ EncoderOpResult MediaFoundationEncoder::start(
     m_formatKey.clear();
     m_activeSubtype = GUID_NULL;
     m_activeHardware = hardwareAcceleration;
+    m_activeBitrateMbps = 0;
+    m_activeMaxBitrateMbps = 0;
 
     bool enableHardware = hardwareAcceleration;
     const CodecTargetSpec resolvedSpec = resolveRequestedCodecSpec(
@@ -263,9 +265,20 @@ EncoderOpResult MediaFoundationEncoder::start(
         const auto& attempt = attempts[i];
         bool isPrimary = (attempt.subtype == targetSubtype && attempt.hardware == enableHardware);
 
+        // Each cascade attempt gets the bitrate an explicit selection of its codec family would get,
+        // instead of reusing the requested family's value (AV1 x0.70 starving an HEVC/H.264 fallback, W1).
+        StartParams attemptParams = params;
+        if (m_familyBitrates.valid) {
+            const EffectiveBitrates familyRates = m_familyBitrates.forFamily(familyForGuid(attempt.subtype));
+            if (familyRates.meanMbps > 0) {
+                attemptParams.bitrateMbps = familyRates.meanMbps;
+                attemptParams.maxBitrateMbps = std::max(familyRates.maxMbps, familyRates.meanMbps);
+            }
+        }
+
         HRESULT failHr = S_OK;
         std::string error;
-        bool started = tryStartLocked(outputPath, attempt.subtype, attempt.hardware, params, failHr, error);
+        bool started = tryStartLocked(outputPath, attempt.subtype, attempt.hardware, attemptParams, failHr, error);
 
         // If the primary hardware codec fails transiently (e.g. concurrent NVENC session limit while
         // the previous segment is still finalizing in the background), wait for background finalization
@@ -277,7 +290,7 @@ EncoderOpResult MediaFoundationEncoder::start(
             onBeforeFallback();
             failHr = S_OK;
             error.clear();
-            started = tryStartLocked(outputPath, attempt.subtype, attempt.hardware, params, failHr, error);
+            started = tryStartLocked(outputPath, attempt.subtype, attempt.hardware, attemptParams, failHr, error);
         }
 
         if (started) {
@@ -289,6 +302,8 @@ EncoderOpResult MediaFoundationEncoder::start(
             m_formatKey = key;
             m_activeSubtype = attempt.subtype;
             m_activeHardware = attempt.hardware;
+            m_activeBitrateMbps = attemptParams.bitrateMbps;
+            m_activeMaxBitrateMbps = attemptParams.maxBitrateMbps;
             m_recording = true;
 
             {
@@ -317,12 +332,12 @@ EncoderOpResult MediaFoundationEncoder::start(
                     s_lastLoggedCodecKey = logKey;
                     geode::log::warn(
                         "Instant Replay: requested codec unavailable, fell back to {} ({}x{} @ {} FPS, effBitrate={} Mbps, effMaxBitrate={} Mbps)",
-                        codecLabel, width, height, fps, params.bitrateMbps, params.maxBitrateMbps);
+                        codecLabel, width, height, fps, attemptParams.bitrateMbps, attemptParams.maxBitrateMbps);
                 } else {
                     s_lastLoggedCodecKey = logKey;
                     geode::log::info(
                         "Instant Replay: encoder started with {} ({}x{} @ {} FPS, effBitrate={} Mbps, effMaxBitrate={} Mbps)",
-                        codecLabel, width, height, fps, params.bitrateMbps, params.maxBitrateMbps);
+                        codecLabel, width, height, fps, attemptParams.bitrateMbps, attemptParams.maxBitrateMbps);
                 }
             }
             return {true, S_OK, codecLabel};
