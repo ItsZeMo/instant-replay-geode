@@ -2971,7 +2971,7 @@ void ReplayManager::openRecordingsFolder() {
         std::filesystem::path dir = cfg.getRecordingsDirectory(true);
         std::error_code ec;
         bool exists = std::filesystem::exists(dir, ec) && std::filesystem::is_directory(dir, ec);
-        // AppKit/NSWorkspace in geode::utils::file::openFolder must execute on the main thread (M17).
+        // Dispatch back to GD's Geode main queue (runs on CVDisplayLink on macOS, N11) after off-thread dir checks (M17).
         geode::queueInMainThread([dir, exists]() {
             bool opened = exists && geode::utils::file::openFolder(dir);
             if (!opened) {

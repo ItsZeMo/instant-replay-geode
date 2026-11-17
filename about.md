@@ -3,7 +3,7 @@
 > **Developer:** **ZeMo**  
 > **Version:** **v1.0.5** | **Platforms:** Windows 64-bit & macOS Universal (`arm64` / `x86_64`) (Geometry Dash 2.2081 / Geode v5.11.2)
 
-Never lose an epic demon completion, new best, or hilarious fail again! **Instant Replay** brings high-performance, background replay recording directly into Geometry Dash with zero FPS impact, GPU hardware acceleration, adaptive bitrate, multi-track audio, and seamless Geode integration.
+Never lose an epic demon completion, new best, or hilarious fail again! **Instant Replay** brings high-performance, background replay recording directly into Geometry Dash with low overhead, GPU hardware acceleration, adaptive bitrate, multi-track audio, and seamless Geode integration.
 
 ---
 
@@ -15,10 +15,10 @@ Never lose an epic demon completion, new best, or hilarious fail again! **Instan
 * **Fully Customizable Duration:** Quick presets (`30s`, `1m`, `2m`, `5m`, `10m`) or **manual second-by-second duration** from 5 seconds up to an entire hour (5 – 3600 seconds).
 
 ### 🚀 Next-Gen Video Codecs & Hardware Acceleration
-* **AV1:** Next-generation encoding offering pristine visual clarity at drastically reduced file sizes (RTX 40-Series, Radeon RX 7000, Intel Arc, or Apple M3+ GPU hardware; automatically gated to HEVC/H.264 on Macs without AV1 HW encode).
+* **AV1:** Next-generation encoding offering pristine visual clarity at drastically reduced file sizes (RTX 40-Series, Radeon RX 7000, Intel Arc on Windows; automatically gated to HEVC/H.264 on Macs where Apple VideoToolbox does not expose AV1 encode).
 * **HEVC (H.265):** Superior visual fidelity and compression efficiency across modern graphics cards (GTX 16 / RTX 20 / RTX 30 / Radeon RX 5000 / 6000 / Apple Silicon VideoToolbox).
 * **H.264:** Maximum compatibility across all media players, web platforms, and Discord (intelligently bounds resolutions & framerates according to H.264 profile limits).
-* **Automatic Hardware Acceleration Toggle:** Automatically selects the best hardware encoder (NVIDIA NVENC, AMD AMF, Intel QuickSync on Windows; Apple VideoToolbox on macOS). Falls back to CPU software encoding (`H.264` software on macOS) if disabled.
+* **Automatic Hardware Acceleration Toggle:** Automatically selects the best hardware encoder (NVIDIA NVENC, AMD AMF, Intel QuickSync on Windows; Apple VideoToolbox on macOS). Switches unsupported presets (such as AV1 or non-writable software HEVC on macOS) to `H.264` software encoding when disabled.
 
 ### 📊 Dynamic File Size Estimator & Low Disk Space Warning
 * **Real-Time Size Calculation:** Live indicator inspired by *Adobe Premiere Pro* that continuously updates the estimated file size (`~X MB` / `~X.XX GB`) in real time as you change duration, resolution, target framerate, or codec.
@@ -66,7 +66,7 @@ Never lose an epic demon completion, new best, or hilarious fail again! **Instan
 * **AMD Radeon (RX 7000):** Select **AV1** or **HEVC** with Hardware Acceleration enabled.
 * **AMD Radeon (RX 5000 / 6000):** Select **HEVC** or **H.264** with Hardware Acceleration enabled.
 * **Intel Arc & Core Ultra:** Select **AV1** with Hardware Acceleration enabled.
-* **Apple Silicon / Intel Macs:** Select **HEVC** (recommended) or **H.264** with Hardware Acceleration enabled (AV1 HW is enabled automatically on M3+ Macs).
+* **Apple Silicon / Intel Macs:** Select **HEVC** (recommended) or **H.264** with Hardware Acceleration enabled (AV1 is automatically gated unless Apple VideoToolbox reports hardware encode support).
 * **Laptops / Integrated Graphics / Budget PCs:** Select **H.264** with Hardware Acceleration (or CPU fallback).
 
 ### 3. Editing Separate Audio Tracks
@@ -79,7 +79,7 @@ If **«Separate Audio Tracks»** is enabled:
 ## ❓ Frequently Asked Questions (FAQ)
 
 **Q: Does background replay affect FPS?**  
-A: No noticeable impact. Frame scaling and encoding utilize hardware GPU memory and dedicated hardware media engines (NVENC / AMF / QSV / Apple VideoToolbox) with zero gameplay stutter.
+A: Usually minimal impact. Encoding runs on dedicated hardware media engines (NVENC / AMF / QSV / Apple VideoToolbox) asynchronously; frame readback still copies framebuffer pixels (`glMapBuffer` + `memcpy`, ~5 MB/frame at 1440x900) on the render thread, so lowering resolution/FPS helps on high-resolution Retina displays.
 
 **Q: Where are recordings saved?**  
 A: By default, in `C:\Users\<YourUser>\Videos\Geometry Dash\` on Windows or `~/Movies/Geometry Dash/` on macOS. You can customize this on the **Audio & Storage** tab.

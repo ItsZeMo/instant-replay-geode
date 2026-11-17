@@ -3,7 +3,7 @@
 > **Developer:** ZeMo (`zemo.instant-replay`)  
 > **Platforms:** Windows 64-bit (`x86_64`) & macOS Universal (`arm64` + `x86_64`) | **Geometry Dash:** `2.2081` | **Geode SDK:** `v5.11.2` | **Standard:** C++23 / Objective-C++23
 
-Hardware-accelerated, ShadowPlay-style background **Instant Replay** recorder built natively into Geometry Dash. Continuously buffers the last `N` seconds of gameplay (5s – 3600s) into rolling segments and exports an MP4 on demand (`F6`) with zero FPS drop.
+Hardware-accelerated, ShadowPlay-style background **Instant Replay** recorder built natively into Geometry Dash. Continuously buffers the last `N` seconds of gameplay (5s – 3600s) into rolling segments and exports an MP4 on demand (`F6`) with low capture overhead.
 
 > 🤖 **Using an LLM / AI Coding Assistant?**  
 > Read **[AGENTS.md](./AGENTS.md)** (or **[CLAUDE.md](./CLAUDE.md)**) first — it documents every source file, thread boundary, Windows Media Foundation / macOS VideoToolbox pipeline detail, and Geode UI invariant.
@@ -15,7 +15,7 @@ Hardware-accelerated, ShadowPlay-style background **Instant Replay** recorder bu
 - **1-Click Instant Save (`F6`):** Saves the last `5` to `3600` seconds of gameplay into a ready-to-share `.mp4` file.
 - **Hardware-Accelerated Encoding:**
   - **Windows:** Windows Media Foundation (`IMFSinkWriter`) across NVIDIA NVENC, AMD AMF, and Intel QuickSync (`AV1 (HW) → HEVC (HW) → H.264 (HW) → H.264 (SW)`).
-  - **macOS:** Native Apple VideoToolbox (`AVAssetWriter` + `VTCompressionSession` + `CVPixelBuffer`) with runtime `VTCopyVideoEncoderList` capability probing (e.g., M1/M2 automatically gate unsupported AV1 to HEVC/H.264; software mode prefers H.264) and BT.709 color tagging.
+  - **macOS:** Native Apple VideoToolbox (`AVAssetWriter` + `VTCompressionSession` + `CVPixelBuffer`) with runtime `VTCopyVideoEncoderList` + `AVAssetWriter` writability probing (gating unsupported codecs such as AV1 and non-writable software HEVC, and preferring `H.264 (SW)` in software mode when needed) and BT.709 color tagging.
 - **Rate Control Modes:** Adaptive VBR (peak-constrained, 5–250 Mbps target / up to 300 Mbps peak), Constant Bitrate (CBR), and Constant Quality (CQ).
 - **Zero-Allocation Real-Time Capture:**
   - **Video:** GPU-side FBO scaling (`glBlitFramebuffer`, with Retina backing pixel awareness and Y-flip blit on macOS), double-buffered asynchronous PBO readback (`GL_BGRA`), reusable `CapturedFrame` (`IMFMediaBuffer` / `CVPixelBuffer`) pools, and phase-preserving frame pacing (`60`, `120`, `240` FPS).
@@ -33,7 +33,7 @@ flowchart LR
     FMOD["FMOD Master DSP<br/>(Lock-Free SPSC Ring Buffer)"] --> Q
     MIC["WASAPI (Win) / CoreAudio (Mac)<br/>(Stateful 48kHz Resampler)"] --> Q
     Q --> ENC["MF (Win) / VideoToolbox (Mac)<br/>(30s Rolling MP4 Segments)"]
-    ENC -->|Press F6| REMUX["concatenateSegments<br/>(Keyframe Trim + Lossless Remux)"]
+    ENC -->|Press F6| REMUX["concatenateSegments<br/>(Keyframe Trim + Video Remux / Continuous Audio)"]
     REMUX --> MP4["Final Replay .mp4"]
 ```
 
@@ -50,9 +50,9 @@ flowchart LR
 | [`src/capture/AudioGrabber.cpp`](./src/capture/AudioGrabber.cpp) | Lock-free FMOD DSP game audio ring buffer & stateful WASAPI microphone capture (Windows) |
 | [`src/capture/AudioGrabberMac.mm`](./src/capture/AudioGrabberMac.mm) | CoreAudio `AudioQueue` microphone capture, TCC permission handling, and fallback recovery (macOS) |
 | [`src/encoder/MediaFoundationEncoder.cpp`](./src/encoder/MediaFoundationEncoder.cpp) | `IMFSinkWriter` encoder & `IMFSourceReader` lossless MP4 remuxer (Windows) |
-| [`src/encoder/VideoToolboxEncoder.mm`](./src/encoder/VideoToolboxEncoder.mm) | `AVAssetWriter` + VideoToolbox encoder, bounded deferred audio queues, and `AVAssetReader` lossless MP4 remuxer (macOS) |
-| [`src/platform/MacPlatformUtils.mm`](./src/platform/MacPlatformUtils.mm) | Cocoa directories, Retina GL backing size query, `NSOpenGLContext::flushBuffer` hook & PID identity checks (macOS) |
-| [`src/platform/MacVideoCapabilities.mm`](./src/platform/MacVideoCapabilities.mm) | Runtime `VTCopyVideoEncoderList` capability detection & oversize Retina probe cache (macOS) |
+| [`src/encoder/VideoToolboxEncoder.mm`](./src/encoder/VideoToolboxEncoder.mm) | `AVAssetWriter` + VideoToolbox encoder, bounded deferred audio queues, and `AVAssetReader` MP4 export (passthrough video + continuous AAC audio) (macOS) |
+| [`src/platform/MacPlatformUtils.mm`](./src/platform/MacPlatformUtils.mm) | Cocoa directories, GL drawable size query, `NSOpenGLContext::flushBuffer` hook & PID identity checks (macOS) |
+| [`src/platform/MacVideoCapabilities.mm`](./src/platform/MacVideoCapabilities.mm) | Runtime `VTCopyVideoEncoderList` + `AVAssetWriter` writability detection & oversize Retina probe cache (macOS) |
 | [`src/recorder/ReplayManager.cpp`](./src/recorder/ReplayManager.cpp) | Async segment rotation, single-track mic mixer, export file locking, and error recovery |
 | [`src/ui/ReplayPopup.cpp`](./src/ui/ReplayPopup.cpp) | In-game 4-tab settings and status popup (`F9`) |
 | [`src/ui/CodecGuidePopup.cpp`](./src/ui/CodecGuidePopup.cpp) | In-game GPU / VideoToolbox codec guide popup |

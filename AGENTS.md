@@ -74,7 +74,7 @@ instant-replay-geode/
 
 2. **Audio Capture (`src/capture/AudioGrabber.cpp`, `src/capture/AudioGrabberMac.mm`)**
    - **Game Audio:** Custom FMOD DSP attached to the tail of the Master `ChannelGroup`. Writes normalized 2-channel stereo float PCM into a pre-allocated **lock-free SPSC ring buffer + 8192-entry packet metadata ring** (`GameAudioRing`, 262144 stereo frames / ~5.46s @ 48 kHz) with zero heap allocations or mutex locks on the FMOD mixer thread.
-   - **Microphone Audio:** Event-driven WASAPI capture (Windows) and CoreAudio `AudioQueue` (macOS), started only when both `enabled` and `recordMic` are true and stopped immediately in `ReplayManager::stopReplay()`. On macOS, checks `[AVCaptureDevice authorizationStatusForMediaType:]` before touching CoreAudio, monitors 3-second digital silence, and falls back to the system default input when a chosen mic disconnects (reattaching when it returns).
+   - **Microphone Audio:** Event-driven WASAPI capture (Windows) and CoreAudio `AudioQueue` (macOS), started only when both `enabled` and `recordMic` are true and stopped immediately in `ReplayManager::stopReplay()`. On macOS, checks `[AVCaptureDevice authorizationStatusForMediaType:]` + bundle `NSMicrophoneUsageDescription` before touching CoreAudio (`BlockedNoUsageDescription` alerts when non-Steam launches are muted by TCC after 3s silence or denied without usage key, vs `PermissionDenied` / `DigitalSilenceDetected`), and falls back to the system default input when a chosen mic disconnects (reattaching when it returns).
 
 3. **Worker Thread & Rolling Segments (`src/recorder/ReplayManager.cpp`)**
    - Takes an immutable `ReplayConfig` snapshot (`m_sessionConfig`) at `startReplay()`, locks the session output resolution and video bitrates once.
@@ -84,10 +84,12 @@ instant-replay-geode/
 
 4. **Platform Encoders & Fallback Cascade (`MediaFoundationEncoder` / `VideoToolboxEncoder`)**
    - **Windows (`MediaFoundationEncoder.cpp`):** `IMFSinkWriter` with `MF_SINK_WRITER_DISABLE_THROTTLING = TRUE` and fallback cascade `Cached -> Requested (HW) -> HEVC (HW) -> H.264 (HW) -> H.264 (SW)`.
-   - **macOS (`VideoToolboxEncoder.mm`):** `AVAssetWriter` + VideoToolbox (`VTCompressionSession` probe, `VTCopyVideoEncoderList` runtime gating so AV1 is disabled cleanly on M1/M2, `H.264 (SW)` preferred in software mode), BT.709 color properties, buffered deferred AAC FIFO (`kMaxPendingAudioSeconds = 10.0`), 60s `finishWriting` timeouts, `@try/@catch` ObjC exception guards with `-fobjc-arc-exceptions`, and `-fobjc-arc`.
+   - **macOS (`VideoToolboxEncoder.mm`):** `AVAssetWriter` + VideoToolbox (`VTCompressionSession` probe, `VTCopyVideoEncoderList` + `AVAssetWriter canApplyOutputSettings` gating so unsupported codecs like AV1 or non-writable SW HEVC switch cleanly to `H.264`; `H.264 (SW)` preferred in software mode if the selected codec is unsupported), BT.709 color properties, buffered deferred AAC FIFO (`kMaxPendingAudioSeconds = 10.0`), 60s `finishWriting` timeouts, `@try/@catch` ObjC exception guards with `-fobjc-arc-exceptions`, and `-fobjc-arc`.
 
-5. **Saving & Lossless Segment Remuxing (`concatenateSegments`)**
-   - On `F6`, performs a hot-swap onto the pre-warmed encoder, locks selected segment paths in `m_exportLockedSegments`, scans segment 0 for a keyframe near `trimStartSeconds` (shifting initial PTS by negative B-frame decode lead), and remuxes compressed video/audio tracks chronologically without re-encoding. On macOS, preserves `mediaTimeScale` (1 MHz) on passthrough video, sets `expectsMediaDataInRealTime = YES` + 10s stall watchdog, frees segment AVAsset/reader objects per iteration via inner `@autoreleasepool`, and rebases sample timings by `targetOutputPTS - origOutputPTS` delta so AAC priming offsets stay intact.
+5. **Saving & Segment Export (`concatenateSegments`)**
+   - On `F6`, performs a hot-swap onto the pre-warmed encoder, locks selected segment paths in `m_exportLockedSegments`, and scans segment 0 for a keyframe near `trimStartSeconds`.
+   - **Windows (`MediaFoundationEncoder.cpp`):** remuxes compressed video/audio tracks chronologically via `IMFSourceReader`/`IMFSinkWriter`.
+   - **macOS (`VideoToolboxEncoder.mm`):** passes through compressed video rebased directly from raw track timings (`allowNegativeDts = true`, `clampPtsToDts = false`, `1 MHz` `mediaTimeScale` preserved, zero empty edit on H.264 B-frames), decodes all audio tracks via `AVAssetReaderTrackOutput` to Float32 interleaved LPCM (resolving AAC priming & remainder edits automatically), and encodes uninterrupted AAC streams (`192 kbps` first track / `128 kbps` split track) with sample-exact seam padding/trimming and per-iteration `@autoreleasepool` cleanup (M9). Uses `expectsMediaDataInRealTime = YES` + 10s stall watchdog (M1) and 1-sample HNS overlap tolerance (`ConcatTimestampState::audioOverlapToleranceHns`, N4).
 
 ---
 
@@ -103,8 +105,8 @@ instant-replay-geode/
    In `ReplayPopup::refreshUI()`, `updateFolderDisplay()`, and `syncUnfocusedInputsToConfig()`, always check `!isInputFocused(input)` before calling `input->setString(...)`, otherwise typing multi-digit numbers (like `"35"` or `"100"`) will clobber the user's input mid-keystroke.
 5. **Clean Shutdown, OpenGL Contexts & COM Lifetime:**
    `ReplayManager::shutdown()` is hooked on `$on_game(Exiting)` in `src/main.cpp` (disabling the macOS `flushBuffer` hook first) so OpenGL FBOs/PBOs and FMOD DSPs are released while valid. On macOS/Windows `FrameGrabber::resetGlResources(true)` verifies the current thread holds the owning GL context before `glDelete*`, and the `flushBuffer` hook saves/restores any previous CGL context. All `ComRef` wrappers on Windows worker/WASAPI threads must be destroyed before `CoUninitialize()`.
-6. **Main-Thread-Only Cocos2d / GD APIs, AppKit, `Notification`, and `FMODAudioEngine`:**
-   Never call cocos2d-x APIs, Geometry Dash classes, AppKit (`geode::utils::file::openFolder` / `NSWorkspace`), `geode::Notification` / `ReplayNotification`, or `FMODAudioEngine` from worker, finalize, prepare, export, WASAPI/CoreAudio, or FMOD mixer threads. Marshal all UI/AppKit/notification/audio-engine actions via `geode::queueInMainThread`.
+6. **Game/UI-Thread-Only Cocos2d / GD APIs, `Notification`, and `FMODAudioEngine`:**
+   Never call cocos2d-x APIs, Geometry Dash classes, `geode::utils::file::openFolder`, `geode::Notification` / `ReplayNotification`, or `FMODAudioEngine` from worker, finalize, prepare, export, WASAPI/CoreAudio, or FMOD mixer threads. Marshal all GD/notification/audio-engine actions via `geode::queueInMainThread`. Note (N11): on macOS, Cocos2d and `geode::queueInMainThread` run on GD's `CVDisplayLink` thread (`[NSThread isMainThread]` is `NO`), not AppKit's main thread.
 7. **macOS ARC, ObjC Exceptions & Capture Hooks:**
    `.mm` files compile with `-fobjc-arc -fobjc-arc-exceptions`; wrap AVFoundation/VideoToolbox calls in `@try / @catch (NSException*)` so Objective-C exceptions never unwind into C++ frames. Never inline-hook AppKit/system frameworks on macOS; use `geode::hook::replaceObjcMethod` (`method_setImplementation`).
 
