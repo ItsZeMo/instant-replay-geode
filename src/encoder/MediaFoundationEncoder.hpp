@@ -118,7 +118,9 @@ private:
         RateControlMode rateControl = RateControlMode::ADAPTIVE_VBR;
         bool splitAudio = false;
         int gameSampleRate = 48000;
-        bool colorTags = true; // explicit BT.709 / limited-range signalling on the video types (W12)
+        // Optional media type extensions: BT.709 / limited-range signalling (W12) and, for H.264,
+        // High profile with an explicit level (W13). Dropped together on the compatibility retry.
+        bool typeExtensions = true;
     };
 
     bool tryStartLocked(const std::wstring& outputPath, const GUID& subtype, bool hardware,
@@ -148,6 +150,8 @@ private:
     int m_activeMaxBitrateMbps = 0;
     bool m_gamePrerollWritten = false;
     bool m_micPrerollWritten = false;
+    int m_readbackMeanMbps = 0; // encoder-reported bitrates after configuration (0 = unavailable, W13)
+    int m_readbackMaxMbps = 0;
     CodecBitrateTable m_familyBitrates{};
 
     int64_t m_videoFrameDurationHns = 0;
