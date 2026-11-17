@@ -23,7 +23,7 @@ Never lose an epic demon completion, new best, or hilarious fail again! **Instan
 ### 📊 Dynamic File Size Estimator & Low Disk Space Warning
 * **Real-Time Size Calculation:** Live indicator inspired by *Adobe Premiere Pro* that continuously updates the estimated file size (`~X MB` / `~X.XX GB`) in real time as you change duration, resolution, target framerate, or codec.
 * **Low Disk Space Alert:** Automatically warns you if your hard drive or SSD is running low on space or if the upcoming replay may exceed the remaining free space.
-* **Bitrate Control:** Choose between Adaptive VBR (saves storage during menus/idle scenes and boosts bitrate during high-speed wave/ship gameplay) or Constant Bitrate (CBR) with custom manual Mbps input.
+* **Bitrate Control:** Choose between Adaptive VBR (saves storage during menus/idle scenes and boosts bitrate during high-speed wave/ship gameplay) or Constant Bitrate (CBR) with custom manual Mbps input. In VBR and Quality mode the Mbps value is a base for 1080p60 that is scaled by the recorded size, FPS and codec (the popup shows the effective bitrate); CBR records exactly the Mbps you enter.
 
 ### 🎙️ Multi-Track Studio Audio & Physical Microphone Picker
 * **Separate Audio Tracks:** Game sound and microphone are recorded into **two separate, independent audio streams** inside the single MP4 container. When opened in *Adobe Premiere Pro, DaVinci Resolve,* or *Sony Vegas*, you can adjust voice and game volume independently!

@@ -90,6 +90,7 @@ private:
     geode::TextInput* m_customCodecInput = nullptr;
     geode::TextInput* m_saveFolderInput = nullptr;
     geode::TextInput* m_customBitrateInput = nullptr;
+    cocos2d::CCLabelBMFont* m_bitrateHintLabel = nullptr;
 
     // Menus to update active/locked state
     cocos2d::CCMenu* m_durationMenu = nullptr;

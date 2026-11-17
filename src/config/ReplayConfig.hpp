@@ -139,6 +139,7 @@ struct ReplayConfig {
     std::string customTempFolder = "";
 
     static inline std::atomic<int> s_nativeFrameHeight{1080};
+    static inline std::atomic<int> s_nativeFrameWidth{1920};
 
     // Resolves physical OpenGL drawable dimensions across Windows and macOS Retina (backing pixels).
     // On macOS, delegates strictly to getMacOpenGLDrawableSize() (NSView on AppKit main or active
@@ -165,6 +166,7 @@ struct ReplayConfig {
         int w = 0, h = 0;
         if (getNativeFramebufferSize(w, h) && h > 0) {
             s_nativeFrameHeight.store(h, std::memory_order_relaxed);
+            s_nativeFrameWidth.store(w, std::memory_order_relaxed);
         }
     }
 
@@ -308,29 +310,6 @@ struct ReplayConfig {
         customTempFolder = val;
     }
 
-    static double resolutionMultiplierForHeight(ResolutionType res, int sessionFrameHeight) noexcept {
-        switch (res) {
-            case ResolutionType::HD_720P:   return 0.50;
-            case ResolutionType::FHD_1080P: return 1.00;
-            case ResolutionType::QHD_1440P: return 1.60;
-            case ResolutionType::UHD_4K:    return 2.40;
-            case ResolutionType::NATIVE: {
-                if (sessionFrameHeight > 0) {
-                    double factor = static_cast<double>(sessionFrameHeight) / 1080.0;
-                    return std::clamp(factor, 0.50, 2.50);
-                }
-                return 1.00;
-            }
-            default: return 1.00;
-        }
-    }
-
-    // Thread-safe: reads only atomic state, never touches CCEGLView on worker threads (#18).
-    double getResolutionMultiplier() const noexcept {
-        return resolutionMultiplierForHeight(
-            resolution.load(), s_nativeFrameHeight.load(std::memory_order_relaxed));
-    }
-
     double getFpsMultiplier() const noexcept {
         return fpsBitrateMultiplier(targetFps.load());
     }
@@ -345,34 +324,41 @@ struct ReplayConfig {
         return codecBitrateMultiplier(requestedCodecSpec().family);
     }
 
-    EffectiveBitrates getEffectiveBitratesForHeight(int sessionFrameHeight, VideoCodecFamily family) const {
+    // Effective bitrates for the size actually encoded (session video size or the UI estimate, W9).
+    EffectiveBitrates getEffectiveBitratesForOutput(int outWidth, int outHeight, VideoCodecFamily family) const {
         return computeEffectiveBitrates(
             bitrateMbps.load(), maxBitrateMbps.load(), qualityLevel.load(), static_cast<int>(rateControl.load()),
-            resolutionMultiplierForHeight(resolution.load(), sessionFrameHeight), getFpsMultiplier(), family);
+            resolutionBitrateMultiplier(outWidth, outHeight), getFpsMultiplier(), family);
     }
 
     // Per-family bitrates for one session: lets the encoder fallback cascade (AV1 -> HEVC -> H.264)
     // use the bitrate an explicit selection of the fallback codec would get (W1).
-    CodecBitrateTable getCodecBitrateTableForHeight(int sessionFrameHeight) const {
+    CodecBitrateTable getCodecBitrateTableForOutput(int outWidth, int outHeight) const {
         return computeCodecBitrateTable(
             bitrateMbps.load(), maxBitrateMbps.load(), qualityLevel.load(), static_cast<int>(rateControl.load()),
-            resolutionMultiplierForHeight(resolution.load(), sessionFrameHeight), getFpsMultiplier());
+            resolutionBitrateMultiplier(outWidth, outHeight), getFpsMultiplier());
     }
 
-    int getEffectiveBitrateMbpsForHeight(int sessionFrameHeight) const {
-        return getEffectiveBitratesForHeight(sessionFrameHeight, requestedCodecSpec().family).meanMbps;
-    }
-
-    int getEffectiveMaxBitrateMbpsForHeight(int sessionFrameHeight) const {
-        return getEffectiveBitratesForHeight(sessionFrameHeight, requestedCodecSpec().family).maxMbps;
+    // Expected output size for UI estimates from the last known framebuffer size (no disk / GPU work,
+    // safe on any thread): preset height with the window aspect ratio, H.264 clamp applied.
+    std::pair<int, int> estimateOutputDimensions() const {
+        auto [w, h] = getResolutionDimensions(
+            s_nativeFrameWidth.load(std::memory_order_relaxed), s_nativeFrameHeight.load(std::memory_order_relaxed));
+        if (requestedCodecSpec().family == VideoCodecFamily::H264) {
+            VideoDimensions clamped = clampDimensionsToBounds(w, h, kH264MaxWidth, kH264MaxHeight);
+            if (clamped.clamped) return {clamped.width, clamped.height};
+        }
+        return {w, h};
     }
 
     int getEffectiveBitrateMbps() const {
-        return getEffectiveBitrateMbpsForHeight(s_nativeFrameHeight.load(std::memory_order_relaxed));
+        auto [w, h] = estimateOutputDimensions();
+        return getEffectiveBitratesForOutput(w, h, requestedCodecSpec().family).meanMbps;
     }
 
     int getEffectiveMaxBitrateMbps() const {
-        return getEffectiveMaxBitrateMbpsForHeight(s_nativeFrameHeight.load(std::memory_order_relaxed));
+        auto [w, h] = estimateOutputDimensions();
+        return getEffectiveBitratesForOutput(w, h, requestedCodecSpec().family).maxMbps;
     }
 
     // Cached GPU / hardware encoder backend string (populated on the main/GL thread).

@@ -574,8 +574,9 @@ void FrameGrabber::captureCurrentFrame() {
         srcW = viewport[2];
         srcH = viewport[3];
     }
-    if (srcH > 0) {
+    if (srcH > 0 && srcW > 0) {
         ReplayConfig::s_nativeFrameHeight.store(srcH, std::memory_order_relaxed);
+        ReplayConfig::s_nativeFrameWidth.store(srcW, std::memory_order_relaxed);
     }
     if (srcW < 16 || srcH < 16) return;
 

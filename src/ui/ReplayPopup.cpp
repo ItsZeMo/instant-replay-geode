@@ -974,12 +974,13 @@ void ReplayPopup::setupBitrateTab(CCNode* page, CCSize const& winSize, float cen
     });
     page->addChild(m_customBitrateInput);
 
-    auto bitHint = CCLabelBMFont::create("(5 - 250 Mbps)", "chatFont.fnt");
-    bitHint->setScale(0.42f);
-    bitHint->setColor(ccc3(140, 200, 240));
-    bitHint->setAnchorPoint(ccp(0.0f, 0.5f));
-    bitHint->setPosition(ccp(205.0f, winSize.height - 156.0f));
-    page->addChild(bitHint);
+    // VBR/CQ treat the value as a 1080p60 base scaled by output size, FPS and codec; CBR is exact (W9).
+    m_bitrateHintLabel = CCLabelBMFont::create("(5 - 250 Mbps)", "chatFont.fnt");
+    m_bitrateHintLabel->setScale(0.42f);
+    m_bitrateHintLabel->setColor(ccc3(140, 200, 240));
+    m_bitrateHintLabel->setAnchorPoint(ccp(0.0f, 0.5f));
+    m_bitrateHintLabel->setPosition(ccp(205.0f, winSize.height - 156.0f));
+    page->addChild(m_bitrateHintLabel);
 
     // Peak / Max Bitrate (Adaptive VBR only)
     m_peakBitrateNode = CCNode::create();
@@ -1435,6 +1436,16 @@ void ReplayPopup::updateStatusDisplay(float dt) {
                      cName.c_str(), rName, effMbps, rcName);
         }
         m_codecBadgeLabel->setString(buf);
+
+        if (m_bitrateHintLabel) {
+            char hint[96];
+            if (rc == RateControlMode::CONSTANT_CBR) {
+                snprintf(hint, sizeof(hint), "(exact CBR, 5 - 250 Mbps)");
+            } else {
+                snprintf(hint, sizeof(hint), "(base @1080p60, effective %d Mbps)", effMbps);
+            }
+            m_bitrateHintLabel->setString(hint);
+        }
     }
 
     if (m_estSizeLabel) {

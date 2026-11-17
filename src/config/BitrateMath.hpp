@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstddef>
 
 namespace replay {
@@ -30,6 +31,35 @@ inline constexpr double codecBitrateMultiplier(VideoCodecFamily family) noexcept
         case VideoCodecFamily::H264:
         default:                     return 1.10;
     }
+}
+
+// Output-size factor from the size actually encoded: piecewise-linear over the 16:9-equivalent
+// height sqrt(w * h * 9 / 16), reproducing the preset table (720p 0.5, 1080p 1.0, 1440p 1.6,
+// 2160p 2.4). Native 3840x2160 and the 2160p preset therefore get the same bitrate, and wider
+// windows get more bitrate for their extra pixels (W9).
+inline double resolutionBitrateMultiplier(int outWidth, int outHeight) noexcept {
+    if (outWidth <= 0 || outHeight <= 0) return 1.00;
+    struct Point { double height; double mult; };
+    static constexpr Point kPoints[] = {{720.0, 0.50}, {1080.0, 1.00}, {1440.0, 1.60}, {2160.0, 2.40}};
+    constexpr size_t kCount = sizeof(kPoints) / sizeof(kPoints[0]);
+    const double eqHeight = std::sqrt(static_cast<double>(outWidth) * static_cast<double>(outHeight) * 9.0 / 16.0);
+
+    double mult = kPoints[0].mult;
+    if (eqHeight >= kPoints[kCount - 1].height) {
+        const Point& a = kPoints[kCount - 2];
+        const Point& b = kPoints[kCount - 1];
+        mult = b.mult + (eqHeight - b.height) * (b.mult - a.mult) / (b.height - a.height);
+    } else if (eqHeight > kPoints[0].height) {
+        for (size_t i = 0; i + 1 < kCount; ++i) {
+            const Point& a = kPoints[i];
+            const Point& b = kPoints[i + 1];
+            if (eqHeight <= b.height) {
+                mult = a.mult + (eqHeight - a.height) * (b.mult - a.mult) / (b.height - a.height);
+                break;
+            }
+        }
+    }
+    return std::clamp(mult, 0.50, 2.50);
 }
 
 inline constexpr double fpsBitrateMultiplier(int fps) noexcept {

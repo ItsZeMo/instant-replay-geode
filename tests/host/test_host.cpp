@@ -1168,6 +1168,38 @@ void testExportAudioSeamsW2() {
     std::cout << "  PASS Test W2\n";
 }
 
+void testResolutionBitrateSemanticsW9() {
+    std::cout << "[Test W9] Bitrate scales with the encoded size (Native 4K == 2160p preset)...\n";
+    auto approxEq = [](double a, double b) { return std::abs(a - b) < 1e-9; };
+    // 16:9 sizes reproduce the preset table.
+    CHECK(approxEq(replay::resolutionBitrateMultiplier(1280, 720), 0.50));
+    CHECK(approxEq(replay::resolutionBitrateMultiplier(1920, 1080), 1.00));
+    CHECK(approxEq(replay::resolutionBitrateMultiplier(2560, 1440), 1.60));
+    CHECK(approxEq(replay::resolutionBitrateMultiplier(3840, 2160), 2.40));
+    // Native 3840x2160 and the 2160p preset both encode 3840x2160 -> identical effective bitrate
+    // (previously Native used h/1080 = 2.0 and the preset 2.4).
+    const auto nativeFourK = replay::computeEffectiveBitrates(80, 120, 80, replay::kRateControlAdaptiveVbr,
+        replay::resolutionBitrateMultiplier(3840, 2160), 1.0, replay::VideoCodecFamily::AV1);
+    CHECK(nativeFourK.meanMbps == 134 && nativeFourK.maxMbps == 202);
+    // Non-16:9: more pixels -> more bitrate, monotonic, clamped to [0.5, 2.5].
+    const double ultrawide = replay::resolutionBitrateMultiplier(2560, 1080);
+    CHECK(ultrawide > 1.0 && ultrawide < 1.6);
+    CHECK(replay::resolutionBitrateMultiplier(3440, 1440) > replay::resolutionBitrateMultiplier(2560, 1440));
+    CHECK(approxEq(replay::resolutionBitrateMultiplier(5120, 2880), 2.50));
+    CHECK(approxEq(replay::resolutionBitrateMultiplier(640, 360), 0.50));
+    double prev = 0.0;
+    for (int h = 360; h <= 4320; h += 36) {
+        const double m = replay::resolutionBitrateMultiplier((h * 16) / 9, h);
+        CHECK(m + 1e-12 >= prev);
+        prev = m;
+    }
+    // CBR stays exact regardless of size / FPS / codec.
+    const auto cbr = replay::computeEffectiveBitrates(50, 60, 80, replay::kRateControlCbr,
+        replay::resolutionBitrateMultiplier(3840, 2160), replay::fpsBitrateMultiplier(240), replay::VideoCodecFamily::H264);
+    CHECK(cbr.meanMbps == 50 && cbr.maxMbps == 50);
+    std::cout << "  PASS Test W9\n";
+}
+
 // Media Foundation may be missing on CI images (Windows Server without the Media Foundation
 // feature): mfplat / mfreadwrite are delay-loaded and the MF integration tests are skipped then.
 bool mediaFoundationTestsAvailable(std::string& whyNot) {
@@ -1218,6 +1250,7 @@ int main() {
     testMicMixFifo();
     testH264BoundsAndCodecSpecC3();
     testCodecFallbackBitratesW1();
+    testResolutionBitrateSemanticsW9();
 
     std::string whyNot;
     if (mediaFoundationTestsAvailable(whyNot)) {

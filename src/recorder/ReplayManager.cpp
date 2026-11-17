@@ -1917,10 +1917,11 @@ void ReplayManager::publishActiveEncoderInfo(const ReplayConfig& cfg) {
 }
 
 void ReplayManager::ensureSessionBitrates(const ReplayConfig& cfg) {
-    if (m_sessionEffBitrateMbps <= 0 && m_videoHeight > 0) {
+    if (m_sessionEffBitrateMbps <= 0 && m_videoWidth > 0 && m_videoHeight > 0) {
         // Lock bitrates for every codec family once per session, so fallback encoders and
-        // pre-warmed rotations of the active codec all use the same per-family values (W1).
-        m_sessionBitrateTable = cfg.getCodecBitrateTableForHeight(m_videoHeight);
+        // pre-warmed rotations of the active codec all use the same per-family values (W1),
+        // scaled by the size actually encoded (W9).
+        m_sessionBitrateTable = cfg.getCodecBitrateTableForOutput(m_videoWidth, m_videoHeight);
         const EffectiveBitrates requested = m_sessionBitrateTable.forFamily(cfg.requestedCodecSpec().family);
         m_sessionEffBitrateMbps = requested.meanMbps;
         m_sessionEffMaxBitrateMbps = std::max(requested.maxMbps, requested.meanMbps);
