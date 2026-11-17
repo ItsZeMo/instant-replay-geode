@@ -8,6 +8,7 @@
 #include "SegmentRules.hpp"
 #include "AudioQueuePolicy.hpp"
 #include <Geode/binding/FMODAudioEngine.hpp>
+#include <Geode/loader/SettingV3.hpp>
 #include <Geode/utils/async.hpp>
 #include <Geode/utils/file.hpp>
 #ifdef GEODE_IS_WINDOWS
@@ -3237,16 +3238,35 @@ SaveReplayResult ReplayManager::saveReplay() {
     return SaveReplayResult::Started;
 }
 
+namespace {
+// First binding of a keybind setting as text (e.g. "Ctrl+F6"), empty when unbound (W16).
+std::string keybindSettingLabel(std::string_view key) {
+    if (auto* mod = geode::Mod::get()) {
+        if (auto sett = mod->getSetting(key)) {
+            if (auto kbSett = geode::cast::typeinfo_pointer_cast<geode::KeybindSettingV3>(sett)) {
+                const auto& binds = kbSett->getValue();
+                if (!binds.empty()) {
+                    return binds.front().toString();
+                }
+            }
+        }
+    }
+    return {};
+}
+} // namespace
+
 void ReplayManager::showSaveFeedback(SaveReplayResult result) {
     switch (result) {
-        case SaveReplayResult::NotRunning:
+        case SaveReplayResult::NotRunning: {
             geode::log::warn("Instant Replay: save requested but recording is off");
-            geode::Notification::create(
-                "Instant Replay is OFF (Ctrl+F6 to enable)",
-                geode::NotificationIcon::Warning,
-                2.0f
-            )->show();
+            const std::string toggleBind = keybindSettingLabel("toggle-replay");
+            std::string msg = "Instant Replay is OFF";
+            if (!toggleBind.empty()) {
+                msg += " (" + toggleBind + " to enable)";
+            }
+            geode::Notification::create(msg, geode::NotificationIcon::Warning, 2.0f)->show();
             break;
+        }
         case SaveReplayResult::AlreadySaving: {
             const int pct = ReplayManager::get()->getExportProgressPercent();
             geode::log::warn("Instant Replay: save requested while the previous replay is still saving ({}%)", std::max(0, pct));
