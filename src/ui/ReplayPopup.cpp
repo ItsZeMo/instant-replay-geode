@@ -9,6 +9,7 @@
 #include <Geode/utils/async.hpp>
 #include <Geode/utils/string.hpp>
 #include <algorithm>
+#include <optional>
 #include <span>
 
 using namespace cocos2d;
@@ -230,6 +231,10 @@ void syncVolumeControls(Slider* slider, CCLabelBMFont* label, float vol) {
         label->setString((std::to_string(pct) + "%").c_str());
     }
 }
+
+// Preset that was active before the user typed a custom codec string; restored when the field is
+// cleared (process lifetime, survives reopening the popup, W17).
+std::optional<CodecType> s_codecBeforeCustom;
 
 #ifdef GEODE_IS_MACOS
 constexpr const char* kThisDevice = "this Mac";
@@ -799,9 +804,20 @@ void ReplayPopup::setupCodecTab(CCNode* page, CCSize const& winSize, float cente
         auto& c = ReplayConfig::get();
         c.setCustomCodec(str);
         if (!str.empty()) {
+            if (c.codec.load() != CodecType::CUSTOM) {
+                s_codecBeforeCustom = c.codec.load();
+            }
             c.codec = CodecType::CUSTOM;
         } else if (c.codec.load() == CodecType::CUSTOM) {
-            c.codec = ReplayConfig::bestSupportedCodec(c.hardwareAcceleration.load());
+            // Clearing the custom string returns to the preset chosen before it, or else to the best
+            // codec this PC/Mac actually supports, instead of always jumping to AV1 (W17).
+            const bool hw = c.hardwareAcceleration.load();
+            if (s_codecBeforeCustom && ReplayConfig::isPresetCodecSupported(*s_codecBeforeCustom, hw)) {
+                c.codec = *s_codecBeforeCustom;
+            } else {
+                c.codec = ReplayConfig::bestSupportedCodec(hw);
+            }
+            s_codecBeforeCustom.reset();
             c.sanitizeCodecSettings();
         }
         m_codecBeforeHwOff.reset();
