@@ -171,6 +171,9 @@ private:
 
     bool m_initialized = false;
     FMOD::DSP* m_fmodDSP = nullptr;
+    FMOD::System* m_dspSystem = nullptr;            // system / master group the DSP was attached to (W18)
+    FMOD::ChannelGroup* m_dspMasterGroup = nullptr;
+    std::chrono::steady_clock::time_point m_nextDspCheckTime{};
     FMOD::ChannelGroup* m_saveBypassGroup = nullptr;
     FMOD::Sound* m_cachedSaveSound = nullptr;
     std::chrono::steady_clock::time_point m_nextDspRetryTime{};

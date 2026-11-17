@@ -239,8 +239,43 @@ void AudioGrabber::setMicAudioCallback(AudioCallback cb) {
 }
 
 void AudioGrabber::ensureDSPAttached() {
-    if (!m_initialized || m_fmodDSP) return;
+    if (!m_initialized) return;
     auto now = std::chrono::steady_clock::now();
+
+    if (m_fmodDSP) {
+        // Re-verify the capture DSP every ~2 s: if GD/FMOD recreated the system or master group (audio
+        // device change, sound re-init) the DSP is gone and game audio would silently stop (W18).
+        if (now < m_nextDspCheckTime) return;
+        m_nextDspCheckTime = now + std::chrono::seconds(2);
+
+        auto engine = FMODAudioEngine::sharedEngine();
+        FMOD::System* system = engine ? engine->m_system : nullptr;
+        FMOD::ChannelGroup* masterGroup = nullptr;
+        const bool sameGroup = system && system == m_dspSystem &&
+                               system->getMasterChannelGroup(&masterGroup) == FMOD_OK &&
+                               masterGroup && masterGroup == m_dspMasterGroup;
+        if (sameGroup) {
+            int index = -1;
+            if (masterGroup->getDSPIndex(m_fmodDSP, &index) == FMOD_OK && index >= 0) {
+                return; // still attached
+            }
+            // Same system, DSP detached from the chain: re-add our own DSP object.
+            if (masterGroup->addDSP(FMOD_CHANNELCONTROL_DSP_TAIL, m_fmodDSP) == FMOD_OK) {
+                m_fmodDSP->setActive(true);
+                geode::log::warn("Instant Replay: FMOD capture DSP was detached from the master group, re-attached");
+                return;
+            }
+        }
+
+        // The system / master group changed (or re-adding failed): the old DSP belongs to a dead or
+        // foreign graph, so drop the pointer without release() and attach a fresh one.
+        geode::log::warn("Instant Replay: FMOD system or master group changed, re-attaching the game audio capture DSP");
+        m_fmodDSP = nullptr;
+        m_dspSystem = nullptr;
+        m_dspMasterGroup = nullptr;
+        m_nextDspRetryTime = {};
+    }
+
     if (now < m_nextDspRetryTime) return;
     setupFmodDSP();
 }
@@ -278,6 +313,9 @@ void AudioGrabber::setupFmodDSP() {
         if (addRes == FMOD_OK) {
             m_fmodDSP->setActive(true);
             m_fmodDSP->setBypass(false);
+            m_dspSystem = engine->m_system;
+            m_dspMasterGroup = masterGroup;
+            m_nextDspCheckTime = std::chrono::steady_clock::now() + std::chrono::seconds(2);
             geode::log::info("Instant Replay: attached FMOD DSP to Master Channel Group tail! (Sample Rate: {} Hz)",
                              m_gameSampleRate.load(std::memory_order_relaxed));
         } else {
@@ -296,14 +334,17 @@ void AudioGrabber::setupFmodDSP() {
 void AudioGrabber::removeFmodDSP() {
     if (m_fmodDSP) {
         auto engine = FMODAudioEngine::sharedEngine();
-        if (engine && engine->m_system) {
+        // Only touch the DSP while the system it was created in is still the live one (W18).
+        if (engine && engine->m_system && engine->m_system == m_dspSystem) {
             FMOD::ChannelGroup* masterGroup = nullptr;
             if (engine->m_system->getMasterChannelGroup(&masterGroup) == FMOD_OK && masterGroup) {
                 masterGroup->removeDSP(m_fmodDSP);
             }
+            m_fmodDSP->release();
         }
-        m_fmodDSP->release();
         m_fmodDSP = nullptr;
+        m_dspSystem = nullptr;
+        m_dspMasterGroup = nullptr;
     }
 }
 
