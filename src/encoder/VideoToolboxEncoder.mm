@@ -650,15 +650,22 @@ EncoderOpResult VideoToolboxEncoder::start(
                     }
                 }
 
-                std::string logKey = requestKey + "->" + codecLabel;
-                if (!isPrimary && !hasForcedCodec && s_lastLoggedCodecKey != logKey) {
+                std::string logKey = requestKey + "->" + codecLabel + "|" +
+                                     std::to_string(params.bitrateMbps) + "|" +
+                                     std::to_string(params.maxBitrateMbps);
+                if (s_lastLoggedCodecKey != logKey) {
                     s_lastLoggedCodecKey = logKey;
-                    geode::log::warn(
-                        "Instant Replay: requested codec unavailable, fell back to {} ({}x{} @ {} FPS, effBitrate={} Mbps, effMaxBitrate={} Mbps)",
-                        codecLabel, width, height, fps, params.bitrateMbps, params.maxBitrateMbps);
+                    if (!isPrimary && !hasForcedCodec) {
+                        geode::log::warn(
+                            "Instant Replay: requested codec unavailable, fell back to {} ({}x{} @ {} FPS, effBitrate={} Mbps, effMaxBitrate={} Mbps)",
+                            codecLabel, width, height, fps, params.bitrateMbps, params.maxBitrateMbps);
+                    } else {
+                        geode::log::info(
+                            "Instant Replay: encoder started with {} ({}x{} @ {} FPS, effBitrate={} Mbps, effMaxBitrate={} Mbps)",
+                            codecLabel, width, height, fps, params.bitrateMbps, params.maxBitrateMbps);
+                    }
                 } else {
-                    s_lastLoggedCodecKey = logKey;
-                    geode::log::info(
+                    geode::log::debug(
                         "Instant Replay: encoder started with {} ({}x{} @ {} FPS, effBitrate={} Mbps, effMaxBitrate={} Mbps)",
                         codecLabel, width, height, fps, params.bitrateMbps, params.maxBitrateMbps);
                 }
