@@ -36,6 +36,17 @@ struct SegmentInfo {
     int64_t micAudioFrames = -1;
 };
 
+// Snapshot of the encoder that is actually recording (after any codec fallback), for the UI (W4).
+struct ActiveEncoderInfo {
+    bool valid = false;
+    VideoCodecFamily family = VideoCodecFamily::H264;
+    bool hardware = true;
+    int width = 0;
+    int height = 0;
+    int meanMbps = 0;
+    int maxMbps = 0;
+};
+
 enum class SaveReplayResult {
     Started,
     NotRunning,
@@ -79,6 +90,11 @@ public:
 
     // Direct folder opener
     void openRecordingsFolder();
+
+    ActiveEncoderInfo getActiveEncoderInfo() const {
+        std::lock_guard<std::mutex> lock(m_activeEncoderInfoMutex);
+        return m_activeEncoderInfo;
+    }
 
     // Active recording session configuration snapshot (read by capture threads)
     const ReplayConfig& getSessionConfig() const noexcept { return m_sessionConfig; }
@@ -180,6 +196,7 @@ private:
     void flushTrailingSilenceForClose(const ReplayConfig& cfg);
 
     PendingFinalizeInfo finalizeCurrentSegment(bool syncForExport, const ReplayConfig& cfg);
+    void publishActiveEncoderInfo(const ReplayConfig& cfg);
     void ensureSessionBitrates(const ReplayConfig& cfg);
     bool startNewSegment(const ReplayConfig& cfg, std::chrono::steady_clock::time_point segStart, bool isContinuation);
     bool activatePreparedOrStartNew(
@@ -319,6 +336,9 @@ private:
     int m_sessionEffBitrateMbps = 0;
     int m_sessionEffMaxBitrateMbps = 0;
     CodecBitrateTable m_sessionBitrateTable{}; // per-family session bitrates for codec fallbacks (W1)
+    bool m_codecFallbackNotified = false;      // one fallback notification per session (W4)
+    ActiveEncoderInfo m_activeEncoderInfo{};
+    mutable std::mutex m_activeEncoderInfoMutex;
     int64_t m_lastVideoHns = -1;
     int64_t m_gameAudioSamples = 0;
     int64_t m_micAudioSamples = 0;

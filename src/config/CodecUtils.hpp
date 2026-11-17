@@ -30,6 +30,16 @@ struct VideoDimensions {
 inline constexpr int kH264MaxWidth = 4096;
 inline constexpr int kH264MaxHeight = 2304;
 
+inline constexpr const char* codecFamilyDisplayName(VideoCodecFamily family) noexcept {
+    switch (family) {
+        case VideoCodecFamily::AV1:  return "AV1";
+        case VideoCodecFamily::HEVC: return "HEVC";
+        case VideoCodecFamily::VP9:  return "VP9";
+        case VideoCodecFamily::H264:
+        default:                     return "H.264";
+    }
+}
+
 // Parses free-form custom codec strings (e.g. "av1_nvenc", "software_h264", "hevc_amf").
 inline CodecTargetSpec parseCustomCodecSpec(bool requestedHardware, std::string_view customCodec) {
     CodecTargetSpec spec{VideoCodecFamily::H264, requestedHardware};

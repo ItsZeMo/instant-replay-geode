@@ -9,6 +9,7 @@
 #include <Geode/loader/SettingV3.hpp>
 #include <Geode/utils/string.hpp>
 #ifdef GEODE_IS_WINDOWS
+#include "../platform/WinVideoCapabilities.hpp"
 #include <windows.h>
 #include <shlobj.h>
 #elif defined(GEODE_IS_MACOS)
@@ -521,14 +522,14 @@ struct ReplayConfig {
 #ifdef GEODE_IS_MACOS
         return getMacVideoEncoderCaps().supports(family, hardware);
 #else
-        (void)family;
-        (void)hardware;
-        return true;
+        // Until the background MFTEnumEx probe finishes, assume support: the encoder
+        // fallback cascade still guards the real start (W4).
+        const WinVideoEncoderCaps caps = getWinVideoEncoderCaps();
+        return !caps.probed || caps.supports(family, hardware);
 #endif
     }
 
     static bool isPresetCodecSupported(CodecType c, bool hwAccel) noexcept {
-#ifdef GEODE_IS_MACOS
         switch (c) {
             case CodecType::AV1:  return isCodecFamilySupported(VideoCodecFamily::AV1, hwAccel);
             case CodecType::HEVC: return isCodecFamilySupported(VideoCodecFamily::HEVC, hwAccel);
@@ -536,15 +537,9 @@ struct ReplayConfig {
             case CodecType::CUSTOM:
             default:              return true;
         }
-#else
-        (void)c;
-        (void)hwAccel;
-        return true;
-#endif
     }
 
     static CodecType bestSupportedCodec(bool hwAccel) noexcept {
-#ifdef GEODE_IS_MACOS
         if (!hwAccel) {
             // In CPU software mode prefer H.264 before heavy HEVC software encode (M16).
             if (isPresetCodecSupported(CodecType::H264, false)) return CodecType::H264;
@@ -556,10 +551,6 @@ struct ReplayConfig {
         if (isPresetCodecSupported(CodecType::HEVC, true)) return CodecType::HEVC;
         if (isPresetCodecSupported(CodecType::H264, true)) return CodecType::H264;
         return CodecType::H264;
-#else
-        (void)hwAccel;
-        return CodecType::AV1;
-#endif
     }
 
     static bool isH264Conflict(ResolutionType res, int fps) noexcept {

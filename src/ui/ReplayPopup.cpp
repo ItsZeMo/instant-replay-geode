@@ -231,6 +231,12 @@ void syncVolumeControls(Slider* slider, CCLabelBMFont* label, float vol) {
     }
 }
 
+#ifdef GEODE_IS_MACOS
+constexpr const char* kThisDevice = "this Mac";
+#else
+constexpr const char* kThisDevice = "this PC";
+#endif
+
 std::string getSaveKeybindLabel() {
     if (auto mod = geode::Mod::get()) {
         if (auto sett = mod->getSetting("save-replay")) {
@@ -710,7 +716,7 @@ void ReplayPopup::setupCodecTab(CCNode* page, CCSize const& winSize, float cente
             auto& cfg = ReplayConfig::get();
             auto chosen = static_cast<CodecType>(tag);
             if (!ReplayConfig::isPresetCodecSupported(chosen, cfg.hardwareAcceleration.load())) {
-                Notification::create("This codec is not supported on this Mac", NotificationIcon::Warning, 1.5f)->show();
+                Notification::create(std::string("This codec is not supported on ") + kThisDevice, NotificationIcon::Warning, 1.5f)->show();
                 return;
             }
             cfg.codec = chosen;
@@ -1400,18 +1406,29 @@ void ReplayPopup::updateStatusDisplay(float dt) {
 
     const auto& cfg = ReplayConfig::get();
     if (m_codecBadgeLabel) {
-        std::string cName = cfg.getCodecDisplayName();
+        // While recording, show the encoder that is really running (after any fallback, W4).
+        const ActiveEncoderInfo active = isRec ? mgr->getActiveEncoderInfo() : ActiveEncoderInfo{};
+        std::string cName;
+        int effMbps = 0;
+        if (active.valid) {
+            cName = std::string(codecFamilyDisplayName(active.family)) +
+                    (active.hardware ? " (" + ReplayConfig::getGpuAccelName() + ")" : std::string(" (Software)"));
+            effMbps = active.meanMbps;
+        } else {
+            cName = cfg.getCodecDisplayName();
+            effMbps = cfg.getEffectiveBitrateMbps();
+        }
         const char* rName = ReplayConfig::resolutionDisplayName(cfg.resolution.load());
 
         RateControlMode rc = cfg.rateControl.load();
         char buf[160];
         if (rc == RateControlMode::CONSTANT_QUALITY) {
             snprintf(buf, sizeof(buf), "%s | %s | CQ %d%% (~%d Mbps)",
-                     cName.c_str(), rName, cfg.qualityLevel.load(), cfg.getEffectiveBitrateMbps());
+                     cName.c_str(), rName, cfg.qualityLevel.load(), effMbps);
         } else {
             const char* rcName = (rc == RateControlMode::CONSTANT_CBR) ? "CBR" : "Adaptive VBR";
             snprintf(buf, sizeof(buf), "%s | %s | %d Mbps (%s)",
-                     cName.c_str(), rName, cfg.getEffectiveBitrateMbps(), rcName);
+                     cName.c_str(), rName, effMbps, rcName);
         }
         m_codecBadgeLabel->setString(buf);
     }
@@ -1483,7 +1500,6 @@ void ReplayPopup::refreshUI(bool syncTogglers) {
             m_codecConflictLabel->setColor(ccc3(255, 120, 80));
             m_codecConflictLabel->setVisible(true);
         } else {
-#ifdef GEODE_IS_MACOS
             auto codecDisplayShort = [](CodecType ct) -> const char* {
                 switch (ct) {
                     case CodecType::AV1:  return "AV1";
@@ -1503,7 +1519,7 @@ void ReplayPopup::refreshUI(bool syncTogglers) {
 
             if (customUnsupported) {
                 CodecType fb = ReplayConfig::bestSupportedCodec(customHw);
-                std::string note = std::string("Note: Custom codec unsupported on this Mac (using ") +
+                std::string note = std::string("Note: Custom codec unsupported on ") + kThisDevice + " (using " +
                                    codecDisplayShort(fb) + ")";
                 m_codecConflictLabel->setString(note.c_str());
                 m_codecConflictLabel->setColor(ccc3(255, 120, 80));
@@ -1511,7 +1527,7 @@ void ReplayPopup::refreshUI(bool syncTogglers) {
             } else if (curCodec != CodecType::CUSTOM && !ReplayConfig::isPresetCodecSupported(curCodec, hwAccel)) {
                 CodecType fb = ReplayConfig::bestSupportedCodec(hwAccel);
                 std::string note = std::string("Note: ") + codecDisplayShort(curCodec) +
-                                   " unsupported on this Mac (using " + codecDisplayShort(fb) + ")";
+                                   " unsupported on " + kThisDevice + " (using " + codecDisplayShort(fb) + ")";
                 m_codecConflictLabel->setString(note.c_str());
                 m_codecConflictLabel->setColor(ccc3(255, 195, 95));
                 m_codecConflictLabel->setVisible(true);
@@ -1534,9 +1550,6 @@ void ReplayPopup::refreshUI(bool syncTogglers) {
                     m_codecConflictLabel->setVisible(false);
                 }
             }
-#else
-            m_codecConflictLabel->setVisible(false);
-#endif
         }
     }
 

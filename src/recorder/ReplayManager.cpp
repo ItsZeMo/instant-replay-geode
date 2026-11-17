@@ -589,6 +589,9 @@ void ReplayManager::initialize() {
             caps.h264Hardware, caps.h264Software, caps.h264SoftwareWritable);
     }
 #endif
+#ifdef GEODE_IS_WINDOWS
+    startWinVideoEncoderProbe();
+#endif
     ReplayConfig::get().loadFromSettings();
     m_sessionConfig = ReplayConfig::get().snapshot();
     if (auto* mod = geode::Mod::get()) {
@@ -750,6 +753,11 @@ void ReplayManager::startReplay() {
     m_sessionEffBitrateMbps = 0;
     m_sessionEffMaxBitrateMbps = 0;
     m_sessionBitrateTable = {};
+    m_codecFallbackNotified = false;
+    {
+        std::lock_guard<std::mutex> infoLock(m_activeEncoderInfoMutex);
+        m_activeEncoderInfo = {};
+    }
     // Note: m_segmentIndex is intentionally NOT reset so segment filenames never
     // collide with files still being read by an in-flight export thread.
     m_lastVideoHns = -1;
@@ -855,6 +863,10 @@ void ReplayManager::finishStopCleanup() {
     m_sessionEffBitrateMbps = 0;
     m_sessionEffMaxBitrateMbps = 0;
     m_sessionBitrateTable = {};
+    {
+        std::lock_guard<std::mutex> infoLock(m_activeEncoderInfoMutex);
+        m_activeEncoderInfo = {};
+    }
 
     {
         std::lock_guard<std::mutex> lock(m_queueMutex);
@@ -1864,6 +1876,46 @@ ReplayManager::PendingFinalizeInfo ReplayManager::finalizeCurrentSegment(bool sy
     return info;
 }
 
+void ReplayManager::publishActiveEncoderInfo(const ReplayConfig& cfg) {
+    if (!m_encoder || !m_encoder->hasActiveCodec()) return;
+    ActiveEncoderInfo info;
+    info.valid = true;
+    info.family = m_encoder->activeCodecFamily();
+    info.hardware = m_encoder->activeHardware();
+    info.width = m_videoWidth;
+    info.height = m_videoHeight;
+#ifdef GEODE_IS_WINDOWS
+    info.meanMbps = m_encoder->activeBitrateMbps();
+    info.maxMbps = m_encoder->activeMaxBitrateMbps();
+#else
+    info.meanMbps = m_sessionEffBitrateMbps;
+    info.maxMbps = m_sessionEffMaxBitrateMbps;
+#endif
+    {
+        std::lock_guard<std::mutex> lock(m_activeEncoderInfoMutex);
+        m_activeEncoderInfo = info;
+    }
+
+#ifdef GEODE_IS_WINDOWS
+    // Tell the user once per session when Media Foundation had to fall back to another codec (W4).
+    const CodecTargetSpec requested = cfg.requestedCodecSpec();
+    if (!m_codecFallbackNotified && (info.family != requested.family || info.hardware != requested.hardware)) {
+        m_codecFallbackNotified = true;
+        std::string msg = std::string(codecFamilyDisplayName(requested.family)) +
+                          (requested.hardware ? " (HW)" : " (SW)") + " unavailable - recording " +
+                          codecFamilyDisplayName(info.family) + (info.hardware ? " (HW)" : " (SW)");
+        geode::log::warn("Instant Replay: {}", msg);
+        if (!m_shuttingDown.load()) {
+            geode::queueInMainThread([msg]() {
+                geode::Notification::create("Instant Replay: " + msg, geode::NotificationIcon::Warning, 3.0f)->show();
+            });
+        }
+    }
+#else
+    (void)cfg;
+#endif
+}
+
 void ReplayManager::ensureSessionBitrates(const ReplayConfig& cfg) {
     if (m_sessionEffBitrateMbps <= 0 && m_videoHeight > 0) {
         // Lock bitrates for every codec family once per session, so fallback encoders and
@@ -1947,6 +1999,7 @@ bool ReplayManager::startNewSegment(
     if (m_lastStartError) {
         m_currentFormatKey = m_encoder->formatKey();
         m_segmentGameSampleRate = m_encoder->encodedGameSampleRate();
+        publishActiveEncoderInfo(cfg);
         m_encoderFailCount = 0;
         m_videoWriteErrors = 0;
         m_gameAudioWriteErrors = 0;
@@ -2012,6 +2065,7 @@ bool ReplayManager::activatePreparedOrStartNew(
         m_prepareFailedCount = 0;
         m_prepareFailedLastAttempt.store(false);
         m_nextPrepareRetryTime = {};
+        publishActiveEncoderInfo(cfg);
         return true;
     }
 
