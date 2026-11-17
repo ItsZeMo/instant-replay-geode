@@ -4,6 +4,7 @@
 #include <mfidl.h>
 #include <mfreadwrite.h>
 #include <mferror.h>
+#include <mftransform.h>
 
 #include <atomic>
 #include <cassert>
@@ -32,6 +33,7 @@
 #pragma comment(lib, "mfreadwrite.lib")
 #pragma comment(lib, "mfuuid.lib")
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "delayimp.lib")
 
 namespace {
 
@@ -362,6 +364,13 @@ void testConcatAndC1SeamMath() {
     remuxWithProductionConcatState({d1, d2}, out3);
     verifyMp4NoAudioOverlapAndSynced(out3, 2);
 
+    std::error_code ec;
+    std::filesystem::remove_all(tmp, ec);
+    std::cout << "  PASS Test 1\n";
+}
+
+void testConcatTimestampMathPure() {
+    std::cout << "[Test 1m] ConcatTimestampState C1 seam anchoring, anomaly fallback & B-frame DTS math...\n";
     // 1d. C1 Acceptance exact test on ConcatTimestampState:
     // Segment closes at S = 300,000,000 HNS (30s @ 60 FPS); audio ends cleanly at S,
     // last video frame ends at S + frameDur - 0.1 ms (PTS = S - 1000 HNS).
@@ -454,9 +463,41 @@ void testConcatAndC1SeamMath() {
         CHECK(s2vPts - s2vDts == 333333);
     }
 
-    std::error_code ec;
-    std::filesystem::remove_all(tmp, ec);
-    std::cout << "  PASS Test 1\n";
+    // N4: 1-sample HNS tolerance absorbs independent 100 ns rounding of AAC packet PTS vs duration
+    // (1024 / 48000 s = 213333.33 HNS) over 10,000 packets without hiding a real overlap.
+    {
+        CHECK(replay::ConcatTimestampState::audioOverlapToleranceHns(48000) == 209);
+        CHECK(replay::ConcatTimestampState::audioOverlapToleranceHns(44100) == 227);
+        replay::ConcatTimestampState st(0);
+        st.beginSegment();
+        const int64_t tol = replay::ConcatTimestampState::audioOverlapToleranceHns(48000);
+        for (int64_t k = 0; k < 10000; ++k) {
+            const int64_t pts = (k * 1024 * 10000000LL) / 48000;
+            const int64_t dur = ((k + 1) * 1024 * 10000000LL) / 48000 - pts + 1; // end rounded up by 1 HNS
+            CHECK(st.recordWrittenSample(1, false, pts, dur, nullptr, tol));
+        }
+        int64_t prevEnd = 0;
+        CHECK(!st.recordWrittenSample(1, false, (9999 * 1024 * 10000000LL) / 48000, 213333, &prevEnd, tol));
+        CHECK(prevEnd > 0);
+    }
+
+    // N4: macOS keeps negative B-frame DTS (allowNegativeDts) and unclamped PTS; Windows clamps both.
+    {
+        replay::ConcatTimestampState st(0);
+        st.beginSegment();
+        int64_t pts = 0;
+        int64_t dts = 0;
+        st.adjustVideoTimestamps(-333333, 0, pts, dts, false, true);
+        CHECK(dts == -333333 && pts == 0);
+        replay::ConcatTimestampState win(0);
+        win.beginSegment();
+        int64_t wpts = 0;
+        int64_t wdts = 0;
+        win.adjustVideoTimestamps(-333333, 0, wpts, wdts);
+        CHECK(wdts == 0 && wpts == 0);
+    }
+
+    std::cout << "  PASS Test 1m\n";
 }
 
 void testFrameBudgetAnd4KPool() {
@@ -1126,22 +1167,67 @@ void testExportAudioSeamsW2() {
     std::filesystem::remove_all(tmp, ec);
     std::cout << "  PASS Test W2\n";
 }
+
+// Media Foundation may be missing on CI images (Windows Server without the Media Foundation
+// feature): mfplat / mfreadwrite are delay-loaded and the MF integration tests are skipped then.
+bool mediaFoundationTestsAvailable(std::string& whyNot) {
+    if (!LoadLibraryExW(L"mfplat.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32) ||
+        !LoadLibraryExW(L"mfreadwrite.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32)) {
+        whyNot = "Media Foundation DLLs are not installed";
+        return false;
+    }
+    if (FAILED(MFStartup(MF_VERSION))) {
+        whyNot = "MFStartup failed";
+        return false;
+    }
+    auto hasMft = [](const GUID& category, const GUID& major, const GUID& subtype, bool isInput) {
+        MFT_REGISTER_TYPE_INFO info{major, subtype};
+        IMFActivate** acts = nullptr;
+        UINT32 count = 0;
+        HRESULT hr = MFTEnumEx(category, MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_ASYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER,
+                               isInput ? &info : nullptr, isInput ? nullptr : &info, &acts, &count);
+        if (acts) {
+            for (UINT32 i = 0; i < count; ++i) if (acts[i]) acts[i]->Release();
+            CoTaskMemFree(acts);
+        }
+        return SUCCEEDED(hr) && count > 0;
+    };
+    if (!hasMft(MFT_CATEGORY_AUDIO_ENCODER, MFMediaType_Audio, MFAudioFormat_AAC, false)) {
+        whyNot = "no Media Foundation AAC encoder";
+    } else if (!hasMft(MFT_CATEGORY_AUDIO_DECODER, MFMediaType_Audio, MFAudioFormat_AAC, true)) {
+        whyNot = "no Media Foundation AAC decoder";
+    } else if (!hasMft(MFT_CATEGORY_VIDEO_ENCODER, MFMediaType_Video, MFVideoFormat_H264, false)) {
+        whyNot = "no Media Foundation H.264 encoder";
+    } else {
+        return true;
+    }
+    MFShutdown();
+    return false;
+}
+
 } // namespace
 
 int main() {
     HRESULT coHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     CHECK_HR(coHr);
-    CHECK_HR(MFStartup(MF_VERSION));
 
-    testConcatAndC1SeamMath();
-    testExportAudioSeamsW2();
+    // Pure tests: always run (also on CI runners without Media Foundation).
+    testConcatTimestampMathPure();
     testFrameBudgetAnd4KPool();
     testGameAudioRing();
     testMicMixFifo();
     testH264BoundsAndCodecSpecC3();
     testCodecFallbackBitratesW1();
 
-    MFShutdown();
+    std::string whyNot;
+    if (mediaFoundationTestsAvailable(whyNot)) {
+        testConcatAndC1SeamMath();
+        testExportAudioSeamsW2();
+        MFShutdown();
+    } else {
+        std::cout << "SKIP Media Foundation integration tests (Test 1, Test W2): " << whyNot << "\n";
+    }
+
     CoUninitialize();
     std::cout << "ALL HOST TESTS PASSED!\n";
     return 0;

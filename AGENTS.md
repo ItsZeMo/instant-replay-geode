@@ -114,7 +114,7 @@ instant-replay-geode/
 
 ## 5. Building & Testing
 
-> **Platform Note:** Builds for **Windows x64** (`WIN32`) and **macOS Universal** (`arm64;x86_64`), and intentionally errors on Linux (`CMakeLists.txt`). CI (`.github/workflows/build.yml`) builds `Win64` (`build`), `MacOS` (`build-mac`), and runs macOS host tests (`host-tests-mac`).
+> **Platform Note:** Builds for **Windows x64** (`WIN32`) and **macOS Universal** (`arm64;x86_64`), and intentionally errors on Linux (`CMakeLists.txt`). CI (`.github/workflows/build.yml`) builds `Win64` (`build`), `MacOS` (`build-mac`), and runs the macOS (`host-tests-mac`) and Windows (`host-tests-win`) host tests.
 
 ### Option A: Geode CLI (Recommended)
 Requires [Geode CLI](https://github.com/geode-sdk/cli), Geode SDK (`GEODE_SDK` env var), CMake, Ninja, and `clang-cl`/MSVC (Windows) or Xcode CLT (macOS):
@@ -130,9 +130,9 @@ cmake --build build --config RelWithDebInfo
 ```
 
 ### Host Unit & Platform Integration Tests (`tests/host/`)
-- **Windows (`tests/host/test_host.cpp`):**
+- **Windows (`tests/host/test_host.cpp`):** needs the MSVC/Windows SDK `INCLUDE` and `LIB` environment (a "Developer PowerShell for VS" prompt, `ilammy/msvc-dev-cmd` on CI, or the same variables set by hand for an xwin sysroot). `MfSegmentConcat.cpp` is the production exporter and is compiled into the tests; Media Foundation is delay-loaded so pure tests still run (and MF tests are reported as skipped) on machines without it.
   ```powershell
-  clang-cl /std:c++latest /EHsc /O2 /I src tests/host/test_host.cpp /Fe:build/test_host.exe mfplat.lib mfreadwrite.lib mfuuid.lib ole32.lib
+  clang-cl /std:c++latest /EHsc /O2 /W3 /I src tests/host/test_host.cpp src/encoder/MfSegmentConcat.cpp /Febuild\test_host.exe /Fobuild\ mfplat.lib mfreadwrite.lib mfuuid.lib ole32.lib /link /DELAYLOAD:mfplat.dll /DELAYLOAD:mfreadwrite.dll delayimp.lib
   .\build\test_host.exe
   ```
 - **macOS (`tests/host/test_host_mac.mm`):**

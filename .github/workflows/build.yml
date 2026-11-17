@@ -51,3 +51,21 @@ jobs:
             -framework AudioToolbox -framework CoreFoundation -framework OpenGL \
             -o build/test_host_mac
           ./build/test_host_mac
+
+  host-tests-win:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Compile and run Windows host tests
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force build | Out-Null
+          $clang = Join-Path $env:ProgramFiles 'LLVM\bin\clang-cl.exe'
+          $compiler = if (Test-Path $clang) { $clang } else { 'cl' }
+          & $compiler /nologo /std:c++latest /EHsc /O2 /W3 /I src tests/host/test_host.cpp src/encoder/MfSegmentConcat.cpp /Febuild\test_host.exe /Fobuild\ mfplat.lib mfreadwrite.lib mfuuid.lib ole32.lib /link /DELAYLOAD:mfplat.dll /DELAYLOAD:mfreadwrite.dll delayimp.lib
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./build/test_host.exe
+          exit $LASTEXITCODE
