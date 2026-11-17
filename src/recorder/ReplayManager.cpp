@@ -68,7 +68,7 @@ static constexpr int MAX_ENCODER_START_FAILURES = 3;
 static constexpr int MAX_CONSECUTIVE_WRITE_ERRORS = 5;
 
 static bool isSegmentFile(const std::filesystem::path& path) {
-    std::string name = path.filename().string();
+    std::string name = geode::utils::string::pathToString(path.filename());
     // Match exact pattern "seg_<digits>.mp4"
     if (name.size() <= 8) return false; // at least "seg_1.mp4"
     if (name.compare(0, 4, "seg_") != 0) return false;
@@ -131,14 +131,27 @@ bool isPidProcessAlive(uint32_t pid) {
 #ifdef GEODE_IS_WINDOWS
     HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(pid));
     if (!hProc) {
-        return GetLastError() != ERROR_INVALID_PARAMETER;
+        return false;
     }
     DWORD exitCode = 0;
     bool alive = GetExitCodeProcess(hProc, &exitCode) && exitCode == STILL_ACTIVE;
+    bool sameApp = false;
+    if (alive) {
+        wchar_t selfExe[MAX_PATH] = {};
+        wchar_t otherExe[MAX_PATH] = {};
+        DWORD selfLen = GetModuleFileNameW(nullptr, selfExe, MAX_PATH);
+        DWORD otherLen = MAX_PATH;
+        if (selfLen > 0 && QueryFullProcessImageNameW(hProc, 0, otherExe, &otherLen)) {
+            std::filesystem::path selfName = std::filesystem::path(selfExe).filename();
+            std::filesystem::path otherName = std::filesystem::path(otherExe).filename();
+            sameApp = !selfName.empty() && _wcsicmp(selfName.c_str(), otherName.c_str()) == 0;
+        }
+    }
     CloseHandle(hProc);
-    return alive;
+    return sameApp;
 #elif defined(GEODE_IS_MACOS)
-    return isMacProcessAlive(static_cast<int>(pid));
+    // Verify both existence AND executable identity so OS PID reuse after a crash never stalls cleanup (M13).
+    return isMacSameAppProcessAlive(static_cast<int>(pid));
 #else
     return false;
 #endif
@@ -187,7 +200,7 @@ void ReplayManager::ensureSessionLock(const std::filesystem::path& pidTempDir) {
         }
 
         auto lockPath = pidTempDir / "session.lock";
-        int fdNew = ::open(lockPath.c_str(), O_CREAT | O_RDWR, 0644);
+        int fdNew = ::open(lockPath.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0644);
         if (fdNew < 0) {
             geode::log::warn("ReplayManager: failed to open session file '{}': errno={}",
                 geode::utils::string::pathToString(lockPath), errno);
@@ -303,7 +316,7 @@ void ReplayManager::cleanupTempDir() {
             if (!isDir) continue;
 
             uint32_t otherPid = 0;
-            if (!parsePidFolderName(dirPath.filename().string(), otherPid) || otherPid == selfPid) {
+            if (!parsePidFolderName(geode::utils::string::pathToString(dirPath.filename()), otherPid) || otherPid == selfPid) {
                 continue;
             }
 
@@ -336,7 +349,7 @@ void ReplayManager::cleanupTempDir() {
                 CloseHandle(hLock);
             }
 #else
-            int lockFd = ::open(lockPath.c_str(), O_RDWR);
+            int lockFd = ::open(lockPath.c_str(), O_RDWR | O_CLOEXEC);
             if (lockFd < 0) {
                 if (errno != ENOENT || isPidProcessAlive(otherPid)) {
                     continue;
@@ -513,7 +526,7 @@ void ReplayManager::initialize() {
     {
         const auto& caps = getMacVideoEncoderCaps();
         geode::log::info(
-            "Instant Replay: VideoToolbox compatibility — AV1(HW={},SW={}), HEVC(HW={},SW={}), H.264(HW={},SW={})",
+            "Instant Replay: VideoToolbox compatibility - AV1(HW={},SW={}), HEVC(HW={},SW={}), H.264(HW={},SW={})",
             caps.av1Hardware, caps.av1Software,
             caps.hevcHardware, caps.hevcSoftware,
             caps.h264Hardware, caps.h264Software);
@@ -603,6 +616,14 @@ void ReplayManager::shutdown() {
     releaseSessionLock(true);
 }
 
+bool ReplayManager::isCaptureBackendReady() noexcept {
+#ifdef GEODE_IS_MACOS
+    return isMacGLCaptureHookInstalled();
+#else
+    return true;
+#endif
+}
+
 void ReplayManager::startReplay() {
     {
         std::lock_guard<std::mutex> lc(m_lifecycleMutex);
@@ -618,6 +639,24 @@ void ReplayManager::startReplay() {
     // Stop teardown has already finished; harvest any exited thread handle before starting anew
     joinStopThread();
     if (m_running.load() || m_shuttingDown.load() || m_stopping.load()) return;
+
+    if (!isCaptureBackendReady()) {
+        geode::log::error("Instant Replay: cannot start recording because the macOS GL capture hook failed to install (M20)");
+        ReplayConfig::get().enabled = false;
+        ReplayConfig::get().saveToSettings();
+        geode::Loader::get()->queueInMainThread([]() {
+            geode::Notification::create(
+                "Instant Replay: Capture hook failed - cannot record video",
+                geode::NotificationIcon::Error,
+                4.0f
+            )->show();
+            if (auto* popup = ReplayPopup::get()) {
+                popup->refreshUI();
+                popup->updateStatusDisplay(0.0f);
+            }
+        });
+        return;
+    }
 
     ReplayConfig::refreshNativeFrameHeight();
 
@@ -690,14 +729,18 @@ void ReplayManager::startReplay() {
     }
 
     int targetW = 0, targetH = 0;
-    if (auto view = cocos2d::CCEGLView::get()) {
-        auto fs = view->getFrameSize();
-        int initW = static_cast<int>(fs.width);
-        int initH = static_cast<int>(fs.height);
-        if (initW >= 16 && initH >= 16) {
-            bool clamped = false;
-            std::tie(targetW, targetH) = m_sessionConfig.getSessionResolutionDimensions(initW, initH, &clamped);
-            if (clamped) {
+    int initW = 0, initH = 0;
+    if (ReplayConfig::getNativeFramebufferSize(initW, initH)) {
+        bool clamped = false;
+        bool clampedOversizeMac = false;
+        std::tie(targetW, targetH) = m_sessionConfig.getSessionResolutionDimensions(
+            initW, initH, &clamped, &clampedOversizeMac);
+        if (clamped) {
+            if (clampedOversizeMac) {
+                geode::log::info(
+                    "Instant Replay: clamped oversized native output from {}x{} to {}x{} (VideoToolbox 4K fallback)",
+                    initW, initH, targetW, targetH);
+            } else {
                 geode::log::info(
                     "Instant Replay: clamped H.264 output size from {}x{} native to {}x{} (max {}x{})",
                     initW, initH, targetW, targetH, kH264MaxWidth, kH264MaxHeight);
@@ -869,6 +912,10 @@ ToggleReplayResult ReplayManager::toggleReplay() {
     cfg.saveToSettings();
 
     if (newState) {
+        if (!isCaptureBackendReady()) {
+            startReplay();
+            return ToggleReplayResult::Unavailable;
+        }
         startReplay();
         return m_pendingRestart.load() ? ToggleReplayResult::RestartQueued : ToggleReplayResult::Enabled;
     }
@@ -977,8 +1024,12 @@ ReplayManager::WriteCheckResult ReplayManager::handleEncoderWriteError(
         return WriteCheckResult::Fatal;
     }
 
+    const int maxErrs = res.retryable ? (MAX_CONSECUTIVE_WRITE_ERRORS * 10) : MAX_CONSECUTIVE_WRITE_ERRORS;
     errorCounter++;
-    if (errorCounter < MAX_CONSECUTIVE_WRITE_ERRORS) {
+    if (errorCounter < maxErrs) {
+        if (res.retryable && errorCounter == 1) {
+            geode::log::debug("Instant Replay: transient {} write backpressure on {} ({})", streamLabel, codec, detail);
+        }
         return WriteCheckResult::ToleratedError;
     }
 
@@ -2908,6 +2959,23 @@ void ReplayManager::showSaveFeedback(SaveReplayResult result) {
 void ReplayManager::openRecordingsFolder() {
     auto cfg = ReplayConfig::get().snapshot();
     geode::async::runtime().spawnBlocking<void>([cfg]() {
+#ifdef GEODE_IS_MACOS
+        std::filesystem::path dir = cfg.getRecordingsDirectory(true);
+        std::error_code ec;
+        bool exists = std::filesystem::exists(dir, ec) && std::filesystem::is_directory(dir, ec);
+        // AppKit/NSWorkspace in geode::utils::file::openFolder must execute on the main thread (M17).
+        geode::queueInMainThread([dir, exists]() {
+            bool opened = exists && geode::utils::file::openFolder(dir);
+            if (!opened) {
+                std::string dirStr = geode::utils::string::pathToString(dir);
+                geode::Notification::create(
+                    "Instant Replay: failed to open folder (" + dirStr + ")",
+                    geode::NotificationIcon::Error,
+                    3.0f
+                )->show();
+            }
+        });
+#else
         bool opened = false;
         std::filesystem::path dir;
         {
@@ -2928,6 +2996,7 @@ void ReplayManager::openRecordingsFolder() {
                 )->show();
             });
         }
+#endif
     });
 }
 

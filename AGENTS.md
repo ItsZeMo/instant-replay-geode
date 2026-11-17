@@ -7,10 +7,12 @@ This document provides the complete architectural context, invariants, and build
 ## 1. Project Overview
 
 - **Mod ID:** `zemo.instant-replay`
-- **Target Platform:** Windows 64-bit (`WIN32` / `x86_64`, guarded by `#ifdef GEODE_IS_WINDOWS`)
+- **Target Platforms:**
+  - Windows 64-bit (`WIN32` / `x86_64`, guarded by `#ifdef GEODE_IS_WINDOWS`)
+  - macOS Universal (`arm64` + `x86_64`, macOS `11.0+`, guarded by `#ifdef GEODE_IS_MACOS`)
 - **Target Game / Loader:** Geometry Dash `2.2081`, Geode SDK `v5.11.2`
-- **Language Standard:** C++23 (`clang-cl` or MSVC)
-- **Purpose:** ShadowPlay-style background instant replay recorder for Geometry Dash. Continuously records rolling 30-second MP4 segments in the background using hardware-accelerated Windows Media Foundation encoders and lossless segment remuxing when the user presses `F6` (Save Replay).
+- **Language Standard:** C++23 (`clang-cl` / MSVC on Windows; Apple `clang++` + Objective-C++23 with `-fobjc-arc -fobjc-arc-exceptions` on macOS)
+- **Purpose:** ShadowPlay-style background instant replay recorder for Geometry Dash. Continuously records rolling 30-second MP4 segments in the background using hardware-accelerated Windows Media Foundation or macOS VideoToolbox encoders and lossless segment remuxing when the user presses `F6` (Save Replay).
 
 ---
 
@@ -19,7 +21,7 @@ This document provides the complete architectural context, invariants, and build
 ```text
 instant-replay-geode/
 ├── mod.json                             # Geode manifest, settings schema, keybind definitions
-├── CMakeLists.txt                       # CMake build script (links mfplat, mfreadwrite, mfuuid, opengl32, shell32)
+├── CMakeLists.txt                       # CMake build script (Win32/MF on Windows; ObjC++23 ARC + VT/AVF/CA on macOS)
 ├── about.md                             # Geode in-game mod description
 ├── changelog.md                         # Release history
 ├── LICENSE                              # MIT License
@@ -28,26 +30,34 @@ instant-replay-geode/
 ├── CLAUDE.md                            # Pointer to AGENTS.md for Claude Code
 ├── tests/
 │   └── host/
-│       └── test_host.cpp                # Standalone Windows host unit/MF integration tests (clang-cl /std:c++latest)
+│       ├── test_host.cpp                # Standalone Windows host unit/MF integration tests (clang-cl /std:c++latest)
+│       ├── test_host_mac.mm             # Standalone macOS VideoToolbox/CGL/remux host integration tests
+│       └── mock_geode/                  # Minimal header mocks for standalone macOS host tests
 └── src/
-    ├── main.cpp                         # Hooks ($on_game(Exiting), CCEGLView, FMODAudioEngine, MenuLayer, PauseLayer), keybinds, settings listener
+    ├── main.cpp                         # Hooks ($on_game(Exiting), CCEGLView / NSOpenGLContext flushBuffer, FMODAudioEngine, menus), keybinds
     ├── config/
     │   ├── CodecUtils.hpp               # Pure codec parsing (resolveRequestedCodecSpec) & H.264 4096x2304 aspect clamping
-    │   └── ReplayConfig.hpp             # Thread-safe singleton configuration, snapshots, disk space checks & mod.json sync
+    │   └── ReplayConfig.hpp             # Thread-safe singleton configuration, snapshots, Retina size, disk checks & mod.json sync
+    ├── platform/
+    │   ├── MacPlatformUtils.hpp / .mm   # Cocoa folders, Retina GL drawable size, CGL-locked flushBuffer hook, PID identity check
+    │   └── MacVideoCapabilities.hpp/.mm # VTCopyVideoEncoderList hardware/SW gating & cached >4K VideoToolbox size probes
     ├── capture/
     │   ├── FrameBudget.hpp              # Dynamic byte-budgeted pool/queue/in-flight frame helpers
-    │   ├── FrameGrabber.hpp / .cpp      # OpenGL FBO scaling + double-buffered async PBO readback + pooled IMFMediaBuffer frames
+    │   ├── FrameGrabber.hpp / .cpp      # OpenGL FBO scaling + async PBO readback + IMFMediaBuffer / BT.709 CVPixelBuffer pool
     │   ├── GameAudioRing.hpp            # Lock-free SPSC ring buffer + packet metadata ring for FMOD audio
-    │   └── AudioGrabber.hpp / .cpp      # FMOD DSP capture (+ Master HEAD save-sound bypass) + stateful WASAPI mic capture
+    │   └── AudioGrabber.hpp/.cpp/.mm    # FMOD DSP capture + WASAPI (Win) / CoreAudio + TCC mic capture (Mac)
     ├── encoder/
+    │   ├── VideoEncoderTypes.hpp        # Shared ConcatResult & EncoderOpResult structs
+    │   ├── PlatformEncoder.hpp          # Platform encoder type alias (MediaFoundationEncoder / VideoToolboxEncoder)
     │   ├── ConcatTimestampMath.hpp      # Audio-driven cross-segment timestamp state & B-frame monotonic DTS math
-    │   └── MediaFoundationEncoder.hpp / .cpp # IMFSinkWriter encoding (with session codec cache) + IMFSourceReader MP4 remuxing
+    │   ├── MediaFoundationEncoder.*     # IMFSinkWriter encoding & IMFSourceReader MP4 remuxing (Windows)
+    │   └── VideoToolboxEncoder.hpp/.mm  # AVAssetWriter + VT encoding, deferred AAC FIFO & AVAssetReader remuxing (macOS)
     ├── recorder/
     │   ├── MicMixFifo.hpp               # Timeline-anchored stereo mic mixing FIFO (drift/pause/overlap/rebase)
     │   └── ReplayManager.hpp / .cpp     # Rolling segment lifecycle, async finalizer, worker thread, audio horizon & export thread
     └── ui/
         ├── ReplayPopup.hpp / .cpp       # 4-tab in-game dashboard & settings popup (F9)
-        ├── CodecGuidePopup.hpp / .cpp   # GPU codec recommendation modal
+        ├── CodecGuidePopup.hpp / .cpp   # GPU / VideoToolbox codec recommendation modal
         └── ReplayNotification.hpp / .cpp# Toast notification when a replay is saved
 ```
 
@@ -56,34 +66,28 @@ instant-replay-geode/
 ## 3. Data Flow & Architecture
 
 1. **Video Capture (`src/capture/FrameGrabber.cpp`)**
-   - Hooked in `ReplayEGLView::swapBuffers` (`src/main.cpp`) with hook priority `100000` (and after `absolllute.megahack`) so capture runs **after** all overlays have rendered, right before presentation.
+   - Hooked in `ReplayEGLView::swapBuffers` on Windows (with hook priority `100000`, after `absolllute.megahack`) and via Objective-C `method_setImplementation` (`replaceObjcMethod`) on `-[NSOpenGLContext flushBuffer]` on macOS (saving/restoring the active CGL context cleanly under `CGLLockContext`), right before presentation.
    - Frame pacing uses `m_nextCaptureTime += interval` with a `3/8` interval tolerance and a 2-interval lag cushion (plus EMA swap-rate detection for 1:1 VSync capture) so driver/OS frame jitter never locks `m_nextCaptureTime` onto late spikes or drops subsequent on-time VSync frames.
-   - Uses an OpenGL FBO + `glBlitFramebuffer` to scale the backbuffer to a **session-fixed** output resolution (`setTargetResolution()` computed at `startReplay()` or from the first valid frame, always even width/height for NV12 compatibility). If the window resizes or changes aspect ratio mid-session, `FrameGrabber` preserves aspect ratio with letterbox/pillarbox bars (clearing the FBO black only when bars are needed, mirrored by `resizeNearest` fallback) instead of splitting segments or distorting video.
-   - Reads pixels asynchronously via 2 alternating Pixel Buffer Objects (`m_pbos[2]`) in `GL_BGRA` format directly into a byte-budgeted pool (`kMaxPooledFrames = 6`, dynamic budget `max(50 MB, min(256 MB, 4 * frameBytes))` guaranteeing `>= 4` frames at 4K) of `IMFMediaBuffer`s inside `CapturedFrame` (`acquireFrame` / `recycleFrame`), avoiding per-frame heap allocations and releasing pool memory when capture stops.
-   - **Note:** OpenGL readback is bottom-up. Pixels are kept bottom-up in `CapturedFrame` and flipped at zero CPU cost by passing a negative stride (`-width * 4`) to Media Foundation (`MF_MT_DEFAULT_STRIDE`).
+   - Uses an OpenGL FBO + `glBlitFramebuffer` to scale the physical framebuffer (`ReplayConfig::getNativeFramebufferSize` accounts for macOS Retina backing pixels) to a **session-fixed** output resolution (`setTargetResolution()`, clamping H.264 to `<= 4096x2304` and oversized macOS >4K Native displays when VideoToolbox declines). Preserves aspect ratio with letterbox/pillarbox bars on resize.
+   - Reads pixels asynchronously via 2 alternating PBOs (`m_pbos[2]`) in `GL_BGRA` into a byte-budgeted pool (`kMaxPooledFrames = 6`, `max(50 MB, min(256 MB, 4 * frameBytes))`) of `IMFMediaBuffer` (Windows) or BT.709-tagged IOSurface-backed `CVPixelBuffer` (macOS).
+   - **Note:** OpenGL readback is bottom-up. Windows keeps pixels bottom-up with negative stride (`-width * 4`) in Media Foundation; macOS flips Y inside the GPU `glBlitFramebuffer` pass so VideoToolbox receives top-down rows at zero CPU cost.
 
-2. **Audio Capture (`src/capture/AudioGrabber.cpp`)**
-   - **Game Audio:** Custom FMOD DSP attached to the tail of the Master `ChannelGroup`. Writes normalized 2-channel stereo float PCM into a pre-allocated **lock-free SPSC ring buffer + 8192-entry packet metadata ring** (`GameAudioRing`, 262144 stereo frames / ~5.46s @ 48 kHz) binding timestamps and sample rates to each pushed range with zero heap allocations and zero mutex locks on the real-time FMOD mixer thread. Drained by the worker thread via `drainGameAudio()`.
-   - **Microphone Audio:** Event-driven WASAPI capture thread (`micCaptureThreadFunc`), started only when both `enabled` and `recordMic` are true, and stopped immediately in `ReplayManager::stopReplay()`. Uses `eConsole` first (falling back to `eCommunications`), computes overflow-safe 64-bit QPC packet timestamps, maintains a stateful fractional-phase linear resampler (`StereoResampler`) to `48000 Hz` across packet boundaries, and automatically recovers from device invalidation (`AUDCLNT_E_DEVICE_INVALIDATED`).
+2. **Audio Capture (`src/capture/AudioGrabber.cpp`, `src/capture/AudioGrabberMac.mm`)**
+   - **Game Audio:** Custom FMOD DSP attached to the tail of the Master `ChannelGroup`. Writes normalized 2-channel stereo float PCM into a pre-allocated **lock-free SPSC ring buffer + 8192-entry packet metadata ring** (`GameAudioRing`, 262144 stereo frames / ~5.46s @ 48 kHz) with zero heap allocations or mutex locks on the FMOD mixer thread.
+   - **Microphone Audio:** Event-driven WASAPI capture (Windows) and CoreAudio `AudioQueue` (macOS), started only when both `enabled` and `recordMic` are true and stopped immediately in `ReplayManager::stopReplay()`. On macOS, checks `[AVCaptureDevice authorizationStatusForMediaType:]` before touching CoreAudio, monitors 3-second digital silence, and falls back to the system default input when a chosen mic disconnects (reattaching when it returns).
 
 3. **Worker Thread & Rolling Segments (`src/recorder/ReplayManager.cpp`)**
-   - Takes an immutable `ReplayConfig` snapshot (`m_sessionConfig`) at `startReplay()`, locks the session output resolution (`FrameGrabber::setTargetResolution`, clamping H.264/custom-H.264 sizes into `4096x2304` with preserved aspect and even sides), and locks session video bitrates (`m_sessionEffBitrateMbps`, `m_sessionEffMaxBitrateMbps`) once from fixed `m_videoHeight`.
-   - Encodes into rolling 30-second MP4 segments (`SEGMENT_DURATION = 30.0`, `MAX_SEGMENT_DURATION = 120.0`) inside `getTempDirectory() / seg_<N>.mp4`, where `getTempDirectory()` resolves to `<base>/pid_<PID>` protected by an exclusive `session.lock` handle (`ensureSessionLock` / `releaseSessionLock`).
-   - **Pre-Warming, Async Rotation & Seam Audio Rules:** Pre-warms the next segment's `MediaFoundationEncoder` on `m_prepareThread` after `25 s` (never keeping more than 2 live encoders). While video frames arrive normally (`< 200 ms`), both game audio and split mic are written only up to the session-wide timestamp of the last encoded video frame (`m_lastWrittenVideoCaptureTime`); newer PCM waits in carry queues (`m_carryGameChunks`, `m_carryMicAudio`) and flushes whenever video catches up, video idles `> 200 ms`, on `stopReplay()`, or on non-continuing save. At every seam `S`, `splitAudioAtBoundary()` writes PCM strictly `< S` (clamped by `targetSamples`), closes every track cleanly up to exact `S` with silence if needed, and leaves `>= S` in carry; continuation segments trim `< S - 1 ms` uniformly. Offloads `Finalize()` on `m_finalizeThread` and exports on `m_exportThread`.
-   - **Audio Timestamp Resync & Keep-Alive:** Compares sample-counter timestamps against wall-clock capture timestamps; bridges any positive gap (`> 40 ms`, capped to `<= MAX_SEGMENT_DURATION` total) with chunked (`<= 1 s`) silence samples (mixing single-track mic via timestamp-anchored `MicMixFifo`), trims negative overlaps (`< -40 ms`, advancing `MicMixFifo` to match), and synthesizes continuous silence on idle audio streams (`> 200 ms` behind video).
-   - **Per-Stream Error & Recovery Handling:** Stops immediately on fatal storage errors (`ERROR_DISK_FULL`, `ERROR_ACCESS_DENIED`, `ERROR_WRITE_PROTECT`), attempts 1 encoder recreation/fallback on repeated non-storage write failures, tracks encoder start failures with exponential backoff, and stops replay cleanly on the main thread guarded by session ID.
+   - Takes an immutable `ReplayConfig` snapshot (`m_sessionConfig`) at `startReplay()`, locks the session output resolution and video bitrates once.
+   - Encodes into rolling 30-second MP4 segments (`SEGMENT_DURATION = 30.0`, `MAX_SEGMENT_DURATION = 120.0`) inside `getTempDirectory() / seg_<N>.mp4`, where `getTempDirectory()` resolves to `<base>/pid_<PID>` protected by an exclusive `session.lock` (`O_CLOEXEC` on POSIX + app executable identity check against PID reuse).
+   - **Pre-Warming, Async Rotation & Seam Audio Rules:** Pre-warms the next segment's encoder on `m_prepareThread` after `25 s` (<= 2 live encoders). Audio tracks write up to the session-wide horizon `m_lastWrittenVideoCaptureTime`, hold newer PCM in carry queues, and split cleanly on boundary `S` (trimming `< S - 1 ms` uniformly). Offloads `Finalize()` on `m_finalizeThread` and exports on `m_exportThread`.
+   - **Per-Stream Error & Recovery Handling:** Stops immediately on fatal storage errors (`ERROR_DISK_FULL`/`ENOSPC`, access denied, write-protect), tolerates transient `retryable` encoder backpressure (e.g. deferred macOS AAC buffering up to 10s), and attempts 1 encoder recreation/fallback on repeated non-storage write failures.
 
-4. **Media Foundation Encoder & Fallback Cascade (`src/encoder/MediaFoundationEncoder.cpp`)**
-   - `IMFSinkWriter` runs with `MF_SINK_WRITER_DISABLE_THROTTLING = TRUE` so `WriteSample` never blocks/deadlocks when an audio stream is idle; `ReplayManager` bounds in-flight uncompressed video frames (`MAX_IN_FLIGHT_ENCODER_FRAMES = 16` and `<= max(256 MB, 4 * frameBytes)` via both `m_inFlightFrames` and `IMFSinkWriter::GetStatistics` queue backpressure).
-   - `MediaFoundationEncoder::start()` uses shared `CodecUtils::resolveRequestedCodecSpec()` and builds a fallback list:
-     `Cached Working Codec -> Requested Codec (HW) -> HEVC (HW) -> H.264 (HW) -> H.264 (SW)`.
-   - Joins any background segment finalization (`onBeforeFallback`) and retries the primary hardware codec before falling back, and only caches fallback codecs on permanent codec-unsupported errors when the primary codec has never succeeded in the current session.
-   - Wraps the caller's `IMFMediaBuffer` directly in an `IMFSample` with zero additional pixel copies.
+4. **Platform Encoders & Fallback Cascade (`MediaFoundationEncoder` / `VideoToolboxEncoder`)**
+   - **Windows (`MediaFoundationEncoder.cpp`):** `IMFSinkWriter` with `MF_SINK_WRITER_DISABLE_THROTTLING = TRUE` and fallback cascade `Cached -> Requested (HW) -> HEVC (HW) -> H.264 (HW) -> H.264 (SW)`.
+   - **macOS (`VideoToolboxEncoder.mm`):** `AVAssetWriter` + VideoToolbox (`VTCompressionSession` probe, `VTCopyVideoEncoderList` runtime gating so AV1 is disabled cleanly on M1/M2, `H.264 (SW)` preferred in software mode), BT.709 color properties, buffered deferred AAC FIFO (`kMaxPendingAudioSeconds = 10.0`), 60s `finishWriting` timeouts, `@try/@catch` ObjC exception guards with `-fobjc-arc-exceptions`, and `-fobjc-arc`.
 
-5. **Saving & Lossless Segment Remuxing (`ReplayManager::handleSaveRequest` & `MediaFoundationEncoder::concatenateSegments`)**
-   - On `F6` (`continueRecording = true`), performs a non-blocking hot-swap onto the pre-warmed encoder (offloading active segment finalization asynchronously to `m_finalizeThread`), falling back to synchronous `Finalize()` only when no prepared encoder is ready or an asynchronous finalization is still in flight. Then selects the newest segments with matching `formatKey` covering `durationSeconds` (`trimStartSeconds = max(0.0, totalSeconds - maxDuration)`).
-   - Locks the selected segment file paths in `m_exportLockedSegments` so `stopReplay()`, `purgeOldSegments()`, or `cleanupTempDir()` cannot delete them while `m_exportThread` is reading them.
-   - `concatenateSegments()` scans the first segment for a keyframe near `trimStartSeconds` (and shifts initial PTS by any B-frame decode lead so negative initial DTS is never clamped together at `0`), remuxes all compressed video/audio samples without re-encoding, and advances `ConcatTimestampState::outputBase` to the primary game-audio stream end (`>= segMaxVideoPts + 1`, falling back to max segment end with a warning only if video outlasts primary audio by `> 1.5` frames) while preserving monotonic video DTS. Checks every `ReadSample`, `WriteSample`, and `Finalize` call and removes any partial output file on failure.
+5. **Saving & Lossless Segment Remuxing (`concatenateSegments`)**
+   - On `F6`, performs a hot-swap onto the pre-warmed encoder, locks selected segment paths in `m_exportLockedSegments`, scans segment 0 for a keyframe near `trimStartSeconds` (shifting initial PTS by negative B-frame decode lead), and remuxes compressed video/audio tracks chronologically without re-encoding. On macOS, preserves `mediaTimeScale` (1 MHz) on passthrough video, sets `expectsMediaDataInRealTime = YES` + 10s stall watchdog, frees segment AVAsset/reader objects per iteration via inner `@autoreleasepool`, and rebases sample timings by `targetOutputPTS - origOutputPTS` delta so AAC priming offsets stay intact.
 
 ---
 
@@ -97,33 +101,40 @@ instant-replay-geode/
    In Geode 5.10+, `IntSettingV3::setValue` resets to `defaultValue` if a value exceeds `min`/`max` in `mod.json`. Always write integer/float settings through `setClampedSetting` and keep `s_isSavingSettings = true` while saving.
 4. **Do Not Overwrite Focused `geode::TextInput`:**
    In `ReplayPopup::refreshUI()`, `updateFolderDisplay()`, and `syncUnfocusedInputsToConfig()`, always check `!isInputFocused(input)` before calling `input->setString(...)`, otherwise typing multi-digit numbers (like `"35"` or `"100"`) will clobber the user's input mid-keystroke.
-5. **Clean Shutdown & COM Lifetime:**
-   `ReplayManager::shutdown()` is hooked on `$on_game(Exiting)` in `src/main.cpp` so OpenGL FBOs/PBOs and FMOD DSPs/bypass ChannelGroups are released while the GL context and FMOD system are still valid. All `ComRef` wrappers on worker/WASAPI threads must be destroyed before `CoUninitialize()`.
-6. **Main-Thread-Only Cocos2d / GD APIs, `Notification`, and `FMODAudioEngine`:**
-   Never call cocos2d-x APIs, Geometry Dash classes, `geode::Notification` / `ReplayNotification`, or `FMODAudioEngine` from worker, finalize, prepare, export, WASAPI, or FMOD mixer threads. Marshal all UI/notification/audio-engine actions via `geode::queueInMainThread`.
+5. **Clean Shutdown, OpenGL Contexts & COM Lifetime:**
+   `ReplayManager::shutdown()` is hooked on `$on_game(Exiting)` in `src/main.cpp` (disabling the macOS `flushBuffer` hook first) so OpenGL FBOs/PBOs and FMOD DSPs are released while valid. On macOS/Windows `FrameGrabber::resetGlResources(true)` verifies the current thread holds the owning GL context before `glDelete*`, and the `flushBuffer` hook saves/restores any previous CGL context. All `ComRef` wrappers on Windows worker/WASAPI threads must be destroyed before `CoUninitialize()`.
+6. **Main-Thread-Only Cocos2d / GD APIs, AppKit, `Notification`, and `FMODAudioEngine`:**
+   Never call cocos2d-x APIs, Geometry Dash classes, AppKit (`geode::utils::file::openFolder` / `NSWorkspace`), `geode::Notification` / `ReplayNotification`, or `FMODAudioEngine` from worker, finalize, prepare, export, WASAPI/CoreAudio, or FMOD mixer threads. Marshal all UI/AppKit/notification/audio-engine actions via `geode::queueInMainThread`.
+7. **macOS ARC, ObjC Exceptions & Capture Hooks:**
+   `.mm` files compile with `-fobjc-arc -fobjc-arc-exceptions`; wrap AVFoundation/VideoToolbox calls in `@try / @catch (NSException*)` so Objective-C exceptions never unwind into C++ frames. Never inline-hook AppKit/system frameworks on macOS; use `geode::hook::replaceObjcMethod` (`method_setImplementation`).
 
 ---
 
 ## 5. Building & Testing
 
-> **Platform Note:** This mod is Windows x64 only (`WIN32` + Media Foundation + WASAPI + OpenGL) and **does not build on Linux** (`CMakeLists.txt` intentionally errors on non-`WIN32`). Full build verification runs natively on Windows or via GitHub Actions on `windows-latest` (`.github/workflows/build.yml`).
+> **Platform Note:** Builds for **Windows x64** (`WIN32`) and **macOS Universal** (`arm64;x86_64`), and intentionally errors on Linux (`CMakeLists.txt`). CI (`.github/workflows/build.yml`) builds `Win64` (`build`), `MacOS` (`build-mac`), and runs macOS host tests (`host-tests-mac`).
 
 ### Option A: Geode CLI (Recommended)
-Requires [Geode CLI](https://github.com/geode-sdk/cli), Geode SDK (`GEODE_SDK` env var), CMake, Ninja, and clang-cl / MSVC on Windows:
+Requires [Geode CLI](https://github.com/geode-sdk/cli), Geode SDK (`GEODE_SDK` env var), CMake, Ninja, and `clang-cl`/MSVC (Windows) or Xcode CLT (macOS):
 ```powershell
 geode build --ninja
 ```
 The packaged mod is written to `build/zemo.instant-replay.geode`.
 
 ### Option B: Standard CMake
-```powershell
+```bash
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build build --config RelWithDebInfo
 ```
 
-### Host Unit & Media Foundation Integration Tests (`tests/host/`)
-Standalone C++23 tests (no Geode/GD runtime required, links Windows Media Foundation directly) live in `tests/host/test_host.cpp`. Run on Windows with `clang-cl` or MSVC (`cl`):
-```powershell
-clang-cl /std:c++latest /EHsc /O2 /I src tests/host/test_host.cpp /Fe:build/test_host.exe mfplat.lib mfreadwrite.lib mfuuid.lib ole32.lib
-.\build\test_host.exe
-```
+### Host Unit & Platform Integration Tests (`tests/host/`)
+- **Windows (`tests/host/test_host.cpp`):**
+  ```powershell
+  clang-cl /std:c++latest /EHsc /O2 /I src tests/host/test_host.cpp /Fe:build/test_host.exe mfplat.lib mfreadwrite.lib mfuuid.lib ole32.lib
+  .\build\test_host.exe
+  ```
+- **macOS (`tests/host/test_host_mac.mm`):**
+  ```bash
+  clang++ -std=c++23 -fobjc-arc -fobjc-arc-exceptions -DGEODE_IS_MACOS -DGL_SILENCE_DEPRECATION -Isrc -Itests/host/mock_geode tests/host/test_host_mac.mm src/encoder/VideoToolboxEncoder.mm src/platform/MacVideoCapabilities.mm -framework Foundation -framework AVFoundation -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework CoreAudio -framework AudioToolbox -framework CoreFoundation -framework OpenGL -o build/test_host_mac
+  ./build/test_host_mac
+  ```

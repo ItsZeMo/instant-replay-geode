@@ -84,7 +84,15 @@ bool allocateIOSurfacePixelBuffer(int width, int height, CVPixelBufferRef* outPb
         outPb);
     if (emptyDict) CFRelease(emptyDict);
     if (attrs) CFRelease(attrs);
-    return ret == kCVReturnSuccess && *outPb != nullptr;
+    if (ret != kCVReturnSuccess || *outPb == nullptr) {
+        return false;
+    }
+
+    // Tag capture buffers as BT.709 so VideoToolbox and color-managed players preserve accurate game colors (M18).
+    CVBufferSetAttachment(*outPb, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
+    CVBufferSetAttachment(*outPb, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
+    CVBufferSetAttachment(*outPb, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
+    return true;
 }
 #endif
 
@@ -188,17 +196,35 @@ void FrameGrabber::setCapturing(bool active) {
 }
 
 void FrameGrabber::resetGlResources(bool glContextValid) noexcept {
-    if (glContextValid && m_initialized) {
+    bool canDeleteGl = glContextValid && m_initialized;
 #ifdef GEODE_IS_WINDOWS
+    if (canDeleteGl && (!m_glContext || wglGetCurrentContext() != m_glContext)) {
+        canDeleteGl = false;
+    }
+    if (canDeleteGl) {
         if (m_pbos[0] != 0 && glDeleteBuffers) glDeleteBuffers(2, m_pbos);
         if (m_fbo && glDeleteFramebuffers) glDeleteFramebuffers(1, &m_fbo);
         if (m_rbo && glDeleteRenderbuffers) glDeleteRenderbuffers(1, &m_rbo);
-#else
+    }
+#elif defined(GEODE_IS_MACOS)
+    CGLContextObj ownerCtx = m_glContext;
+    if (canDeleteGl) {
+        CGLContextObj curCtx = CGLGetCurrentContext();
+        if (!ownerCtx || curCtx != ownerCtx) {
+            geode::log::debug(
+                "FrameGrabber: skipping glDelete* on exit (current CGL={}, owner CGL={})",
+                static_cast<const void*>(curCtx), static_cast<const void*>(ownerCtx));
+            canDeleteGl = false;
+        }
+    }
+    if (canDeleteGl) {
+        // m_glMutex serializes cleanup() vs captureCurrentFrame(), and curCtx == ownerCtx proves the calling
+        // thread owns the context; avoid nested CGLLockContext inside m_glMutex to prevent AB-BA inversion with flushBuffer.
         if (m_pbos[0] != 0) glDeleteBuffers(2, m_pbos);
         if (m_fbo) glDeleteFramebuffers(1, &m_fbo);
         if (m_rbo) glDeleteRenderbuffers(1, &m_rbo);
-#endif
     }
+#endif
     m_pbos[0] = m_pbos[1] = 0;
     m_fbo = 0;
     m_rbo = 0;
@@ -216,7 +242,10 @@ void FrameGrabber::resetGlResources(bool glContextValid) noexcept {
 void FrameGrabber::cleanup(bool glContextValid) {
     m_capturing.store(false, std::memory_order_release);
     m_captureEpoch.fetch_add(1, std::memory_order_acq_rel);
-    resetGlResources(glContextValid);
+    {
+        std::lock_guard<std::mutex> glLock(m_glMutex);
+        resetGlResources(glContextValid);
+    }
 
     std::lock_guard<std::mutex> lock(m_poolMutex);
     m_framePool.clear();
@@ -463,6 +492,9 @@ static void resizeNearestStrided(
 void FrameGrabber::captureCurrentFrame() {
     if (!m_callback || !m_capturing.load(std::memory_order_acquire)) return;
 
+    std::unique_lock<std::mutex> glLock(m_glMutex);
+    if (!m_callback || !m_capturing.load(std::memory_order_acquire)) return;
+
     uint64_t epoch = m_captureEpoch.load(std::memory_order_acquire);
     if (m_seenEpoch != epoch) {
         m_seenEpoch = epoch;
@@ -535,15 +567,7 @@ void FrameGrabber::captureCurrentFrame() {
 
     // Real size of the window back buffer (GL_VIEWPORT may be a sub-region)
     int srcW = 0, srcH = 0;
-#ifdef GEODE_IS_WINDOWS
-    if (auto view = CCEGLView::get()) {
-        auto fs = view->getFrameSize();
-        srcW = static_cast<int>(fs.width);
-        srcH = static_cast<int>(fs.height);
-    }
-#elif defined(GEODE_IS_MACOS)
-    getMacOpenGLDrawableSize(srcW, srcH);
-#endif
+    ReplayConfig::getNativeFramebufferSize(srcW, srcH);
     if (srcW <= 0 || srcH <= 0) {
         GLint viewport[4] = {0, 0, 0, 0};
         glGetIntegerv(GL_VIEWPORT, viewport);
@@ -559,15 +583,22 @@ void FrameGrabber::captureCurrentFrame() {
     int dstH = m_sessionTargetH.load(std::memory_order_acquire);
     if (dstW <= 0 || dstH <= 0) {
         bool clamped = false;
-        auto [w, h] = config.getSessionResolutionDimensions(srcW, srcH, &clamped);
+        bool clampedOversizeMac = false;
+        auto [w, h] = config.getSessionResolutionDimensions(srcW, srcH, &clamped, &clampedOversizeMac);
         dstW = w;
         dstH = h;
         m_sessionTargetW.store(dstW, std::memory_order_release);
         m_sessionTargetH.store(dstH, std::memory_order_release);
         if (clamped) {
-            geode::log::info(
-                "FrameGrabber: clamped H.264 output size from {}x{} to {}x{} (max {}x{})",
-                srcW, srcH, dstW, dstH, kH264MaxWidth, kH264MaxHeight);
+            if (clampedOversizeMac) {
+                geode::log::info(
+                    "FrameGrabber: clamped oversized native output from {}x{} to {}x{} (VideoToolbox max 4K fallback)",
+                    srcW, srcH, dstW, dstH);
+            } else {
+                geode::log::info(
+                    "FrameGrabber: clamped H.264 output size from {}x{} to {}x{} (max {}x{})",
+                    srcW, srcH, dstW, dstH, kH264MaxWidth, kH264MaxHeight);
+            }
         }
     }
 

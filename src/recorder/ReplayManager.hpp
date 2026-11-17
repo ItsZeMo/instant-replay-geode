@@ -41,7 +41,8 @@ enum class ToggleReplayResult {
     Enabled,
     Stopping,
     RestartQueued,
-    StopPending
+    StopPending,
+    Unavailable
 };
 
 class ReplayManager {
@@ -63,6 +64,7 @@ public:
     bool isReplayLocked() const noexcept { return m_running.load() || m_stopping.load(); }
     bool isExportInFlight() const noexcept { return m_exportInFlight.load(); }
     bool isSaving() const noexcept { return m_savePending.load() || m_exportInFlight.load(); }
+    static bool isCaptureBackendReady() noexcept;
 
     // Direct folder opener
     void openRecordingsFolder();

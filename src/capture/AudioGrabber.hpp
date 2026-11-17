@@ -28,6 +28,15 @@ struct AudioDeviceInfo {
     std::string name; // Sanitized friendly name for display
 };
 
+enum class MicCaptureStatus : uint8_t {
+    Idle = 0,
+    Active,
+    PermissionDenied,
+    UsingFallbackDevice,
+    DigitalSilenceDetected,
+    NoInputDevice
+};
+
 // Stateful fractional-phase linear stereo resampler shared by AudioGrabber and ReplayManager.
 // Appends converted stereo samples to `outStereo` without clearing existing elements.
 struct StereoResampler {
@@ -114,6 +123,9 @@ public:
     static std::string sanitizeDeviceNameUtf8(std::string_view rawName);
     void startMicCapture();
     void stopMicCapture();
+    MicCaptureStatus getMicCaptureStatus() const noexcept {
+        return m_micStatus.load(std::memory_order_acquire);
+    }
 
     // Microphone callback (WASAPI thread -> ReplayManager worker queue)
     using AudioCallback = std::function<void(std::shared_ptr<AudioChunk>)>;
@@ -174,6 +186,7 @@ private:
 
     std::atomic<int> m_gameSampleRate{48000};
     std::atomic<bool> m_micRunning{false};
+    std::atomic<MicCaptureStatus> m_micStatus{MicCaptureStatus::Idle};
     std::thread m_micThread;
 };
 

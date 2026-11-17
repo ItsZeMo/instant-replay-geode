@@ -16,10 +16,13 @@
 #pragma pop_macro("CommentType")
 #include <objc/message.h>
 #include <objc/runtime.h>
+#include <libproc.h>
 #include <atomic>
 #include <cerrno>
 #include <cstdlib>
+#include <mutex>
 #include <signal.h>
+#include <unistd.h>
 
 namespace replay {
 
@@ -29,6 +32,7 @@ std::atomic<bool (*)()> g_shouldCaptureCallback{nullptr};
 std::atomic<bool> g_captureHookEnabled{false};
 std::atomic<void*> g_origFlushBuffer{nullptr};
 std::atomic<bool> g_hookInstalled{false};
+std::mutex g_hookInstallMutex;
 } // namespace
 
 std::filesystem::path getMacDefaultVideosDirectory() {
@@ -61,6 +65,22 @@ bool isMacProcessAlive(int pid) noexcept {
     if (pid <= 0) return false;
     if (::kill(static_cast<pid_t>(pid), 0) == 0) return true;
     return errno == EPERM;
+}
+
+bool isMacSameAppProcessAlive(int pid) noexcept {
+    if (!isMacProcessAlive(pid)) return false;
+
+    char selfPath[PROC_PIDPATHINFO_MAXSIZE] = {};
+    char otherPath[PROC_PIDPATHINFO_MAXSIZE] = {};
+    int selfLen = proc_pidpath(::getpid(), selfPath, sizeof(selfPath));
+    int otherLen = proc_pidpath(static_cast<pid_t>(pid), otherPath, sizeof(otherPath));
+    if (selfLen <= 0 || otherLen <= 0) {
+        return false; // EPERM (another user/system daemon) or exited concurrently -> safe to clean
+    }
+
+    std::filesystem::path selfName = std::filesystem::path(selfPath).filename();
+    std::filesystem::path otherName = std::filesystem::path(otherPath).filename();
+    return !selfName.empty() && selfName == otherName;
 }
 
 static id getSharedEAGLView() {
@@ -132,11 +152,25 @@ static void nsOpenGLContextFlushBufferHook(NSOpenGLContext* self, SEL sel) {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
                     id ctxView = self ? [self view] : nil;
-                    if (self && eaglView && ctxView == eaglView) {
-                        if (CGLGetCurrentContext() != [self CGLContextObj]) {
-                            [self makeCurrentContext];
+                    CGLContextObj targetCtx = self ? [self CGLContextObj] : nullptr;
+                    if (self && eaglView && ctxView == eaglView && targetCtx) {
+                        CGLContextObj prevCtx = CGLGetCurrentContext();
+                        CGLLockContext(targetCtx);
+                        bool switched = (prevCtx != targetCtx);
+                        if (switched) {
+                            static std::atomic<bool> s_loggedSwitch{false};
+                            if (!s_loggedSwitch.exchange(true, std::memory_order_relaxed)) {
+                                geode::log::debug(
+                                    "Instant Replay: switching CGL context {} -> {} during flushBuffer capture",
+                                    static_cast<const void*>(prevCtx), static_cast<const void*>(targetCtx));
+                            }
+                            CGLSetCurrentContext(targetCtx);
                         }
                         cb();
+                        if (switched) {
+                            CGLSetCurrentContext(prevCtx);
+                        }
+                        CGLUnlockContext(targetCtx);
                     }
 #pragma clang diagnostic pop
                 }
@@ -148,14 +182,14 @@ static void nsOpenGLContextFlushBufferHook(NSOpenGLContext* self, SEL sel) {
     }
 }
 
-void installMacGLCaptureHook(void (*onBeforeFlush)(), bool (*shouldCapture)()) {
+bool installMacGLCaptureHook(void (*onBeforeFlush)(), bool (*shouldCapture)()) {
+    std::lock_guard<std::mutex> lock(g_hookInstallMutex);
     g_onBeforeFlushCallback.store(onBeforeFlush, std::memory_order_release);
     g_shouldCaptureCallback.store(shouldCapture, std::memory_order_release);
     g_captureHookEnabled.store(true, std::memory_order_release);
 
-    bool expected = false;
-    if (!g_hookInstalled.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-        return;
+    if (g_hookInstalled.load(std::memory_order_acquire)) {
+        return true;
     }
 
     // Seed original IMP before replacing the ObjC method table entry so any concurrent
@@ -177,9 +211,17 @@ void installMacGLCaptureHook(void (*onBeforeFlush)(), bool (*shouldCapture)()) {
         if (prevImp && prevImp != reinterpret_cast<void*>(&nsOpenGLContextFlushBufferHook)) {
             g_origFlushBuffer.store(prevImp, std::memory_order_release);
         }
+        g_hookInstalled.store(true, std::memory_order_release);
+        return true;
     } else {
         geode::log::error("Instant Replay: failed to swizzle -[NSOpenGLContext flushBuffer]: {}", replaceRes.unwrapErr());
+        g_hookInstalled.store(false, std::memory_order_release);
+        return false;
     }
+}
+
+bool isMacGLCaptureHookInstalled() noexcept {
+    return g_hookInstalled.load(std::memory_order_acquire);
 }
 
 void disableMacGLCaptureHook() noexcept {

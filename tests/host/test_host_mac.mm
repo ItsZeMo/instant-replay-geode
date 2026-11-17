@@ -535,6 +535,11 @@ void testHardwareCapabilityChecks() {
     CHECK(!caps.supports(replay::VideoCodecFamily::VP9, true));
     CHECK(!caps.supports(replay::VideoCodecFamily::VP9, false));
 
+    // M16 check: in CPU software mode, H.264 SW is preferred before HEVC SW.
+    if (caps.h264Software) {
+        CHECK(replay::ReplayConfig::bestSupportedCodec(false) == replay::CodecType::H264);
+    }
+
     replay::ReplayConfig cfg;
     cfg.codec = replay::CodecType::AV1;
     cfg.hardwareAcceleration = true;
@@ -579,6 +584,323 @@ void testHardwareCapabilityChecks() {
               << ", h264HW=" << caps.h264Hardware << ")\n";
 }
 
+// T-M1: Middle segment has 3s shorter audio than video; remux must complete cleanly under 20s without deadlock.
+void testConcatShortAudioNoDeadlock() {
+    std::cout << "[Test 6 / T-M1] Concat with 3s shorter audio in middle segment (no deadlock <20s)...\n" << std::flush;
+    auto testDir = std::filesystem::temp_directory_path() / "InstantReplayMacHostTest_M1";
+    std::error_code ec;
+    std::filesystem::remove_all(testDir, ec);
+    std::filesystem::create_directories(testDir, ec);
+
+    auto seg1 = testDir / "seg_1.mp4";
+    auto seg2 = testDir / "seg_2.mp4";
+    auto seg3 = testDir / "seg_3.mp4";
+    auto merged = testDir / "merged_m1.mp4";
+
+    writeEncoderSegment(seg1, 3.0, 3.0, 3.0, 30, replay::CodecType::HEVC, true);
+    writeEncoderSegment(seg2, 4.5, 1.5, 1.5, 30, replay::CodecType::HEVC, true); // 3s shorter game & mic audio
+    writeEncoderSegment(seg3, 2.0, 2.0, 2.0, 30, replay::CodecType::HEVC, true);
+
+    std::atomic<bool> done{false};
+    std::thread watchdog([&done]() {
+        for (int i = 0; i < 200 && !done.load(); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        if (!done.load()) {
+            std::cerr << "FAIL: T-M1 concatenateSegments hung past 20s timeout!\n";
+            std::abort();
+        }
+    });
+
+    auto t0 = std::chrono::steady_clock::now();
+    auto concatRes = replay::VideoToolboxEncoder::concatenateSegments({seg1, seg2, seg3}, merged, 0.0);
+    done.store(true);
+    watchdog.join();
+
+    double elapsedSec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    std::cout << "  T-M1 finished in " << elapsedSec << "s (ok=" << concatRes.success
+              << ", dur=" << concatRes.durationSeconds << "s)\n" << std::flush;
+    CHECK(elapsedSec < 20.0);
+    CHECK(concatRes.success);
+    CHECK(concatRes.durationSeconds >= 8.8 && concatRes.durationSeconds <= 10.2);
+    verifyMp4NoOverlapAndDuration(merged, 2, 8.8, 10.2);
+
+    std::filesystem::remove_all(testDir, ec);
+    std::cout << "  PASS Test 6 (T-M1)\n";
+}
+
+// T-M2: 120s of 50ms audio chunks interleaved with video (plus burst lead audio) -> zero writeGameAudio errors.
+void testLongAudioBurstNoBackpressureError() {
+    std::cout << "[Test 7 / T-M2] 120s of 50ms audio chunks + lead burst (no AAC readyForMoreMediaData errors)...\n" << std::flush;
+    auto testDir = std::filesystem::temp_directory_path() / "InstantReplayMacHostTest_M2";
+    std::error_code ec;
+    std::filesystem::remove_all(testDir, ec);
+    std::filesystem::create_directories(testDir, ec);
+
+    auto outPath = testDir / "long_120s.mp4";
+    replay::VideoToolboxEncoder enc;
+    auto startRes = enc.start(
+        outPath, 128, 72, 15, 4, 6, 80, replay::RateControlMode::ADAPTIVE_VBR,
+        false, replay::CodecType::H264, true, "", 48000, nullptr, true);
+    CHECK(startRes.ok);
+
+    constexpr int kAudioChunkFrames = 2400; // 50ms @ 48 kHz
+    constexpr int kTotalAudioChunks = 2400; // 120.0s
+    constexpr int kTotalVideoFrames = 1800; // 120.0s @ 15 FPS
+    std::vector<float> pcm(kAudioChunkFrames * 2, 0.0f);
+    for (int s = 0; s < kAudioChunkFrames; ++s) {
+        float v = 0.04f * std::sinf(0.05f * static_cast<float>(s));
+        pcm[s * 2 + 0] = v;
+        pcm[s * 2 + 1] = v;
+    }
+
+    CVPixelBufferRef pb = makeTestPixelBuffer(128, 72, 80, 180, 240, 20, 40, 90);
+    int videoIdx = 0;
+    int audioIdx = 0;
+
+    // Deliberately pre-push 1.5s of audio before frame 0 to exercise deferred queue draining
+    while (audioIdx < 30) {
+        int64_t tsHns = static_cast<int64_t>(audioIdx) * 500000LL;
+        auto aRes = enc.writeGameAudio(pcm.data(), kAudioChunkFrames, 2, 48000, tsHns);
+        CHECK(aRes.ok);
+        audioIdx++;
+    }
+
+    while (videoIdx < kTotalVideoFrames || audioIdx < kTotalAudioChunks) {
+        int64_t nextVideoHns = static_cast<int64_t>(videoIdx) * (10000000LL / 15);
+        int64_t nextAudioHns = static_cast<int64_t>(audioIdx) * 500000LL;
+
+        if (videoIdx < kTotalVideoFrames && (audioIdx >= kTotalAudioChunks || nextVideoHns <= nextAudioHns)) {
+            for (int w = 0; w < 200 && enc.isVideoQueueSaturated(16, 256ull * 1024 * 1024); ++w) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            auto vRes = enc.writeVideoFrame(pb, 128, 72, nextVideoHns);
+            CHECK(vRes.ok);
+            videoIdx++;
+        } else if (audioIdx < kTotalAudioChunks) {
+            auto aRes = enc.writeGameAudio(pcm.data(), kAudioChunkFrames, 2, 48000, nextAudioHns);
+            CHECK(aRes.ok);
+            audioIdx++;
+        }
+    }
+    CFRelease(pb);
+
+    CHECK(enc.finish());
+    verifyMp4NoOverlapAndDuration(outPath, 1, 118.0, 122.0);
+
+    std::filesystem::remove_all(testDir, ec);
+    std::cout << "  PASS Test 7 (T-M2)\n";
+}
+
+// T-M8 + M18: 240 FPS with +/-1ms jitter remux preserves naturalTimeScale == 1000000, distinct PTS, and BT.709 color tags.
+void test240FpsTimescaleAndBT709() {
+    std::cout << "[Test 8 / T-M8] 240 FPS jitter remux timescale (1000000), distinct PTS, BT.709 tags...\n" << std::flush;
+    auto testDir = std::filesystem::temp_directory_path() / "InstantReplayMacHostTest_M8";
+    std::error_code ec;
+    std::filesystem::remove_all(testDir, ec);
+    std::filesystem::create_directories(testDir, ec);
+
+    auto write240Seg = [&](const std::filesystem::path& path) {
+        replay::VideoToolboxEncoder enc;
+        auto res = enc.start(
+            path, 128, 72, 240, 8, 12, 80, replay::RateControlMode::ADAPTIVE_VBR,
+            false, replay::CodecType::H264, true, "", 48000, nullptr, true);
+        CHECK(res.ok);
+
+        CVPixelBufferRef pb = makeTestPixelBuffer(128, 72, 10, 220, 40, 220, 10, 40);
+        CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
+        CVBufferSetAttachment(pb, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
+        CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
+
+        constexpr int kFrames = 120; // 0.5s @ 240 FPS
+        constexpr int64_t kNominalStepHns = 41667LL;
+        int64_t prevTs = -1;
+        for (int i = 0; i < kFrames; ++i) {
+            int64_t jitter = (i == 0) ? 0 : ((i % 2 == 1) ? 10000LL : -10000LL); // +/- 1ms
+            int64_t ts = static_cast<int64_t>(i) * kNominalStepHns + jitter;
+            if (prevTs >= 0 && ts <= prevTs) ts = prevTs + 15000LL;
+            prevTs = ts;
+            for (int w = 0; w < 200 && enc.isVideoQueueSaturated(16, 256ull * 1024 * 1024); ++w) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            CHECK(enc.writeVideoFrame(pb, 128, 72, ts).ok);
+        }
+        CFRelease(pb);
+
+        std::vector<float> a(24000 * 2, 0.01f); // 0.5s stereo
+        CHECK(enc.writeGameAudio(a.data(), 24000, 2, 48000, 0).ok);
+        CHECK(enc.finish());
+    };
+
+    auto seg1 = testDir / "seg240_1.mp4";
+    auto seg2 = testDir / "seg240_2.mp4";
+    auto merged = testDir / "merged_240.mp4";
+    write240Seg(seg1);
+    write240Seg(seg2);
+
+    auto concatRes = replay::VideoToolboxEncoder::concatenateSegments({seg1, seg2}, merged, 0.0);
+    CHECK(concatRes.success);
+
+    @autoreleasepool {
+        std::string u8 = geode::utils::string::pathToString(merged);
+        NSURL* url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:u8.c_str()]];
+        AVURLAsset* asset = [AVURLAsset URLAssetWithURL:url options:@{ AVURLAssetPreferPreciseDurationAndTimingKey: @YES }];
+        CHECK(asset != nil);
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        NSArray<AVAssetTrack*>* tracks = [asset tracks];
+#pragma clang diagnostic pop
+        AVAssetTrack* videoTrack = nil;
+        for (AVAssetTrack* tr in tracks) {
+            if ([tr.mediaType isEqualToString:AVMediaTypeVideo]) {
+                videoTrack = tr;
+                break;
+            }
+        }
+        CHECK(videoTrack != nil);
+        CHECK(videoTrack.naturalTimeScale == 1000000);
+
+        NSArray* descs = videoTrack.formatDescriptions;
+        CHECK(descs.count > 0);
+        CMFormatDescriptionRef fmtDesc = (__bridge CMFormatDescriptionRef)descs[0];
+        CFPropertyListRef primaries = CMFormatDescriptionGetExtension(fmtDesc, kCMFormatDescriptionExtension_ColorPrimaries);
+        CHECK(primaries != nullptr);
+        CHECK(CFEqual(primaries, kCMFormatDescriptionColorPrimaries_ITU_R_709_2));
+
+        NSError* rErr = nil;
+        AVAssetReader* reader = [AVAssetReader assetReaderWithAsset:asset error:&rErr];
+        CHECK(reader != nil && rErr == nil);
+        AVAssetReaderTrackOutput* out = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:videoTrack outputSettings:nil];
+        out.alwaysCopiesSampleData = NO;
+        [reader addOutput:out];
+        CHECK([reader startReading]);
+
+        std::vector<int64_t> allPtsValues;
+        CMTime prevDts = kCMTimeInvalid;
+        int frameCount = 0;
+        while (CMSampleBufferRef s = [out copyNextSampleBuffer]) {
+            if (CMSampleBufferGetNumSamples(s) > 0 && CMSampleBufferGetDataBuffer(s)) {
+                CMTime pts = CMSampleBufferGetOutputPresentationTimeStamp(s);
+                CMTime dts = CMSampleBufferGetOutputDecodeTimeStamp(s);
+                CHECK(CMTIME_IS_VALID(pts));
+                if (CMTIME_IS_VALID(dts)) {
+                    if (CMTIME_IS_VALID(prevDts)) {
+                        CHECK(CMTimeCompare(dts, prevDts) >= 0);
+                    }
+                    prevDts = dts;
+                }
+                // Express PTS strictly in the 1 MHz track timescale (no rounding down to 600 ticks).
+                CMTime ptsScaled = CMTimeConvertScale(pts, 1000000, kCMTimeRoundingMethod_RoundHalfAwayFromZero);
+                allPtsValues.push_back(ptsScaled.value);
+                frameCount++;
+            }
+            CFRelease(s);
+        }
+        CHECK(frameCount == 240);
+        CHECK(reader.status == AVAssetReaderStatusCompleted);
+
+        std::sort(allPtsValues.begin(), allPtsValues.end());
+        int64_t minDeltaUs = INT64_MAX;
+        for (size_t i = 1; i < allPtsValues.size(); ++i) {
+            int64_t delta = allPtsValues[i] - allPtsValues[i - 1];
+            CHECK(delta > 0); // Strictly distinct presentation timestamps at 240 FPS + jitter
+            minDeltaUs = std::min(minDeltaUs, delta);
+        }
+        std::cout << "  T-M8 verified: naturalTimeScale=" << videoTrack.naturalTimeScale
+                  << ", frames=" << frameCount << ", minPtsDeltaUs=" << minDeltaUs << "\n";
+    }
+
+    std::filesystem::remove_all(testDir, ec);
+    std::cout << "  PASS Test 8 (T-M8 + M18 BT.709)\n";
+}
+
+// T-M10: 10 x 1s segments -> verify AAC continuity across all seams (no overlaps, no >25ms gaps).
+void test10SegmentAacContinuity() {
+    std::cout << "[Test 9 / T-M10] 10 x 1s segment remux AAC continuity...\n" << std::flush;
+    auto testDir = std::filesystem::temp_directory_path() / "InstantReplayMacHostTest_M10";
+    std::error_code ec;
+    std::filesystem::remove_all(testDir, ec);
+    std::filesystem::create_directories(testDir, ec);
+
+    std::vector<std::filesystem::path> segs;
+    for (int i = 0; i < 10; ++i) {
+        auto seg = testDir / ("seg_" + std::to_string(i + 1) + ".mp4");
+        writeEncoderSegment(seg, 1.0, 1.0, 0.0, 30, replay::CodecType::H264, true);
+        segs.push_back(seg);
+    }
+
+    auto merged = testDir / "merged_10seg.mp4";
+    auto concatRes = replay::VideoToolboxEncoder::concatenateSegments(segs, merged, 0.0);
+    CHECK(concatRes.success);
+    CHECK(concatRes.durationSeconds >= 9.6 && concatRes.durationSeconds <= 10.5);
+    verifyMp4NoOverlapAndDuration(merged, 1, 9.6, 10.5);
+
+    @autoreleasepool {
+        std::string u8 = geode::utils::string::pathToString(merged);
+        NSURL* url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:u8.c_str()]];
+        AVURLAsset* asset = [AVURLAsset URLAssetWithURL:url options:@{ AVURLAssetPreferPreciseDurationAndTimingKey: @YES }];
+        CHECK(asset != nil);
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        NSArray<AVAssetTrack*>* tracks = [asset tracks];
+#pragma clang diagnostic pop
+        AVAssetTrack* audioTrack = nil;
+        for (AVAssetTrack* tr in tracks) {
+            if ([tr.mediaType isEqualToString:AVMediaTypeAudio]) {
+                audioTrack = tr;
+                break;
+            }
+        }
+        CHECK(audioTrack != nil);
+
+        NSError* rErr = nil;
+        AVAssetReader* reader = [AVAssetReader assetReaderWithAsset:asset error:&rErr];
+        CHECK(reader != nil && rErr == nil);
+        AVAssetReaderTrackOutput* out = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:audioTrack outputSettings:nil];
+        out.alwaysCopiesSampleData = NO;
+        [reader addOutput:out];
+        CHECK([reader startReading]);
+
+        int64_t prevPtsUs = -1;
+        int64_t prevEndUs = -1;
+        int64_t totalDurUs = 0;
+        int pktCount = 0;
+        int sampleCountSum = 0;
+        while (CMSampleBufferRef s = [out copyNextSampleBuffer]) {
+            CMItemCount numSamples = CMSampleBufferGetNumSamples(s);
+            if (numSamples > 0 && CMSampleBufferGetDataBuffer(s)) {
+                int64_t ptsUs = llround(CMTimeGetSeconds(CMSampleBufferGetOutputPresentationTimeStamp(s)) * 1e6);
+                int64_t durUs = llround(CMTimeGetSeconds(CMSampleBufferGetOutputDuration(s)) * 1e6);
+                if (prevPtsUs >= 0) CHECK(ptsUs > prevPtsUs);
+                if (prevEndUs >= 0) {
+                    if (ptsUs + 1500 < prevEndUs || ptsUs - prevEndUs > 25000) {
+                        std::cerr << "  AAC discontinuity at pkt " << pktCount << ": ptsUs=" << ptsUs
+                                  << ", prevEndUs=" << prevEndUs << ", durUs=" << durUs << "\n";
+                    }
+                    CHECK(ptsUs + 1500 >= prevEndUs);  // no overlap
+                    CHECK(ptsUs - prevEndUs <= 25000); // no >25ms dropped AAC frame gap across seams
+                }
+                prevPtsUs = ptsUs;
+                prevEndUs = std::max(prevEndUs, ptsUs + durUs);
+                totalDurUs += durUs;
+                pktCount++;
+                sampleCountSum += static_cast<int>(numSamples);
+            }
+            CFRelease(s);
+        }
+        std::cout << "  T-M10 AAC stats: buffers=" << pktCount
+                  << ", totalSamples=" << sampleCountSum
+                  << ", totalDurUs=" << totalDurUs << "\n";
+        CHECK(sampleCountSum > 400);
+        CHECK(totalDurUs >= 9600000LL);
+        CHECK(reader.status == AVAssetReaderStatusCompleted);
+    }
+
+    std::filesystem::remove_all(testDir, ec);
+    std::cout << "  PASS Test 9 (T-M10)\n";
+}
+
 } // namespace
 
 int main() {
@@ -588,6 +910,10 @@ int main() {
         testCoreAudioHardwareEnumeration();
         testSharedMathAndBuffers();
         testHardwareCapabilityChecks();
+        testConcatShortAudioNoDeadlock();
+        testLongAudioBurstNoBackpressureError();
+        test240FpsTimescaleAndBT709();
+        test10SegmentAacContinuity();
     }
     std::cout << "ALL MACOS HOST TESTS PASSED!\n";
     return 0;

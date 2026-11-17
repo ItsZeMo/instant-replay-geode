@@ -11,6 +11,7 @@
 #include "../recorder/ReplayManager.hpp"
 #include "../capture/AudioGrabber.hpp"
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace replay {
@@ -146,6 +147,7 @@ private:
     bool m_settingsDirty = false;
     bool m_hasAppliedLockState = false;
     bool m_isLocked = false;
+    std::optional<CodecType> m_codecBeforeHwOff;
 
     // Asynchronous disk space monitor (#16)
     geode::async::TaskHolder<DiskSpaceResult> m_diskCheckTask;

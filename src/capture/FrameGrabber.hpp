@@ -171,7 +171,8 @@ private:
     std::chrono::steady_clock::time_point m_pboTime[2];
     int m_pboIndex = 0;
 
-    // Reusable IMFMediaBuffer frame pool (bounded steady-state working set, #7)
+    // Reusable buffer frame pool (bounded steady-state working set, #7)
+    mutable std::mutex m_glMutex;
     std::mutex m_poolMutex;
     std::vector<std::shared_ptr<CapturedFrame>> m_framePool;
     std::vector<uint8_t> m_syncScratch;

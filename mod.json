@@ -59,13 +59,13 @@
         },
         "hardware-accel": {
             "name": "Hardware Acceleration (GPU)",
-            "description": "Automatically use GPU hardware encoder (NVIDIA NVENC, AMD AMF, Intel QuickSync) based on your graphics card. Falls back to CPU software encoding if disabled.",
+            "description": "Automatically use GPU hardware encoder (NVIDIA NVENC, AMD AMF, Intel QuickSync on Windows; Apple VideoToolbox on macOS). Falls back to CPU software encoding if disabled.",
             "type": "bool",
             "default": true
         },
         "custom-codec": {
             "name": "Custom Codec Name",
-            "description": "Custom codec for your GPU/CPU (e.g. av1_nvenc, hevc_nvenc, h264_nvenc, amf_av1, qsv_av1, software_h264)",
+            "description": "Custom codec for your GPU/CPU (e.g. av1_nvenc, hevc_vt, h264_vt, amf_av1, qsv_av1, software_h264)",
             "type": "string",
             "default": ""
         },
@@ -201,7 +201,7 @@
         },
         "save-folder": {
             "name": "Save Directory Path",
-            "description": "Custom folder path to save replay MP4 videos (leave empty for default Videos/Geometry Dash)",
+            "description": "Custom folder path to save replay MP4 videos (leave empty for default Videos/Geometry Dash on Windows or Movies/Geometry Dash on macOS)",
             "type": "string",
             "default": ""
         },

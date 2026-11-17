@@ -50,6 +50,9 @@ struct MacVideoEncoderCaps {
 // real hardware and software encoder availability on the host Mac (e.g. M1 lacks AV1 HW).
 const MacVideoEncoderCaps& getMacVideoEncoderCaps();
 
+// Cached VideoToolbox session capability check for oversize Retina resolutions (>4096x2304, M4).
+bool isMacVideoEncodeSizeSupported(VideoCodecFamily family, bool hardware, int width, int height);
+
 } // namespace replay
 
 #endif // __APPLE__ && !TARGET_OS_IPHONE

@@ -23,6 +23,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <deque>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -38,6 +39,14 @@ namespace {
 constexpr int64_t kHnsPerSecond = 10000000LL;
 constexpr int32_t kVideoMediaTimeScale = 1000000; // 1 us ticks (safe for >20h, exact divisor of HNS/10)
 constexpr CMVideoCodecType kCodecTypeAV1 = 'av01';
+constexpr double kMaxPendingAudioSeconds = 10.0; // cap deferred AAC buffers during transient writer backpressure (M2)
+
+std::string formatNsException(NSException* ex) {
+    if (!ex) return "Objective-C exception";
+    const char* name = ex.name ? ex.name.UTF8String : "NSException";
+    const char* reason = ex.reason ? ex.reason.UTF8String : "unknown reason";
+    return std::string(name ? name : "NSException") + ": " + (reason ? reason : "unknown reason");
+}
 
 const char* familyName(VideoCodecFamily family) noexcept {
     switch (family) {
@@ -304,6 +313,11 @@ bool s_hasCachedCodec = false;
 } // namespace
 
 struct VideoToolboxEncoder::Impl {
+    struct PendingAudioBuffer {
+        CMSampleBufferRef sample = nullptr;
+        double durationSec = 0.0;
+    };
+
     AVAssetWriter* writer = nil;
     AVAssetWriterInput* videoInput = nil;
     AVAssetWriterInputPixelBufferAdaptor* adaptor = nil;
@@ -313,6 +327,11 @@ struct VideoToolboxEncoder::Impl {
     CMFormatDescriptionRef gameAudioFmt = nullptr;
     CMFormatDescriptionRef micAudioFmt = nullptr;
 
+    std::deque<PendingAudioBuffer> pendingGameAudio;
+    double pendingGameDurationSec = 0.0;
+    std::deque<PendingAudioBuffer> pendingMicAudio;
+    double pendingMicDurationSec = 0.0;
+
     int64_t lastVideoTicks = -1;
     int64_t lastGameAudioTicks = -1;
     int64_t lastMicAudioTicks = -1;
@@ -321,8 +340,80 @@ struct VideoToolboxEncoder::Impl {
         clear();
     }
 
+    static void clearAudioQueue(std::deque<PendingAudioBuffer>& queue, double& pendingSec) noexcept {
+        for (auto& item : queue) {
+            if (item.sample) {
+                CFRelease(item.sample);
+                item.sample = nullptr;
+            }
+        }
+        queue.clear();
+        pendingSec = 0.0;
+    }
+
+    static bool drainQueue(
+        AVAssetWriter* writer,
+        AVAssetWriterInput* input,
+        std::deque<PendingAudioBuffer>& queue,
+        double& totalDurationSec,
+        EncoderOpResult& outErr
+    ) {
+        outErr = {true, 0, {}, false, false};
+        if (!writer || !input) return true;
+
+        while (!queue.empty()) {
+            if (writer.status == AVAssetWriterStatusFailed) {
+                int64_t code = -1;
+                bool fatal = false;
+                bool perm = false;
+                std::string msg;
+                classifyNSError(writer.error, code, fatal, perm, msg);
+                outErr = {false, code, msg, fatal, false};
+                return false;
+            }
+            if (writer.status != AVAssetWriterStatusWriting || !input.readyForMoreMediaData) {
+                return true;
+            }
+            auto item = queue.front();
+            BOOL appended = [input appendSampleBuffer:item.sample];
+            CFRelease(item.sample);
+            queue.pop_front();
+            totalDurationSec = std::max(0.0, totalDurationSec - item.durationSec);
+            if (!appended) {
+                if (writer.status == AVAssetWriterStatusFailed) {
+                    int64_t code = -1;
+                    bool fatal = false;
+                    bool perm = false;
+                    std::string msg;
+                    classifyNSError(writer.error, code, fatal, perm, msg);
+                    outErr = {false, code, msg, fatal, false};
+                    return false;
+                }
+                outErr = {false, -1, "audio appendSampleBuffer returned NO", false, false};
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool drainAllPendingAudio(EncoderOpResult& outErr) {
+        outErr = {true, 0, {}, false, false};
+        if (!writer) return true;
+        if (!drainQueue(writer, gameAudioInput, pendingGameAudio, pendingGameDurationSec, outErr)) {
+            return false;
+        }
+        if (micAudioInput) {
+            if (!drainQueue(writer, micAudioInput, pendingMicAudio, pendingMicDurationSec, outErr)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     void clear() {
         @autoreleasepool {
+            clearAudioQueue(pendingGameAudio, pendingGameDurationSec);
+            clearAudioQueue(pendingMicAudio, pendingMicDurationSec);
             if (gameAudioFmt) {
                 CFRelease(gameAudioFmt);
                 gameAudioFmt = nullptr;
@@ -453,9 +544,16 @@ EncoderOpResult VideoToolboxEncoder::start(
     addAttempt(targetFamily, enableHardware);
     if (allowFallback && !hasForcedCodec) {
         if (targetFamily == VideoCodecFamily::AV1) {
-            addAttempt(VideoCodecFamily::HEVC, enableHardware);
+            if (enableHardware) {
+                addAttempt(VideoCodecFamily::HEVC, true);
+                addAttempt(VideoCodecFamily::H264, true);
+            } else {
+                addAttempt(VideoCodecFamily::H264, false);
+                addAttempt(VideoCodecFamily::HEVC, false);
+            }
+        } else {
+            addAttempt(VideoCodecFamily::H264, enableHardware);
         }
-        addAttempt(VideoCodecFamily::H264, enableHardware);
         if (enableHardware) {
             addAttempt(VideoCodecFamily::H264, false);
         }
@@ -475,7 +573,9 @@ EncoderOpResult VideoToolboxEncoder::start(
     auto cleanupFailedAttempt = [this, &outputPath]() {
         if (m_impl) {
             if (m_impl->writer) {
-                [m_impl->writer cancelWriting];
+                @try {
+                    [m_impl->writer cancelWriting];
+                } @catch (NSException*) {}
             }
             m_impl.reset();
         }
@@ -616,6 +716,7 @@ bool VideoToolboxEncoder::tryStartLocked(
     std::string& outError
 ) {
     @autoreleasepool {
+        @try {
         outCode = 0;
         outFatalStorage = false;
         outPermUnsupported = false;
@@ -710,6 +811,11 @@ bool VideoToolboxEncoder::tryStartLocked(
             AVVideoHeightKey: @(p.height),
             AVVideoEncoderSpecificationKey: encoderSpec,
             AVVideoCompressionPropertiesKey: compProps,
+            AVVideoColorPropertiesKey: @{
+                AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
+                AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+                AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2,
+            },
         };
 
         if (![writer canApplyOutputSettings:videoSettings forMediaType:AVMediaTypeVideo]) {
@@ -845,6 +951,13 @@ bool VideoToolboxEncoder::tryStartLocked(
 
         m_impl = std::move(impl);
         return true;
+        } @catch (NSException* ex) {
+            outCode = -1;
+            outPermUnsupported = true;
+            outError = formatNsException(ex);
+            m_impl.reset();
+            return false;
+        }
     }
 }
 
@@ -862,30 +975,8 @@ EncoderOpResult VideoToolboxEncoder::writeVideoFrame(
     if (width != m_width || height != m_height) {
         return {false, kVTParameterErr, "frame resolution mismatch", false};
     }
-    if (m_impl->writer.status == AVAssetWriterStatusFailed) {
-        int64_t code = -1;
-        bool fatal = false;
-        bool perm = false;
-        std::string msg;
-        classifyNSError(m_impl->writer.error, code, fatal, perm, msg);
-        return {false, code, msg, fatal};
-    }
 
-    int64_t ticks = std::max<int64_t>(0, timestampHns / 10); // 100ns -> 1us ticks
-    if (m_impl->lastVideoTicks >= 0 && ticks <= m_impl->lastVideoTicks) {
-        ticks = m_impl->lastVideoTicks + 1;
-    }
-    m_impl->lastVideoTicks = ticks;
-
-    // Give VideoToolbox a tiny window if backpressure hits right at a transition
-    for (int waitIter = 0;
-         waitIter < 5 && !m_impl->videoInput.readyForMoreMediaData &&
-         m_impl->writer.status == AVAssetWriterStatusWriting;
-         ++waitIter) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-
-    if (!m_impl->videoInput.readyForMoreMediaData) {
+    @try {
         if (m_impl->writer.status == AVAssetWriterStatusFailed) {
             int64_t code = -1;
             bool fatal = false;
@@ -894,22 +985,55 @@ EncoderOpResult VideoToolboxEncoder::writeVideoFrame(
             classifyNSError(m_impl->writer.error, code, fatal, perm, msg);
             return {false, code, msg, fatal};
         }
-        return {false, kVTVideoEncoderNotAvailableNowErr, "video encoder backpressure", false};
-    }
 
-    CMTime pts = CMTimeMake(ticks, kVideoMediaTimeScale);
-    if (![m_impl->adaptor appendPixelBuffer:pixelBuffer withPresentationTime:pts]) {
-        if (m_impl->writer.status == AVAssetWriterStatusFailed) {
-            int64_t code = -1;
-            bool fatal = false;
-            bool perm = false;
-            std::string msg;
-            classifyNSError(m_impl->writer.error, code, fatal, perm, msg);
-            return {false, code, msg, fatal};
+        // Give VideoToolbox a tiny window if backpressure hits right at a transition
+        for (int waitIter = 0;
+             waitIter < 5 && !m_impl->videoInput.readyForMoreMediaData &&
+             m_impl->writer.status == AVAssetWriterStatusWriting;
+             ++waitIter) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
-        return {false, -1, "appendPixelBuffer returned NO", false};
+
+        if (!m_impl->videoInput.readyForMoreMediaData) {
+            if (m_impl->writer.status == AVAssetWriterStatusFailed) {
+                int64_t code = -1;
+                bool fatal = false;
+                bool perm = false;
+                std::string msg;
+                classifyNSError(m_impl->writer.error, code, fatal, perm, msg);
+                return {false, code, msg, fatal};
+            }
+            return {false, kVTVideoEncoderNotAvailableNowErr, "video encoder backpressure", false, true};
+        }
+
+        int64_t ticks = std::max<int64_t>(0, timestampHns / 10); // 100ns -> 1us ticks
+        if (m_impl->lastVideoTicks >= 0 && ticks <= m_impl->lastVideoTicks) {
+            ticks = m_impl->lastVideoTicks + 1;
+        }
+        m_impl->lastVideoTicks = ticks;
+
+        CMTime pts = CMTimeMake(ticks, kVideoMediaTimeScale);
+        if (![m_impl->adaptor appendPixelBuffer:pixelBuffer withPresentationTime:pts]) {
+            if (m_impl->writer.status == AVAssetWriterStatusFailed) {
+                int64_t code = -1;
+                bool fatal = false;
+                bool perm = false;
+                std::string msg;
+                classifyNSError(m_impl->writer.error, code, fatal, perm, msg);
+                return {false, code, msg, fatal};
+            }
+            return {false, -1, "appendPixelBuffer returned NO", false};
+        }
+
+        // Flush any queued audio buffers that unblocked as video advanced the writer timeline (M2).
+        EncoderOpResult audioDrainErr;
+        if (!m_impl->drainAllPendingAudio(audioDrainErr)) {
+            return audioDrainErr;
+        }
+        return {true, 0, {}, false};
+    } @catch (NSException* ex) {
+        return {false, -1, formatNsException(ex), false};
     }
-    return {true, 0, {}, false};
 }
 
 EncoderOpResult VideoToolboxEncoder::writeGameAudio(
@@ -948,76 +1072,16 @@ EncoderOpResult VideoToolboxEncoder::writeAudioLocked(
     AVAssetWriterInput* input = isGameAudio ? m_impl->gameAudioInput : m_impl->micAudioInput;
     CMFormatDescriptionRef fmt = isGameAudio ? m_impl->gameAudioFmt : m_impl->micAudioFmt;
     int64_t& lastTicks = isGameAudio ? m_impl->lastGameAudioTicks : m_impl->lastMicAudioTicks;
+    auto& queue = isGameAudio ? m_impl->pendingGameAudio : m_impl->pendingMicAudio;
+    double& pendingSec = isGameAudio ? m_impl->pendingGameDurationSec : m_impl->pendingMicDurationSec;
     if (!input || !fmt) {
         return {false, -1, "audio input not initialized", false};
     }
     if (!pcmFloat || numSamples <= 0 || channels != 2) {
         return {false, kVTParameterErr, "invalid audio buffer", false};
     }
-    if (m_impl->writer.status == AVAssetWriterStatusFailed) {
-        int64_t code = -1;
-        bool fatal = false;
-        bool perm = false;
-        std::string msg;
-        classifyNSError(m_impl->writer.error, code, fatal, perm, msg);
-        return {false, code, msg, fatal};
-    }
 
-    const int validRate = isGameAudio ? m_gameSampleRate : 48000;
-    const int srcRate = (sampleRate > 0) ? sampleRate : validRate;
-    const size_t byteSize = static_cast<size_t>(numSamples) * 2 * sizeof(float);
-
-    // Build CMBlockBuffer owning a copy of clamped interleaved Float32 samples
-    std::vector<float> clamped(static_cast<size_t>(numSamples) * 2);
-    for (size_t i = 0; i < clamped.size(); ++i) {
-        clamped[i] = std::clamp(pcmFloat[i], -1.0f, 1.0f);
-    }
-
-    CMBlockBufferRef blockBuf = nullptr;
-    OSStatus err = CMBlockBufferCreateWithMemoryBlock(
-        kCFAllocatorDefault, nullptr, byteSize, kCFAllocatorDefault, nullptr, 0, byteSize, 0, &blockBuf);
-    if (err != noErr || !blockBuf) {
-        return {false, err, buildAudioEncoderError(err, "CMBlockBufferCreateWithMemoryBlock"), false};
-    }
-    err = CMBlockBufferAssureBlockMemory(blockBuf);
-    if (err == noErr) {
-        err = CMBlockBufferReplaceDataBytes(clamped.data(), blockBuf, 0, byteSize);
-    }
-    if (err != noErr) {
-        CFRelease(blockBuf);
-        return {false, err, buildAudioEncoderError(err, "CMBlockBufferReplaceDataBytes"), false};
-    }
-
-    int64_t ptsTicks = llround(static_cast<double>(std::max<int64_t>(0, timestampHns)) *
-                               static_cast<double>(srcRate) / static_cast<double>(kHnsPerSecond));
-    if (lastTicks >= 0 && ptsTicks <= lastTicks) {
-        ptsTicks = lastTicks + 1;
-    }
-    lastTicks = ptsTicks;
-
-    CMTime pts = CMTimeMake(ptsTicks, static_cast<CMTimeScale>(srcRate));
-    CMSampleBufferRef sampleBuf = nullptr;
-    err = CMAudioSampleBufferCreateReadyWithPacketDescriptions(
-        kCFAllocatorDefault, blockBuf, fmt, numSamples, pts, nullptr, &sampleBuf);
-    CFRelease(blockBuf);
-    if (err != noErr || !sampleBuf) {
-        return {false, err, buildAudioEncoderError(err, "CMAudioSampleBufferCreateReadyWithPacketDescriptions"), false};
-    }
-
-    for (int waitIter = 0;
-         waitIter < 5 && !input.readyForMoreMediaData &&
-         m_impl->writer.status == AVAssetWriterStatusWriting;
-         ++waitIter) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-
-    bool appended = false;
-    if (input.readyForMoreMediaData && m_impl->writer.status == AVAssetWriterStatusWriting) {
-        appended = [input appendSampleBuffer:sampleBuf];
-    }
-    CFRelease(sampleBuf);
-
-    if (!appended) {
+    @try {
         if (m_impl->writer.status == AVAssetWriterStatusFailed) {
             int64_t code = -1;
             bool fatal = false;
@@ -1026,16 +1090,107 @@ EncoderOpResult VideoToolboxEncoder::writeAudioLocked(
             classifyNSError(m_impl->writer.error, code, fatal, perm, msg);
             return {false, code, msg, fatal};
         }
-        return {false, -1, "audio appendSampleBuffer returned NO", false};
+
+        // First flush any previously deferred packets on this track (M2).
+        EncoderOpResult preDrainErr;
+        if (!Impl::drainQueue(m_impl->writer, input, queue, pendingSec, preDrainErr)) {
+            return preDrainErr;
+        }
+
+        const int validRate = isGameAudio ? m_gameSampleRate : 48000;
+        const int srcRate = (sampleRate > 0) ? sampleRate : validRate;
+        const size_t byteSize = static_cast<size_t>(numSamples) * 2 * sizeof(float);
+        const double chunkDurationSec = static_cast<double>(numSamples) / static_cast<double>(srcRate);
+
+        if (pendingSec + chunkDurationSec > kMaxPendingAudioSeconds) {
+            for (int waitIter = 0;
+                 waitIter < 250 &&
+                 (pendingSec + chunkDurationSec > kMaxPendingAudioSeconds) &&
+                 m_impl->writer.status == AVAssetWriterStatusWriting;
+                 ++waitIter) {
+                if (input.readyForMoreMediaData) {
+                    if (!Impl::drainQueue(m_impl->writer, input, queue, pendingSec, preDrainErr)) {
+                        return preDrainErr;
+                    }
+                    if (pendingSec + chunkDurationSec <= kMaxPendingAudioSeconds) {
+                        break;
+                    }
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            if (pendingSec + chunkDurationSec > kMaxPendingAudioSeconds) {
+                if (m_impl->writer.status == AVAssetWriterStatusFailed) {
+                    int64_t code = -1;
+                    bool fatal = false;
+                    bool perm = false;
+                    std::string msg;
+                    classifyNSError(m_impl->writer.error, code, fatal, perm, msg);
+                    return {false, code, msg, fatal};
+                }
+                return {false, kVTVideoEncoderNotAvailableNowErr,
+                        "audio encoder queue saturated (>10s backpressure)", false, true};
+            }
+        }
+
+        // Build CMBlockBuffer owning a copy of clamped interleaved Float32 samples
+        std::vector<float> clamped(static_cast<size_t>(numSamples) * 2);
+        for (size_t i = 0; i < clamped.size(); ++i) {
+            clamped[i] = std::clamp(pcmFloat[i], -1.0f, 1.0f);
+        }
+
+        CMBlockBufferRef blockBuf = nullptr;
+        OSStatus err = CMBlockBufferCreateWithMemoryBlock(
+            kCFAllocatorDefault, nullptr, byteSize, kCFAllocatorDefault, nullptr, 0, byteSize, 0, &blockBuf);
+        if (err != noErr || !blockBuf) {
+            return {false, err, buildAudioEncoderError(err, "CMBlockBufferCreateWithMemoryBlock"), false};
+        }
+        err = CMBlockBufferAssureBlockMemory(blockBuf);
+        if (err == noErr) {
+            err = CMBlockBufferReplaceDataBytes(clamped.data(), blockBuf, 0, byteSize);
+        }
+        if (err != noErr) {
+            CFRelease(blockBuf);
+            return {false, err, buildAudioEncoderError(err, "CMBlockBufferReplaceDataBytes"), false};
+        }
+
+        int64_t ptsTicks = llround(static_cast<double>(std::max<int64_t>(0, timestampHns)) *
+                                   static_cast<double>(srcRate) / static_cast<double>(kHnsPerSecond));
+        if (lastTicks >= 0 && ptsTicks <= lastTicks) {
+            ptsTicks = lastTicks + 1;
+        }
+
+        CMTime pts = CMTimeMake(ptsTicks, static_cast<CMTimeScale>(srcRate));
+        CMSampleBufferRef sampleBuf = nullptr;
+        err = CMAudioSampleBufferCreateReadyWithPacketDescriptions(
+            kCFAllocatorDefault, blockBuf, fmt, numSamples, pts, nullptr, &sampleBuf);
+        CFRelease(blockBuf);
+        if (err != noErr || !sampleBuf) {
+            return {false, err, buildAudioEncoderError(err, "CMAudioSampleBufferCreateReadyWithPacketDescriptions"), false};
+        }
+
+        lastTicks = ptsTicks;
+        queue.push_back({sampleBuf, chunkDurationSec});
+        pendingSec += chunkDurationSec;
+
+        EncoderOpResult postDrainErr;
+        if (!Impl::drainQueue(m_impl->writer, input, queue, pendingSec, postDrainErr)) {
+            return postDrainErr;
+        }
+        return {true, 0, {}, false};
+    } @catch (NSException* ex) {
+        return {false, -1, formatNsException(ex), false};
     }
-    return {true, 0, {}, false};
 }
 
 bool VideoToolboxEncoder::isVideoQueueSaturated(size_t /*maxPendingFrames*/, size_t /*maxQueuedBytes*/) const {
     MacAutoreleasePoolScope pool;
     std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_recording || !m_impl || !m_impl->videoInput) return false;
-    return !m_impl->videoInput.readyForMoreMediaData;
+    @try {
+        return !m_impl->videoInput.readyForMoreMediaData;
+    } @catch (NSException*) {
+        return true;
+    }
 }
 
 bool VideoToolboxEncoder::finish() {
@@ -1054,32 +1209,82 @@ bool VideoToolboxEncoder::finishLocked() {
     AVAssetWriter* writer = m_impl->writer;
     bool ok = false;
 
-    if (m_recording && writer.status == AVAssetWriterStatusWriting) {
-        [m_impl->videoInput markAsFinished];
-        [m_impl->gameAudioInput markAsFinished];
-        if (m_impl->micAudioInput) {
-            [m_impl->micAudioInput markAsFinished];
-        }
+    @try {
+        if (m_recording && writer.status == AVAssetWriterStatusWriting) {
+            // Mark video finished first so AVAssetWriter immediately unblocks any pending AAC audio samples (M2).
+            [m_impl->videoInput markAsFinished];
 
-        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-        [writer finishWritingWithCompletionHandler:^{
-            dispatch_semaphore_signal(sem);
-        }];
-        dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+            auto drainDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while ((!m_impl->pendingGameAudio.empty() || !m_impl->pendingMicAudio.empty()) &&
+                   writer.status == AVAssetWriterStatusWriting) {
+                EncoderOpResult drainErr;
+                if (!m_impl->drainAllPendingAudio(drainErr)) {
+                    geode::log::warn("Instant Replay: audio flush during finish failed: {}", drainErr.message);
+                    break;
+                }
+                if (m_impl->pendingGameAudio.empty() && m_impl->pendingMicAudio.empty()) {
+                    break;
+                }
+                if (std::chrono::steady_clock::now() >= drainDeadline) {
+                    geode::log::warn(
+                        "Instant Replay: timed out flushing {} game / {} mic buffered audio chunks at segment end",
+                        m_impl->pendingGameAudio.size(), m_impl->pendingMicAudio.size());
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
 
-        ok = (writer.status == AVAssetWriterStatusCompleted);
-        if (!ok && writer.error) {
-            int64_t code = 0;
-            bool fatal = false;
-            bool perm = false;
-            std::string errMsg;
-            classifyNSError(writer.error, code, fatal, perm, errMsg);
-            geode::log::warn("Instant Replay: segment finish failed: {}", errMsg);
+            if (writer.status == AVAssetWriterStatusWriting) {
+                [m_impl->gameAudioInput markAsFinished];
+                if (m_impl->micAudioInput) {
+                    [m_impl->micAudioInput markAsFinished];
+                }
+
+                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+                [writer finishWritingWithCompletionHandler:^{
+                    dispatch_semaphore_signal(sem);
+                }];
+                dispatch_time_t finishDeadline = dispatch_time(DISPATCH_TIME_NOW, 60LL * NSEC_PER_SEC);
+                if (dispatch_semaphore_wait(sem, finishDeadline) != 0) {
+                    geode::log::warn("Instant Replay: segment finishWriting timed out after 60s, cancelling");
+                    [writer cancelWriting];
+                    ok = false;
+                } else {
+                    ok = (writer.status == AVAssetWriterStatusCompleted);
+                    if (!ok && writer.error) {
+                        int64_t code = 0;
+                        bool fatal = false;
+                        bool perm = false;
+                        std::string errMsg;
+                        classifyNSError(writer.error, code, fatal, perm, errMsg);
+                        geode::log::warn("Instant Replay: segment finish failed: {}", errMsg);
+                    }
+                }
+            } else {
+                if (writer.error) {
+                    int64_t code = 0;
+                    bool fatal = false;
+                    bool perm = false;
+                    std::string errMsg;
+                    classifyNSError(writer.error, code, fatal, perm, errMsg);
+                    geode::log::warn("Instant Replay: segment writer failed during flush: {}", errMsg);
+                }
+                [writer cancelWriting];
+                ok = false;
+            }
+        } else if (!m_recording) {
+            ok = true;
+        } else {
+            [writer cancelWriting];
+            ok = false;
         }
-    } else if (!m_recording) {
-        ok = true;
-    } else {
-        [writer cancelWriting];
+    } @catch (NSException* ex) {
+        geode::log::warn("Instant Replay: exception during finishLocked: {}", formatNsException(ex));
+        @try {
+            if (writer.status == AVAssetWriterStatusWriting) {
+                [writer cancelWriting];
+            }
+        } @catch (NSException*) {}
         ok = false;
     }
 
@@ -1130,482 +1335,590 @@ ConcatResult concatenateImpl(
 
     if (segmentPaths.empty()) return fail("no recorded segments");
 
-    auto pathToURL = [](const std::filesystem::path& p) -> NSURL* {
-        std::string utf8 = geode::utils::string::pathToString(p);
-        NSString* s = [NSString stringWithUTF8String:utf8.c_str()];
-        return s ? [NSURL fileURLWithPath:s] : nil;
-    };
-
-    NSURL* firstUrl = pathToURL(segmentPaths[0]);
-    NSURL* outUrl = pathToURL(finalOutputPath);
-    if (!firstUrl || !outUrl) return fail("invalid UTF-8 file path");
-
-    std::error_code rmEc;
-    std::filesystem::remove(finalOutputPath, rmEc);
-
-    NSDictionary* assetOpts = @{ AVURLAssetPreferPreciseDurationAndTimingKey: @YES };
-    AVURLAsset* firstAsset = [AVURLAsset URLAssetWithURL:firstUrl options:assetOpts];
-    if (!firstAsset) return fail("cannot open first segment");
-
-    NSArray<AVAssetTrack*>* firstTracks = loadAssetTracksSync(firstAsset);
-    if (firstTracks.count == 0) return fail("first segment has no media tracks");
-
-    struct TrackLayout {
-        NSString* mediaType = nil;
-        bool isVideo = false;
-        CMFormatDescriptionRef formatDesc = nullptr;
-        AVAssetWriterInput* writerInput = nil;
-        bool markedFinished = false;
-    };
-    std::vector<TrackLayout> layout;
-    int64_t videoFrameDurationHns = 0;
-
-    NSError* writerErr = nil;
-    AVAssetWriter* writer = [AVAssetWriter assetWriterWithURL:outUrl fileType:AVFileTypeMPEG4 error:&writerErr];
-    if (!writer || writerErr) {
-        int64_t c = 0; bool f = false; bool p = false; std::string m;
-        classifyNSError(writerErr, c, f, p, m);
-        return fail("cannot create output file: " + m);
-    }
-
-    for (AVAssetTrack* tr in firstTracks) {
-        TrackLayout item;
-        item.mediaType = tr.mediaType;
-        item.isVideo = [tr.mediaType isEqualToString:AVMediaTypeVideo];
-        NSArray* fmts = tr.formatDescriptions;
-        if (fmts.count == 0) return fail("track has no format description");
-        item.formatDesc = (__bridge CMFormatDescriptionRef)fmts[0];
-
-        if (item.isVideo && videoFrameDurationHns == 0) {
-            float fps = tr.nominalFrameRate;
-            if (fps > 0.5f) {
-                videoFrameDurationHns = llround(static_cast<double>(kHnsPerSecond) / static_cast<double>(fps));
-            }
-        }
-
-        AVAssetWriterInput* in = [AVAssetWriterInput assetWriterInputWithMediaType:tr.mediaType
-                                                                     outputSettings:nil
-                                                                   sourceFormatHint:item.formatDesc];
-        in.expectsMediaDataInRealTime = NO;
-        if (!in || ![writer canAddInput:in]) {
-            return fail("cannot configure pass-through writer input");
-        }
-        [writer addInput:in];
-        item.writerInput = in;
-        layout.push_back(std::move(item));
-    }
-
-    if (videoFrameDurationHns <= 0) {
-        videoFrameDurationHns = kHnsPerSecond / 60;
-    }
-
-    // 2. Scan first segment video track for initial DTS (B-frame lead) and trim keyframe target
-    int64_t cutHns = 0;
-    bool hasFirstVideoDts = false;
-    int64_t firstVideoDts = 0;
-
-    {
-        size_t videoTrackIdx = layout.size();
-        for (size_t i = 0; i < layout.size(); ++i) {
-            if (layout[i].isVideo) {
-                videoTrackIdx = i;
-                break;
-            }
-        }
-        if (videoTrackIdx < layout.size()) {
-            const int64_t trimHns = (trimStartSeconds > 0.05)
-                ? llround(trimStartSeconds * static_cast<double>(kHnsPerSecond))
-                : 0;
-            NSError* scanErr = nil;
-            AVAssetReader* scanReader = [AVAssetReader assetReaderWithAsset:firstAsset error:&scanErr];
-            if (!scanReader || scanErr) {
-                int64_t c = 0; bool f = false; bool p = false; std::string m;
-                classifyNSError(scanErr, c, f, p, m);
-                return fail("cannot scan first segment: " + m);
-            }
-            AVAssetReaderTrackOutput* scanOut =
-                [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:firstTracks[videoTrackIdx]
-                                                           outputSettings:nil];
-            scanOut.alwaysCopiesSampleData = NO;
-            [scanReader addOutput:scanOut];
-            [scanReader startReading];
-
-            struct KeyCandidate {
-                int64_t pts = -1;
-                int64_t dts = 0;
-                bool hasDts = false;
-            };
-            KeyCandidate initialSample, lastKeyBefore, firstKeyAfter;
-
-            while (CMSampleBufferRef sbuf = [scanOut copyNextSampleBuffer]) {
-                if (CMSampleBufferGetNumSamples(sbuf) <= 0 || !CMSampleBufferGetDataBuffer(sbuf)) {
-                    CFRelease(sbuf);
-                    continue;
-                }
-                CMTime pts = CMSampleBufferGetOutputPresentationTimeStamp(sbuf);
-                CMTime dts = CMSampleBufferGetOutputDecodeTimeStamp(sbuf);
-                int64_t ts = cmTimeToHns(pts);
-                bool sampleHasDts = CMTIME_IS_VALID(dts);
-                int64_t sampleDts = sampleHasDts ? cmTimeToHns(dts) : ts;
-
-                if (initialSample.pts < 0) {
-                    initialSample = {ts, sampleDts, sampleHasDts};
-                    if (trimHns <= 0) {
-                        CFRelease(sbuf);
-                        break;
-                    }
-                }
-
-                bool isKey = sampleIsSync(sbuf);
-                CFRelease(sbuf);
-
-                if (ts <= trimHns) {
-                    if (isKey) lastKeyBefore = {ts, sampleDts, sampleHasDts};
-                } else {
-                    if (isKey && firstKeyAfter.pts < 0) {
-                        firstKeyAfter = {ts, sampleDts, sampleHasDts};
-                        break;
-                    }
-                    if (ts - trimHns > 50000000LL) break;
+    @try {
+        struct RemuxGuard {
+            AVAssetWriter* writer = nil;
+            AVAssetReader* reader = nil;
+            bool writerStarted = false;
+            bool completed = false;
+            ~RemuxGuard() {
+                if (!completed) {
+                    @try {
+                        if (reader) {
+                            [reader cancelReading];
+                            reader = nil;
+                        }
+                        if (writer && writerStarted) {
+                            [writer cancelWriting];
+                        }
+                    } @catch (NSException*) {}
                 }
             }
-            [scanReader cancelReading];
+        };
 
-            if (trimHns <= 0) {
-                cutHns = 0;
-                hasFirstVideoDts = initialSample.hasDts;
-                firstVideoDts = initialSample.dts;
-            } else {
-                constexpr int64_t kMaxKeyframeDriftHns = 20000000LL; // 2s
-                KeyCandidate chosen = {0, initialSample.dts, initialSample.hasDts};
-                if (lastKeyBefore.pts >= 0 && (trimHns - lastKeyBefore.pts) <= kMaxKeyframeDriftHns) {
-                    chosen = lastKeyBefore;
-                } else if (firstKeyAfter.pts >= 0 && (firstKeyAfter.pts - trimHns) <= kMaxKeyframeDriftHns) {
-                    chosen = firstKeyAfter;
-                } else if (lastKeyBefore.pts >= 0) {
-                    chosen = lastKeyBefore;
-                } else if (firstKeyAfter.pts >= 0) {
-                    chosen = firstKeyAfter;
-                }
-                cutHns = chosen.pts;
-                hasFirstVideoDts = chosen.hasDts;
-                firstVideoDts = chosen.dts;
-            }
-        }
-    }
+        auto pathToURL = [](const std::filesystem::path& p) -> NSURL* {
+            std::string utf8 = geode::utils::string::pathToString(p);
+            NSString* s = [NSString stringWithUTF8String:utf8.c_str()];
+            return s ? [NSURL fileURLWithPath:s] : nil;
+        };
 
-    if (![writer startWriting]) {
-        int64_t c = 0; bool f = false; bool p = false; std::string m;
-        classifyNSError(writer.error, c, f, p, m);
-        return fail("AVAssetWriter startWriting failed: " + m);
-    }
-    [writer startSessionAtSourceTime:kCMTimeZero];
+        NSURL* firstUrl = pathToURL(segmentPaths[0]);
+        NSURL* outUrl = pathToURL(finalOutputPath);
+        if (!firstUrl || !outUrl) return fail("invalid UTF-8 file path");
 
-    const int64_t initialPtsShift = (hasFirstVideoDts && firstVideoDts < cutHns)
-        ? (cutHns - firstVideoDts)
-        : 0;
+        std::error_code rmEc;
+        std::filesystem::remove(finalOutputPath, rmEc);
 
-    ConcatTimestampState concatState(initialPtsShift);
-    size_t samplesWritten = 0;
+        NSDictionary* assetOpts = @{ AVURLAssetPreferPreciseDurationAndTimingKey: @YES };
 
-    // 3. Remux every segment with interleaved chronological track pulling (avoids multi-track buffer deadlock)
-    for (size_t segIdx = 0; segIdx < segmentPaths.size(); ++segIdx) {
-        const std::string segLabel = "segment " + std::to_string(segIdx + 1) + "/" + std::to_string(segmentPaths.size());
-        NSURL* segUrl = pathToURL(segmentPaths[segIdx]);
-        if (!segUrl) return fail("invalid path in " + segLabel);
-
-        AVURLAsset* segAsset = [AVURLAsset URLAssetWithURL:segUrl options:assetOpts];
-        if (!segAsset) return fail("cannot open " + segLabel);
-
-        NSError* readerErr = nil;
-        AVAssetReader* reader = [AVAssetReader assetReaderWithAsset:segAsset error:&readerErr];
-        if (!reader || readerErr) {
-            int64_t c = 0; bool f = false; bool p = false; std::string m;
-            classifyNSError(readerErr, c, f, p, m);
-            return fail("cannot read " + segLabel + ": " + m);
-        }
-
-        NSArray<AVAssetTrack*>* segTracks = loadAssetTracksSync(segAsset);
-        if (segTracks.count < layout.size()) {
-            return fail(segLabel + " is missing an expected track");
-        }
-
-        struct ReaderSlot {
-            AVAssetReaderTrackOutput* output = nil;
-            AVAssetWriterInput* writerInput = nil;
+        struct TrackLayout {
+            NSString* mediaType = nil;
             bool isVideo = false;
-            uint32_t streamId = 0;
-            CMSampleBufferRef peek = nullptr;
-            int64_t peekPtsHns = 0;
-            int64_t peekDtsHns = 0;
-            int64_t peekDurHns = 0;
-            bool eof = false;
+            CMFormatDescriptionRef formatDesc = nullptr;
+            AVAssetWriterInput* writerInput = nil;
+            bool markedFinished = false;
         };
-        std::vector<ReaderSlot> slots(layout.size());
+        std::vector<TrackLayout> layout;
+        int64_t videoFrameDurationHns = 0;
 
-        std::vector<bool> usedSegTrack(segTracks.count, false);
-        for (size_t li = 0; li < layout.size(); ++li) {
-            AVAssetTrack* matched = nil;
-            for (NSUInteger ti = 0; ti < segTracks.count; ++ti) {
-                if (!usedSegTrack[ti] && [segTracks[ti].mediaType isEqualToString:layout[li].mediaType]) {
-                    matched = segTracks[ti];
-                    usedSegTrack[ti] = true;
-                    break;
-                }
-            }
-            if (!matched) {
-                return fail(segLabel + " is missing required stream");
-            }
-            AVAssetReaderTrackOutput* out = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:matched
-                                                                                       outputSettings:nil];
-            out.alwaysCopiesSampleData = NO;
-            if (![reader canAddOutput:out]) {
-                return fail("cannot attach track output in " + segLabel);
-            }
-            [reader addOutput:out];
-            slots[li].output = out;
-            slots[li].writerInput = layout[li].writerInput;
-            slots[li].isVideo = layout[li].isVideo;
-            slots[li].streamId = static_cast<uint32_t>(li);
-        }
-
-        if (![reader startReading]) {
+        NSError* writerErr = nil;
+        AVAssetWriter* writer = [AVAssetWriter assetWriterWithURL:outUrl fileType:AVFileTypeMPEG4 error:&writerErr];
+        if (!writer || writerErr) {
             int64_t c = 0; bool f = false; bool p = false; std::string m;
-            classifyNSError(reader.error, c, f, p, m);
-            return fail("cannot start reading " + segLabel + ": " + m);
+            classifyNSError(writerErr, c, f, p, m);
+            return fail("cannot create output file: " + m);
         }
 
-        auto releasePeeks = [&slots]() {
-            for (auto& sl : slots) {
-                if (sl.peek) {
-                    CFRelease(sl.peek);
-                    sl.peek = nullptr;
-                }
-            }
-        };
+        RemuxGuard remuxGuard;
+        remuxGuard.writer = writer;
 
-        auto pullSlot = [&](ReaderSlot& sl) {
-            if (sl.peek || sl.eof) return;
-            while (true) {
-                CMSampleBufferRef next = [sl.output copyNextSampleBuffer];
-                if (!next) {
-                    sl.eof = true;
-                    return;
-                }
-                if (CMSampleBufferGetNumSamples(next) <= 0 || !CMSampleBufferGetDataBuffer(next)) {
-                    CFRelease(next);
-                    continue;
-                }
-                CMTime pts = CMSampleBufferGetOutputPresentationTimeStamp(next);
-                CMTime dts = CMSampleBufferGetOutputDecodeTimeStamp(next);
-                CMTime dur = CMSampleBufferGetOutputDuration(next);
-                sl.peek = next;
-                sl.peekPtsHns = cmTimeToHns(pts);
-                sl.peekDtsHns = CMTIME_IS_VALID(dts) ? cmTimeToHns(dts) : sl.peekPtsHns;
-                int64_t durHns = CMTIME_IS_VALID(dur) ? cmTimeToHns(dur) : 0;
-                if (sl.isVideo && durHns <= 0) durHns = videoFrameDurationHns;
-                sl.peekDurHns = durHns;
-                return;
-            }
-        };
+        // 1 & 2. Inspect first segment inside an inner autorelease pool (M9) for track layout,
+        // initial B-frame DTS lead, and trim keyframe target.
+        int64_t cutHns = 0;
+        bool hasFirstVideoDts = false;
+        int64_t firstVideoDts = 0;
 
-        const int64_t segCut = (segIdx == 0) ? cutHns : 0;
-        bool seenFirstVideoKey = (segCut <= 0);
-        concatState.beginSegment();
+        {
+            @autoreleasepool {
+                AVURLAsset* firstAsset = [AVURLAsset URLAssetWithURL:firstUrl options:assetOpts];
+                if (!firstAsset) return fail("cannot open first segment");
 
-        for (size_t li = 0; li < slots.size(); ++li) {
-            pullSlot(slots[li]);
-            if (segIdx + 1 == segmentPaths.size() && slots[li].eof && !slots[li].peek && !layout[li].markedFinished) {
-                [layout[li].writerInput markAsFinished];
-                layout[li].markedFinished = true;
+                NSArray<AVAssetTrack*>* firstTracks = loadAssetTracksSync(firstAsset);
+                if (firstTracks.count == 0) return fail("first segment has no media tracks");
+
+                for (AVAssetTrack* tr in firstTracks) {
+                    TrackLayout item;
+                    item.mediaType = tr.mediaType;
+                    item.isVideo = [tr.mediaType isEqualToString:AVMediaTypeVideo];
+                    NSArray* fmts = tr.formatDescriptions;
+                    if (fmts.count == 0) return fail("track has no format description");
+                    item.formatDesc = (__bridge CMFormatDescriptionRef)fmts[0];
+
+                    if (item.isVideo && videoFrameDurationHns == 0) {
+                        float fps = tr.nominalFrameRate;
+                        if (fps > 0.5f) {
+                            videoFrameDurationHns = llround(static_cast<double>(kHnsPerSecond) / static_cast<double>(fps));
+                        }
+                    }
+
+                    AVAssetWriterInput* in = [AVAssetWriterInput assetWriterInputWithMediaType:tr.mediaType
+                                                                                 outputSettings:nil
+                                                                               sourceFormatHint:item.formatDesc];
+                    if (!in) {
+                        return fail("cannot configure pass-through writer input");
+                    }
+                    if (item.isVideo) {
+                        // Preserve 1us video timescale so 120/240 FPS frame timestamps never collapse into 600-tick grid (M8).
+                        in.mediaTimeScale = (tr.naturalTimeScale > 0) ? tr.naturalTimeScale : kVideoMediaTimeScale;
+                    }
+                    // Real-time passthrough flag disables cross-track interleaver lockups across segment boundaries (M1).
+                    in.expectsMediaDataInRealTime = YES;
+                    if (![writer canAddInput:in]) {
+                        return fail("cannot configure pass-through writer input");
+                    }
+                    [writer addInput:in];
+                    item.writerInput = in;
+                    item.formatDesc = nullptr; // unretained inside inner autoreleasepool; unused beyond addInput
+                    layout.push_back(std::move(item));
+                }
+
+                if (videoFrameDurationHns <= 0) {
+                    videoFrameDurationHns = kHnsPerSecond / 60;
+                }
+
+                size_t videoTrackIdx = layout.size();
+                for (size_t i = 0; i < layout.size(); ++i) {
+                    if (layout[i].isVideo) {
+                        videoTrackIdx = i;
+                        break;
+                    }
+                }
+                if (videoTrackIdx < layout.size()) {
+                    const int64_t trimHns = (trimStartSeconds > 0.05)
+                        ? llround(trimStartSeconds * static_cast<double>(kHnsPerSecond))
+                        : 0;
+                    NSError* scanErr = nil;
+                    AVAssetReader* scanReader = [AVAssetReader assetReaderWithAsset:firstAsset error:&scanErr];
+                    if (!scanReader || scanErr) {
+                        int64_t c = 0; bool f = false; bool p = false; std::string m;
+                        classifyNSError(scanErr, c, f, p, m);
+                        return fail("cannot scan first segment: " + m);
+                    }
+                    AVAssetReaderTrackOutput* scanOut =
+                        [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:firstTracks[videoTrackIdx]
+                                                                   outputSettings:nil];
+                    scanOut.alwaysCopiesSampleData = NO;
+                    [scanReader addOutput:scanOut];
+                    [scanReader startReading];
+
+                    struct KeyCandidate {
+                        int64_t pts = -1;
+                        int64_t dts = 0;
+                        bool hasDts = false;
+                    };
+                    KeyCandidate initialSample, lastKeyBefore, firstKeyAfter;
+
+                    while (CMSampleBufferRef sbuf = [scanOut copyNextSampleBuffer]) {
+                        if (CMSampleBufferGetNumSamples(sbuf) <= 0 || !CMSampleBufferGetDataBuffer(sbuf)) {
+                            CFRelease(sbuf);
+                            continue;
+                        }
+                        CMTime pts = CMSampleBufferGetOutputPresentationTimeStamp(sbuf);
+                        CMTime dts = CMSampleBufferGetOutputDecodeTimeStamp(sbuf);
+                        int64_t ts = cmTimeToHns(pts);
+                        bool sampleHasDts = CMTIME_IS_VALID(dts);
+                        int64_t sampleDts = sampleHasDts ? cmTimeToHns(dts) : ts;
+
+                        if (initialSample.pts < 0) {
+                            initialSample = {ts, sampleDts, sampleHasDts};
+                            if (trimHns <= 0) {
+                                CFRelease(sbuf);
+                                break;
+                            }
+                        }
+
+                        bool isKey = sampleIsSync(sbuf);
+                        CFRelease(sbuf);
+
+                        if (ts <= trimHns) {
+                            if (isKey) lastKeyBefore = {ts, sampleDts, sampleHasDts};
+                        } else {
+                            if (isKey && firstKeyAfter.pts < 0) {
+                                firstKeyAfter = {ts, sampleDts, sampleHasDts};
+                                break;
+                            }
+                            if (ts - trimHns > 50000000LL) break;
+                        }
+                    }
+                    [scanReader cancelReading];
+
+                    if (trimHns <= 0) {
+                        cutHns = 0;
+                        hasFirstVideoDts = initialSample.hasDts;
+                        firstVideoDts = initialSample.dts;
+                    } else {
+                        constexpr int64_t kMaxKeyframeDriftHns = 20000000LL; // 2s
+                        KeyCandidate chosen = {0, initialSample.dts, initialSample.hasDts};
+                        if (lastKeyBefore.pts >= 0 && (trimHns - lastKeyBefore.pts) <= kMaxKeyframeDriftHns) {
+                            chosen = lastKeyBefore;
+                        } else if (firstKeyAfter.pts >= 0 && (firstKeyAfter.pts - trimHns) <= kMaxKeyframeDriftHns) {
+                            chosen = firstKeyAfter;
+                        } else if (lastKeyBefore.pts >= 0) {
+                            chosen = lastKeyBefore;
+                        } else if (firstKeyAfter.pts >= 0) {
+                            chosen = firstKeyAfter;
+                        }
+                        cutHns = chosen.pts;
+                        hasFirstVideoDts = chosen.hasDts;
+                        firstVideoDts = chosen.dts;
+                    }
+                }
             }
         }
 
-        while (true) {
-            bool anyRemaining = false;
-            size_t bestIdx = slots.size();
-            for (size_t i = 0; i < slots.size(); ++i) {
-                if (!slots[i].peek) continue;
-                anyRemaining = true;
-                if (!slots[i].writerInput.readyForMoreMediaData) continue;
-                if (bestIdx == slots.size()) {
-                    bestIdx = i;
-                } else {
-                    const auto& a = slots[i];
-                    const auto& b = slots[bestIdx];
-                    if (a.peekDtsHns < b.peekDtsHns ||
-                        (a.peekDtsHns == b.peekDtsHns && a.peekPtsHns < b.peekPtsHns)) {
-                        bestIdx = i;
-                    }
-                }
-            }
-            if (!anyRemaining) break;
-            if (bestIdx == slots.size()) {
-                if (writer.status != AVAssetWriterStatusWriting) {
-                    releasePeeks();
-                    [reader cancelReading];
-                    int64_t c = 0; bool f = false; bool p = false; std::string m;
-                    classifyNSError(writer.error, c, f, p, m);
-                    return fail("writer failed during " + segLabel + ": " + m);
-                }
-                usleep(500);
-                continue;
-            }
-
-            ReaderSlot& cur = slots[bestIdx];
-            CMSampleBufferRef sample = cur.peek;
-            int64_t ptsHns = cur.peekPtsHns;
-            int64_t dtsHns = cur.peekDtsHns;
-            int64_t durHns = cur.peekDurHns;
-            cur.peek = nullptr;
-            pullSlot(cur);
-
-            auto maybeMarkTrackFinished = [&]() {
-                if (segIdx + 1 == segmentPaths.size() && cur.eof && !cur.peek && !layout[bestIdx].markedFinished) {
-                    [layout[bestIdx].writerInput markAsFinished];
-                    layout[bestIdx].markedFinished = true;
-                }
-            };
-
-            if (ptsHns < segCut) {
-                CFRelease(sample);
-                maybeMarkTrackFinished();
-                continue;
-            }
-            if (cur.isVideo && !seenFirstVideoKey) {
-                if (!sampleIsSync(sample)) {
-                    CFRelease(sample);
-                    maybeMarkTrackFinished();
-                    continue;
-                }
-                seenFirstVideoKey = true;
-            }
-
-            int64_t sampleTime = concatState.computeSampleTime(ptsHns, segCut);
-            int64_t newDts = sampleTime;
-            if (cur.isVideo) {
-                concatState.adjustVideoTimestamps(dtsHns, segCut, sampleTime, newDts, false);
-            }
-
-            CMItemCount timingCount = 0;
-            OSStatus tErr = CMSampleBufferGetSampleTimingInfoArray(sample, 0, nullptr, &timingCount);
-            if (tErr != noErr || timingCount <= 0) {
-                releasePeeks();
-                CFRelease(sample);
-                [reader cancelReading];
-                return fail("missing sample timing in " + segLabel);
-            }
-
-            std::vector<CMSampleTimingInfo> timings(static_cast<size_t>(timingCount));
-            tErr = CMSampleBufferGetSampleTimingInfoArray(sample, timingCount, timings.data(), &timingCount);
-            if (tErr != noErr) {
-                releasePeeks();
-                CFRelease(sample);
-                [reader cancelReading];
-                return fail("failed reading sample timing in " + segLabel);
-            }
-
-            const CMTime baseOrigPts = timings[0].presentationTimeStamp;
-            const CMTimeScale trackScale = CMTIME_IS_VALID(baseOrigPts) && baseOrigPts.timescale > 0
-                ? baseOrigPts.timescale
-                : static_cast<CMTimeScale>(kHnsPerSecond);
-            const CMTime baseNewPts = hnsToCMTime(sampleTime, trackScale);
-            const CMTime baseNewDts = cur.isVideo ? hnsToCMTime(newDts, trackScale) : baseNewPts;
-
-            for (size_t ti = 0; ti < timings.size(); ++ti) {
-                if (ti == 0) {
-                    timings[ti].presentationTimeStamp = baseNewPts;
-                    if (CMTIME_IS_VALID(timings[ti].decodeTimeStamp)) {
-                        timings[ti].decodeTimeStamp = baseNewDts;
-                    }
-                } else {
-                    if (CMTIME_IS_VALID(timings[ti].presentationTimeStamp) && CMTIME_IS_VALID(baseOrigPts)) {
-                        CMTime offset = CMTimeSubtract(timings[ti].presentationTimeStamp, baseOrigPts);
-                        timings[ti].presentationTimeStamp = CMTimeAdd(baseNewPts, offset);
-                    }
-                    if (CMTIME_IS_VALID(timings[ti].decodeTimeStamp) && CMTIME_IS_VALID(baseOrigPts)) {
-                        CMTime offset = CMTimeSubtract(timings[ti].decodeTimeStamp, baseOrigPts);
-                        timings[ti].decodeTimeStamp = CMTimeAdd(baseNewDts, offset);
-                    }
-                }
-            }
-
-            CMSampleBufferRef rebased = nullptr;
-            tErr = CMSampleBufferCreateCopyWithNewTiming(
-                kCFAllocatorDefault, sample, timingCount, timings.data(), &rebased);
-            CFRelease(sample);
-            if (tErr != noErr || !rebased) {
-                releasePeeks();
-                [reader cancelReading];
-                return fail("failed rebasing timestamp in " + segLabel);
-            }
-
-            if (writer.status != AVAssetWriterStatusWriting || ![cur.writerInput appendSampleBuffer:rebased]) {
-                CFRelease(rebased);
-                releasePeeks();
-                [reader cancelReading];
-                int64_t c = 0; bool f = false; bool p = false; std::string m;
-                classifyNSError(writer.error, c, f, p, m);
-                return fail("failed writing " + segLabel + ": " + m);
-            }
-            CFRelease(rebased);
-            maybeMarkTrackFinished();
-
-            int64_t prevAudioEnd = 0;
-            if (!concatState.recordWrittenSample(cur.streamId, cur.isVideo, sampleTime, durHns, &prevAudioEnd)) {
-                geode::log::warn(
-                    "VideoToolboxEncoder: audio stream {} packet at {} overlaps prior end {} in {}",
-                    cur.streamId, sampleTime, prevAudioEnd, segLabel);
-            }
-            samplesWritten++;
-        }
-
-        releasePeeks();
-        if (reader.status != AVAssetReaderStatusCompleted) {
+        if (![writer startWriting]) {
             int64_t c = 0; bool f = false; bool p = false; std::string m;
-            classifyNSError(reader.error, c, f, p, m);
-            [writer cancelWriting];
-            return fail("failed reading " + segLabel + ": " + m);
+            classifyNSError(writer.error, c, f, p, m);
+            return fail("AVAssetWriter startWriting failed: " + m);
+        }
+        remuxGuard.writerStarted = true;
+        [writer startSessionAtSourceTime:kCMTimeZero];
+
+        const int64_t initialPtsShift = (hasFirstVideoDts && firstVideoDts < cutHns)
+            ? (cutHns - firstVideoDts)
+            : 0;
+
+        ConcatTimestampState concatState(initialPtsShift);
+        size_t samplesWritten = 0;
+
+        // 3. Remux every segment inside its own autoreleasepool (M9) so file descriptors & AVAsset objects drop each iteration.
+        for (size_t segIdx = 0; segIdx < segmentPaths.size(); ++segIdx) {
+            const std::string segLabel = "segment " + std::to_string(segIdx + 1) + "/" + std::to_string(segmentPaths.size());
+            std::string segFailMsg;
+
+            @autoreleasepool {
+                NSURL* segUrl = pathToURL(segmentPaths[segIdx]);
+                if (!segUrl) {
+                    segFailMsg = "invalid path in " + segLabel;
+                } else {
+                    AVURLAsset* segAsset = [AVURLAsset URLAssetWithURL:segUrl options:assetOpts];
+                    if (!segAsset) {
+                        segFailMsg = "cannot open " + segLabel;
+                    } else {
+                        NSError* readerErr = nil;
+                        AVAssetReader* reader = [AVAssetReader assetReaderWithAsset:segAsset error:&readerErr];
+                        if (!reader || readerErr) {
+                            int64_t c = 0; bool f = false; bool p = false; std::string m;
+                            classifyNSError(readerErr, c, f, p, m);
+                            segFailMsg = "cannot read " + segLabel + ": " + m;
+                        } else {
+                            remuxGuard.reader = reader;
+
+                            NSArray<AVAssetTrack*>* segTracks = loadAssetTracksSync(segAsset);
+                            if (segTracks.count < layout.size()) {
+                                segFailMsg = segLabel + " is missing an expected track";
+                            } else {
+                                struct ReaderSlot {
+                                    AVAssetReaderTrackOutput* output = nil;
+                                    AVAssetWriterInput* writerInput = nil;
+                                    bool isVideo = false;
+                                    uint32_t streamId = 0;
+                                    CMSampleBufferRef peek = nullptr;
+                                    CMTime peekOrigOutPts = kCMTimeInvalid;
+                                    CMTime peekOrigOutDts = kCMTimeInvalid;
+                                    int64_t peekPtsHns = 0;
+                                    int64_t peekDtsHns = 0;
+                                    int64_t peekDurHns = 0;
+                                    bool eof = false;
+                                };
+                                struct PeekGuard {
+                                    std::vector<ReaderSlot>& slots;
+                                    ~PeekGuard() {
+                                        for (auto& sl : slots) {
+                                            if (sl.peek) {
+                                                CFRelease(sl.peek);
+                                                sl.peek = nullptr;
+                                            }
+                                        }
+                                    }
+                                };
+
+                                std::vector<ReaderSlot> slots(layout.size());
+                                PeekGuard peekGuard{slots};
+
+                                std::vector<bool> usedSegTrack(segTracks.count, false);
+                                bool trackSetupOk = true;
+                                for (size_t li = 0; li < layout.size(); ++li) {
+                                    AVAssetTrack* matched = nil;
+                                    for (NSUInteger ti = 0; ti < segTracks.count; ++ti) {
+                                        if (!usedSegTrack[ti] && [segTracks[ti].mediaType isEqualToString:layout[li].mediaType]) {
+                                            matched = segTracks[ti];
+                                            usedSegTrack[ti] = true;
+                                            break;
+                                        }
+                                    }
+                                    if (!matched) {
+                                        segFailMsg = segLabel + " is missing required stream";
+                                        trackSetupOk = false;
+                                        break;
+                                    }
+                                    AVAssetReaderTrackOutput* out =
+                                        [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:matched outputSettings:nil];
+                                    out.alwaysCopiesSampleData = NO;
+                                    if (![reader canAddOutput:out]) {
+                                        segFailMsg = "cannot attach track output in " + segLabel;
+                                        trackSetupOk = false;
+                                        break;
+                                    }
+                                    [reader addOutput:out];
+                                    slots[li].output = out;
+                                    slots[li].writerInput = layout[li].writerInput;
+                                    slots[li].isVideo = layout[li].isVideo;
+                                    slots[li].streamId = static_cast<uint32_t>(li);
+                                }
+
+                                if (trackSetupOk && ![reader startReading]) {
+                                    int64_t c = 0; bool f = false; bool p = false; std::string m;
+                                    classifyNSError(reader.error, c, f, p, m);
+                                    segFailMsg = "cannot start reading " + segLabel + ": " + m;
+                                    trackSetupOk = false;
+                                }
+
+                                if (trackSetupOk) {
+                                    auto pullSlot = [&](ReaderSlot& sl) {
+                                        if (sl.peek || sl.eof) return;
+                                        while (true) {
+                                            CMSampleBufferRef next = [sl.output copyNextSampleBuffer];
+                                            if (!next) {
+                                                sl.eof = true;
+                                                return;
+                                            }
+                                            if (CMSampleBufferGetNumSamples(next) <= 0 || !CMSampleBufferGetDataBuffer(next)) {
+                                                CFRelease(next);
+                                                continue;
+                                            }
+                                            CMTime pts = CMSampleBufferGetOutputPresentationTimeStamp(next);
+                                            CMTime dts = CMSampleBufferGetOutputDecodeTimeStamp(next);
+                                            CMTime dur = CMSampleBufferGetOutputDuration(next);
+                                            sl.peek = next;
+                                            sl.peekOrigOutPts = pts;
+                                            sl.peekOrigOutDts = dts;
+                                            sl.peekPtsHns = cmTimeToHns(pts);
+                                            sl.peekDtsHns = CMTIME_IS_VALID(dts) ? cmTimeToHns(dts) : sl.peekPtsHns;
+                                            int64_t durHns = CMTIME_IS_VALID(dur) ? cmTimeToHns(dur) : 0;
+                                            if (sl.isVideo && durHns <= 0) durHns = videoFrameDurationHns;
+                                            sl.peekDurHns = durHns;
+                                            return;
+                                        }
+                                    };
+
+                                    const int64_t segCut = (segIdx == 0) ? cutHns : 0;
+                                    bool seenFirstVideoKey = (segCut <= 0);
+                                    concatState.beginSegment();
+
+                                    for (size_t li = 0; li < slots.size(); ++li) {
+                                        pullSlot(slots[li]);
+                                        if (segIdx + 1 == segmentPaths.size() && slots[li].eof && !slots[li].peek && !layout[li].markedFinished) {
+                                            [layout[li].writerInput markAsFinished];
+                                            layout[li].markedFinished = true;
+                                        }
+                                    }
+
+                                    auto lastProgress = std::chrono::steady_clock::now();
+                                    while (segFailMsg.empty()) {
+                                        bool anyRemaining = false;
+                                        size_t bestIdx = slots.size();
+                                        for (size_t i = 0; i < slots.size(); ++i) {
+                                            if (!slots[i].peek) continue;
+                                            anyRemaining = true;
+                                            if (!slots[i].writerInput.readyForMoreMediaData) continue;
+                                            if (bestIdx == slots.size()) {
+                                                bestIdx = i;
+                                            } else {
+                                                const auto& a = slots[i];
+                                                const auto& b = slots[bestIdx];
+                                                if (a.peekDtsHns < b.peekDtsHns ||
+                                                    (a.peekDtsHns == b.peekDtsHns && a.peekPtsHns < b.peekPtsHns)) {
+                                                    bestIdx = i;
+                                                }
+                                            }
+                                        }
+                                        if (!anyRemaining) break;
+                                        if (bestIdx == slots.size()) {
+                                            if (writer.status != AVAssetWriterStatusWriting) {
+                                                int64_t c = 0; bool f = false; bool p = false; std::string m;
+                                                classifyNSError(writer.error, c, f, p, m);
+                                                segFailMsg = "writer failed during " + segLabel + ": " + m;
+                                                break;
+                                            }
+                                            if (std::chrono::steady_clock::now() - lastProgress >= std::chrono::seconds(10)) {
+                                                segFailMsg = "remux stalled in " + segLabel + ": writer inputs not ready for 10s";
+                                                break;
+                                            }
+                                            usleep(500);
+                                            continue;
+                                        }
+
+                                        ReaderSlot& cur = slots[bestIdx];
+                                        CMSampleBufferRef sample = cur.peek;
+                                        CMTime origOutPts = cur.peekOrigOutPts;
+                                        CMTime origOutDts = cur.peekOrigOutDts;
+                                        int64_t ptsHns = cur.peekPtsHns;
+                                        int64_t dtsHns = cur.peekDtsHns;
+                                        int64_t durHns = cur.peekDurHns;
+                                        cur.peek = nullptr;
+                                        struct SampleRefGuard {
+                                            CMSampleBufferRef ref = nullptr;
+                                            ~SampleRefGuard() { if (ref) CFRelease(ref); }
+                                        } sampleGuard{sample};
+                                        pullSlot(cur);
+
+                                        auto maybeMarkTrackFinished = [&]() {
+                                            if (segIdx + 1 == segmentPaths.size() && cur.eof && !cur.peek && !layout[bestIdx].markedFinished) {
+                                                [layout[bestIdx].writerInput markAsFinished];
+                                                layout[bestIdx].markedFinished = true;
+                                            }
+                                        };
+
+                                        if (ptsHns < segCut) {
+                                            maybeMarkTrackFinished();
+                                            lastProgress = std::chrono::steady_clock::now();
+                                            continue;
+                                        }
+                                        if (cur.isVideo && !seenFirstVideoKey) {
+                                            if (!sampleIsSync(sample)) {
+                                                maybeMarkTrackFinished();
+                                                lastProgress = std::chrono::steady_clock::now();
+                                                continue;
+                                            }
+                                            seenFirstVideoKey = true;
+                                        }
+
+                                        int64_t sampleTime = concatState.computeSampleTime(ptsHns, segCut);
+                                        int64_t newDts = sampleTime;
+                                        if (cur.isVideo) {
+                                            concatState.adjustVideoTimestamps(dtsHns, segCut, sampleTime, newDts, false);
+                                        }
+
+                                        CMItemCount timingCount = 0;
+                                        OSStatus tErr = CMSampleBufferGetSampleTimingInfoArray(sample, 0, nullptr, &timingCount);
+                                        if (tErr != noErr || timingCount <= 0) {
+                                            segFailMsg = "missing sample timing in " + segLabel;
+                                            break;
+                                        }
+
+                                        std::vector<CMSampleTimingInfo> timings(static_cast<size_t>(timingCount));
+                                        tErr = CMSampleBufferGetSampleTimingInfoArray(sample, timingCount, timings.data(), &timingCount);
+                                        if (tErr != noErr) {
+                                            segFailMsg = "failed reading sample timing in " + segLabel;
+                                            break;
+                                        }
+
+                                        // Trim policy across segments (M10):
+                                        // Only segment 0 trims pre-window media at cutHns; continuation segments (segIdx > 0)
+                                        // begin cleanly from segCut == 0 at outputBase. Rebase every timing entry by
+                                        // delta = (targetOutputPTS - origOutputPTS) rather than replacing raw PTS directly,
+                                        // preserving AAC priming/edit-list trim offsets without per-segment shift.
+                                        const CMTimeScale trackScale =
+                                            (CMTIME_IS_VALID(timings[0].presentationTimeStamp) && timings[0].presentationTimeStamp.timescale > 0)
+                                                ? timings[0].presentationTimeStamp.timescale
+                                                : ((CMTIME_IS_VALID(origOutPts) && origOutPts.timescale > 0)
+                                                       ? origOutPts.timescale
+                                                       : static_cast<CMTimeScale>(kHnsPerSecond));
+
+                                        const CMTime targetOutPts = hnsToCMTime(sampleTime, trackScale);
+                                        const CMTime origOutScaled = CMTIME_IS_VALID(origOutPts)
+                                            ? CMTimeConvertScale(origOutPts, trackScale, kCMTimeRoundingMethod_RoundHalfAwayFromZero)
+                                            : timings[0].presentationTimeStamp;
+                                        const CMTime ptsDelta = CMTimeSubtract(targetOutPts, origOutScaled);
+
+                                        CMTime dtsDelta = ptsDelta;
+                                        if (cur.isVideo && CMTIME_IS_VALID(origOutDts)) {
+                                            const CMTimeScale dtsScale =
+                                                (CMTIME_IS_VALID(timings[0].decodeTimeStamp) && timings[0].decodeTimeStamp.timescale > 0)
+                                                    ? timings[0].decodeTimeStamp.timescale
+                                                    : trackScale;
+                                            const CMTime targetOutDts = hnsToCMTime(newDts, dtsScale);
+                                            const CMTime origDtsScaled = CMTimeConvertScale(
+                                                origOutDts, dtsScale, kCMTimeRoundingMethod_RoundHalfAwayFromZero);
+                                            dtsDelta = CMTimeSubtract(targetOutDts, origDtsScaled);
+                                        }
+
+                                        for (size_t ti = 0; ti < timings.size(); ++ti) {
+                                            if (CMTIME_IS_VALID(timings[ti].presentationTimeStamp)) {
+                                                CMTimeScale ts = (timings[ti].presentationTimeStamp.timescale > 0)
+                                                    ? timings[ti].presentationTimeStamp.timescale
+                                                    : trackScale;
+                                                CMTime d = (ts == trackScale)
+                                                    ? ptsDelta
+                                                    : CMTimeConvertScale(ptsDelta, ts, kCMTimeRoundingMethod_RoundHalfAwayFromZero);
+                                                timings[ti].presentationTimeStamp = CMTimeAdd(timings[ti].presentationTimeStamp, d);
+                                            }
+                                            if (CMTIME_IS_VALID(timings[ti].decodeTimeStamp)) {
+                                                CMTime refDelta = cur.isVideo ? dtsDelta : ptsDelta;
+                                                CMTimeScale ts = (timings[ti].decodeTimeStamp.timescale > 0)
+                                                    ? timings[ti].decodeTimeStamp.timescale
+                                                    : trackScale;
+                                                CMTime d = (ts == refDelta.timescale)
+                                                    ? refDelta
+                                                    : CMTimeConvertScale(refDelta, ts, kCMTimeRoundingMethod_RoundHalfAwayFromZero);
+                                                timings[ti].decodeTimeStamp = CMTimeAdd(timings[ti].decodeTimeStamp, d);
+                                            }
+                                        }
+
+                                        CMSampleBufferRef rebased = nullptr;
+                                        tErr = CMSampleBufferCreateCopyWithNewTiming(
+                                            kCFAllocatorDefault, sample, timingCount, timings.data(), &rebased);
+                                        CFRelease(sampleGuard.ref);
+                                        sampleGuard.ref = nullptr;
+                                        if (tErr != noErr || !rebased) {
+                                            segFailMsg = "failed rebasing timestamp in " + segLabel;
+                                            break;
+                                        }
+
+                                        if (writer.status != AVAssetWriterStatusWriting || ![cur.writerInput appendSampleBuffer:rebased]) {
+                                            CFRelease(rebased);
+                                            int64_t c = 0; bool f = false; bool p = false; std::string m;
+                                            classifyNSError(writer.error, c, f, p, m);
+                                            segFailMsg = "failed writing " + segLabel + ": " + m;
+                                            break;
+                                        }
+                                        CFRelease(rebased);
+                                        lastProgress = std::chrono::steady_clock::now();
+                                        maybeMarkTrackFinished();
+
+                                        int64_t prevAudioEnd = 0;
+                                        if (!concatState.recordWrittenSample(cur.streamId, cur.isVideo, sampleTime, durHns, &prevAudioEnd)) {
+                                            geode::log::warn(
+                                                "VideoToolboxEncoder: audio stream {} packet at {} overlaps prior end {} in {}",
+                                                cur.streamId, sampleTime, prevAudioEnd, segLabel);
+                                        }
+                                        samplesWritten++;
+                                    }
+
+                                    if (segFailMsg.empty()) {
+                                        if (reader.status != AVAssetReaderStatusCompleted) {
+                                            int64_t c = 0; bool f = false; bool p = false; std::string m;
+                                            classifyNSError(reader.error, c, f, p, m);
+                                            segFailMsg = "failed reading " + segLabel + ": " + m;
+                                        } else {
+                                            bool anomalyWarn = false;
+                                            int64_t excessHns = 0;
+                                            concatState.endSegment(videoFrameDurationHns, &anomalyWarn, &excessHns);
+                                            if (anomalyWarn) {
+                                                geode::log::warn(
+                                                    "VideoToolboxEncoder: video end exceeded primary audio end by {:.2f} ms (>1.5 frames) in {}, falling back to max segment end",
+                                                    static_cast<double>(excessHns) / 10000.0, segLabel);
+                                            }
+                                            remuxGuard.reader = nil;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (!segFailMsg.empty()) {
+                return fail(segFailMsg);
+            }
         }
 
-        bool anomalyWarn = false;
-        int64_t excessHns = 0;
-        concatState.endSegment(videoFrameDurationHns, &anomalyWarn, &excessHns);
-        if (anomalyWarn) {
-            geode::log::warn(
-                "VideoToolboxEncoder: video end exceeded primary audio end by {:.2f} ms (>1.5 frames) in {}, falling back to max segment end",
-                static_cast<double>(excessHns) / 10000.0, segLabel);
+        if (samplesWritten == 0) {
+            return fail("no media samples were written");
         }
-    }
 
-    if (samplesWritten == 0) {
-        [writer cancelWriting];
-        return fail("no media samples were written");
-    }
-
-    for (auto& tr : layout) {
-        if (!tr.markedFinished) {
-            [tr.writerInput markAsFinished];
-            tr.markedFinished = true;
+        for (auto& tr : layout) {
+            if (!tr.markedFinished) {
+                [tr.writerInput markAsFinished];
+                tr.markedFinished = true;
+            }
         }
+
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        [writer finishWritingWithCompletionHandler:^{
+            dispatch_semaphore_signal(sem);
+        }];
+        dispatch_time_t finishDeadline = dispatch_time(DISPATCH_TIME_NOW, 60LL * NSEC_PER_SEC);
+        if (dispatch_semaphore_wait(sem, finishDeadline) != 0) {
+            return fail("timed out waiting 60s for AVAssetWriter finishWriting");
+        }
+
+        if (writer.status != AVAssetWriterStatusCompleted) {
+            int64_t c = 0; bool f = false; bool p = false; std::string m;
+            classifyNSError(writer.error, c, f, p, m);
+            return fail("finalizing MP4 failed: " + m);
+        }
+
+        remuxGuard.completed = true;
+        res.success = true;
+        res.durationSeconds = static_cast<double>(std::max<int64_t>(0, concatState.outputBase - initialPtsShift)) /
+                              static_cast<double>(kHnsPerSecond);
+        return res;
+    } @catch (NSException* ex) {
+        return fail(formatNsException(ex));
     }
-
-    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-    [writer finishWritingWithCompletionHandler:^{
-        dispatch_semaphore_signal(sem);
-    }];
-    dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
-
-    if (writer.status != AVAssetWriterStatusCompleted) {
-        int64_t c = 0; bool f = false; bool p = false; std::string m;
-        classifyNSError(writer.error, c, f, p, m);
-        return fail("finalizing MP4 failed: " + m);
-    }
-
-    res.success = true;
-    res.durationSeconds = static_cast<double>(std::max<int64_t>(0, concatState.outputBase - initialPtsShift)) /
-                          static_cast<double>(kHnsPerSecond);
-    return res;
 }
 
 } // namespace

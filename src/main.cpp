@@ -69,6 +69,8 @@ static void triggerToggleReplay() {
             case ToggleReplayResult::StopPending:
                 geode::Notification::create("Instant Replay: Stop pending...", geode::NotificationIcon::Warning, 1.5f)->show();
                 break;
+            case ToggleReplayResult::Unavailable:
+                break;
         }
     }
 }
@@ -86,14 +88,29 @@ $on_mod(Loaded) {
     (void)ReplayConfig::get();
     (void)FrameGrabber::get();
     (void)AudioGrabber::get();
-    ReplayManager::get()->initialize();
 
 #ifdef GEODE_IS_MACOS
     // On macOS, CCDirectorCaller calls -[NSOpenGLContext flushBuffer] directly (CCEGLView::swapBuffers is a no-op).
-    installMacGLCaptureHook(
+    // Install BEFORE ReplayManager::initialize() so auto-start knows whether the GL capture backend is live (M20).
+    bool macHookOk = installMacGLCaptureHook(
         []() { FrameGrabber::get()->captureCurrentFrame(); },
         []() { return FrameGrabber::get()->isCapturing(); }
     );
+#endif
+
+    const bool enabledBeforeInit = geode::Mod::get() && geode::Mod::get()->getSettingValue<bool>("enabled");
+    ReplayManager::get()->initialize();
+
+#ifdef GEODE_IS_MACOS
+    if (!macHookOk && !enabledBeforeInit) {
+        geode::Loader::get()->queueInMainThread([]() {
+            geode::Notification::create(
+                "Instant Replay: Video capture hook failed - check Geode log",
+                geode::NotificationIcon::Error,
+                4.0f
+            )->show();
+        });
+    }
 #endif
 
     // 2. Register keybind listeners (Geode 5.10+ native keybind setting system)
@@ -172,13 +189,17 @@ $on_mod(Loaded) {
                 }
 
                 if (paramChanged) {
+#ifdef GEODE_IS_MACOS
                     auto prevModCodecStr = mod->getSettingValue<std::string>("codec");
                     ReplayConfig::get().loadFromSettings();
                     if (ReplayConfig::codecFromString(prevModCodecStr) != ReplayConfig::get().codec.load()) {
-                        std::string msg = std::string("Selected codec is unsupported on this Mac — switched to ") +
-                                          ReplayConfig::codecToString(ReplayConfig::get().codec.load());
-                        geode::Notification::create(msg, geode::NotificationIcon::Warning, 2.0f)->show();
+                        std::string msg = "Selected codec unsupported - switched to " +
+                                          ReplayConfig::get().getCodecDisplayName();
+                        geode::Notification::create(msg, geode::NotificationIcon::Warning, 2.5f)->show();
                     }
+#else
+                    ReplayConfig::get().loadFromSettings();
+#endif
                 }
 
                 if (enabledChanged && targetEnabled && !ReplayManager::get()->isReplayActive()) {

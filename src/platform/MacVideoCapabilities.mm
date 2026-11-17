@@ -12,6 +12,10 @@
 #undef CommentType
 #pragma pop_macro("CommentType")
 
+#include <mutex>
+#include <tuple>
+#include <vector>
+
 namespace replay {
 
 namespace {
@@ -67,6 +71,84 @@ MacVideoEncoderCaps probeMacVideoEncoderCaps() {
 const MacVideoEncoderCaps& getMacVideoEncoderCaps() {
     static const MacVideoEncoderCaps s_caps = probeMacVideoEncoderCaps();
     return s_caps;
+}
+
+bool isMacVideoEncodeSizeSupported(VideoCodecFamily family, bool hardware, int width, int height) {
+    if (width < 16 || height < 16) return false;
+    if (family == VideoCodecFamily::VP9) return false;
+    if (family == VideoCodecFamily::H264 && (width > kH264MaxWidth || height > kH264MaxHeight)) {
+        return false;
+    }
+    if (!getMacVideoEncoderCaps().supports(family, hardware)) {
+        return false;
+    }
+
+    using Key = std::tuple<VideoCodecFamily, bool, int, int>;
+    static std::mutex s_cacheMutex;
+    static std::vector<std::pair<Key, bool>> s_sizeCache;
+
+    Key key{family, hardware, width, height};
+    {
+        std::lock_guard<std::mutex> lock(s_cacheMutex);
+        for (const auto& entry : s_sizeCache) {
+            if (entry.first == key) {
+                return entry.second;
+            }
+        }
+    }
+
+    bool supported = false;
+    @try {
+        @autoreleasepool {
+            CMVideoCodecType codecType = kCMVideoCodecType_H264;
+            if (family == VideoCodecFamily::AV1) {
+                codecType = kMacCodecTypeAV1;
+            } else if (family == VideoCodecFamily::HEVC) {
+                codecType = kCMVideoCodecType_HEVC;
+            }
+
+            NSDictionary* encoderSpec = hardware
+                ? @{ (__bridge NSString*)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @YES }
+                : @{ (__bridge NSString*)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @NO };
+
+            NSDictionary* srcAttrs = @{
+                (__bridge NSString*)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
+                (__bridge NSString*)kCVPixelBufferWidthKey: @(width),
+                (__bridge NSString*)kCVPixelBufferHeightKey: @(height),
+            };
+
+            VTCompressionSessionRef session = nullptr;
+            OSStatus status = VTCompressionSessionCreate(
+                kCFAllocatorDefault,
+                width,
+                height,
+                codecType,
+                (__bridge CFDictionaryRef)encoderSpec,
+                (__bridge CFDictionaryRef)srcAttrs,
+                kCFAllocatorDefault,
+                nullptr,
+                nullptr,
+                &session);
+            if (status == noErr && session) {
+                VTSessionSetProperty(session, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
+                status = VTCompressionSessionPrepareToEncodeFrames(session);
+                VTCompressionSessionInvalidate(session);
+                CFRelease(session);
+                supported = (status == noErr);
+            }
+        }
+    } @catch (NSException*) {
+        supported = false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(s_cacheMutex);
+        if (s_sizeCache.size() >= 32) {
+            s_sizeCache.erase(s_sizeCache.begin());
+        }
+        s_sizeCache.emplace_back(key, supported);
+    }
+    return supported;
 }
 
 } // namespace replay

@@ -9,6 +9,7 @@
 #pragma push_macro("CommentType")
 #undef CommentType
 #define CommentType AppleScriptCommentTypeDummy
+#import <AVFoundation/AVFoundation.h>
 #import <AudioToolbox/AudioToolbox.h>
 #import <CoreAudio/CoreAudio.h>
 #import <CoreFoundation/CoreFoundation.h>
@@ -17,6 +18,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <mach/mach_time.h>
 #include <thread>
@@ -125,25 +127,44 @@ double getDeviceNominalSampleRate(AudioDeviceID deviceId) {
     return 48000.0;
 }
 
-AudioDeviceID resolveTargetInputDevice(const std::string& targetId) {
-    if (!targetId.empty() && targetId != "default") {
-        CFStringRef uidCf = CFStringCreateWithCString(kCFAllocatorDefault, targetId.c_str(), kCFStringEncodingUTF8);
-        if (uidCf) {
-            AudioDeviceID devId = kAudioObjectUnknown;
-            AudioObjectPropertyAddress addr = {
-                kAudioHardwarePropertyTranslateUIDToDevice,
-                kAudioObjectPropertyScopeGlobal,
-                kMainElement
-            };
-            UInt32 size = sizeof(devId);
-            OSStatus err = AudioObjectGetPropertyData(kAudioObjectSystemObject, &addr, sizeof(uidCf), &uidCf, &size, &devId);
-            CFRelease(uidCf);
-            if (err == noErr && devId != kAudioObjectUnknown &&
-                isAudioDeviceAlive(devId) && getDeviceInputChannelCount(devId) > 0) {
-                return devId;
-            }
-            return kAudioObjectUnknown;
+bool isDeviceUidAvailable(const std::string& uid, AudioDeviceID* outDevId = nullptr) {
+    if (uid.empty() || uid == "default") return false;
+    CFStringRef uidCf = CFStringCreateWithCString(kCFAllocatorDefault, uid.c_str(), kCFStringEncodingUTF8);
+    if (!uidCf) return false;
+
+    AudioDeviceID devId = kAudioObjectUnknown;
+    AudioObjectPropertyAddress addr = {
+        kAudioHardwarePropertyTranslateUIDToDevice,
+        kAudioObjectPropertyScopeGlobal,
+        kMainElement
+    };
+    UInt32 size = sizeof(devId);
+    OSStatus err = AudioObjectGetPropertyData(kAudioObjectSystemObject, &addr, sizeof(uidCf), &uidCf, &size, &devId);
+    CFRelease(uidCf);
+    if (err == noErr && devId != kAudioObjectUnknown &&
+        isAudioDeviceAlive(devId) && getDeviceInputChannelCount(devId) > 0) {
+        if (outDevId) *outDevId = devId;
+        return true;
+    }
+    return false;
+}
+
+AudioDeviceID resolveTargetInputDevice(
+    const std::string& targetId,
+    bool forceDefaultFallback,
+    bool& outUsingFallback
+) {
+    outUsingFallback = false;
+    bool wantsSpecific = (!targetId.empty() && targetId != "default");
+
+    if (wantsSpecific && !forceDefaultFallback) {
+        AudioDeviceID specificId = kAudioObjectUnknown;
+        if (isDeviceUidAvailable(targetId, &specificId)) {
+            return specificId;
         }
+        outUsingFallback = true;
+    } else if (wantsSpecific && forceDefaultFallback) {
+        outUsingFallback = true;
     }
 
     AudioDeviceID defaultId = kAudioObjectUnknown;
@@ -168,17 +189,32 @@ struct MicQueueState {
     int sampleRate = AudioGrabber::kMicSampleRate;
     mach_timebase_info_data_t timebase{};
     std::atomic<bool> deviceInvalidated{false};
+    std::atomic<bool> devicesChanged{false};
     std::atomic<bool> stopping{false};
+    std::atomic<uint64_t> consecutiveSilentFrames{0};
+    std::atomic<bool> sawNonZeroAudio{false};
+    std::atomic<bool> digitalSilenceAlert{false};
 };
 
 OSStatus onAudioObjectPropertyChanged(
     AudioObjectID /*inObjectID*/,
-    UInt32 /*inNumberAddresses*/,
-    const AudioObjectPropertyAddress* /*inAddresses*/,
+    UInt32 inNumberAddresses,
+    const AudioObjectPropertyAddress* inAddresses,
     void* inClientData
 ) {
     if (auto* state = static_cast<MicQueueState*>(inClientData)) {
-        state->deviceInvalidated.store(true, std::memory_order_release);
+        bool deviceListOnly = (inNumberAddresses > 0 && inAddresses != nullptr);
+        for (UInt32 i = 0; i < inNumberAddresses; ++i) {
+            if (inAddresses[i].mSelector != kAudioHardwarePropertyDevices) {
+                deviceListOnly = false;
+                break;
+            }
+        }
+        if (deviceListOnly) {
+            state->devicesChanged.store(true, std::memory_order_release);
+        } else {
+            state->deviceInvalidated.store(true, std::memory_order_release);
+        }
     }
     return noErr;
 }
@@ -200,6 +236,27 @@ void onAudioQueueInput(
         const size_t bytesPerFrame = static_cast<size_t>(std::max(1, state->channels)) * sizeof(float);
         const UInt32 frames = static_cast<UInt32>(inBuffer->mAudioDataByteSize / bytesPerFrame);
         if (frames > 0) {
+            const float* pcm = static_cast<const float*>(inBuffer->mAudioData);
+            if (!state->sawNonZeroAudio.load(std::memory_order_relaxed)) {
+                const size_t totalSamples = static_cast<size_t>(frames) * static_cast<size_t>(std::max(1, state->channels));
+                bool nonZero = false;
+                for (size_t i = 0; i < totalSamples; ++i) {
+                    if (pcm[i] != 0.0f) {
+                        nonZero = true;
+                        break;
+                    }
+                }
+                if (nonZero) {
+                    state->sawNonZeroAudio.store(true, std::memory_order_relaxed);
+                    state->consecutiveSilentFrames.store(0, std::memory_order_relaxed);
+                } else {
+                    uint64_t silent = state->consecutiveSilentFrames.fetch_add(frames, std::memory_order_relaxed) + frames;
+                    if (silent >= static_cast<uint64_t>(std::max(1, state->sampleRate)) * 3ULL) {
+                        state->digitalSilenceAlert.store(true, std::memory_order_release);
+                    }
+                }
+            }
+
             auto captureTime = std::chrono::steady_clock::now();
             if (inStartTime && (inStartTime->mFlags & kAudioTimeStampHostTimeValid) &&
                 inStartTime->mHostTime > 0 && state->timebase.denom > 0) {
@@ -216,7 +273,7 @@ void onAudioQueueInput(
             }
 
             state->owner->pushMicAudio(
-                static_cast<const float*>(inBuffer->mAudioData),
+                pcm,
                 frames,
                 state->channels,
                 state->sampleRate,
@@ -276,6 +333,44 @@ void AudioGrabber::micCaptureThreadFunc() {
     MacAutoreleasePoolScope pool;
     m_micResampler.reset();
 
+    // Check macOS Microphone TCC permission before touching CoreAudio input (M3).
+    AVAuthorizationStatus authStatus = [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio];
+    if (authStatus == AVAuthorizationStatusDenied || authStatus == AVAuthorizationStatusRestricted) {
+        m_micStatus.store(MicCaptureStatus::PermissionDenied, std::memory_order_release);
+        static std::atomic<bool> s_notifiedDenied{false};
+        if (!s_notifiedDenied.exchange(true, std::memory_order_acq_rel)) {
+            geode::log::warn(
+                "Instant Replay: macOS Microphone permission is denied/restricted; microphone capture disabled "
+                "(enable Geometry Dash in System Settings -> Privacy & Security -> Microphone)");
+            geode::queueInMainThread([]() {
+                geode::Notification::create(
+                    "Instant Replay: Mic permission denied in macOS Privacy Settings",
+                    geode::NotificationIcon::Warning,
+                    4.0f
+                )->show();
+            });
+        }
+        return;
+    }
+
+    if (authStatus == AVAuthorizationStatusNotDetermined) {
+        static std::atomic<bool> s_warnedNotDetermined{false};
+        if (!s_warnedNotDetermined.exchange(true, std::memory_order_acq_rel)) {
+            if ([[NSBundle mainBundle] objectForInfoDictionaryKey:@"NSMicrophoneUsageDescription"] != nil) {
+                geode::log::info("Instant Replay: requesting macOS Microphone permission");
+                [AVCaptureDevice requestAccessForMediaType:AVMediaTypeAudio completionHandler:^(BOOL granted) {
+                    if (!granted) {
+                        m_micStatus.store(MicCaptureStatus::PermissionDenied, std::memory_order_release);
+                    }
+                }];
+            } else {
+                geode::log::warn(
+                    "Instant Replay: macOS Microphone permission is NotDetermined (no NSMicrophoneUsageDescription); "
+                    "mic audio may remain silent unless granted to Geometry Dash");
+            }
+        }
+    }
+
     auto sleepInterruptible = [this](int totalMs) {
         int elapsed = 0;
         while (elapsed < totalMs && m_micRunning.load()) {
@@ -289,22 +384,58 @@ void AudioGrabber::micCaptureThreadFunc() {
         kAudioObjectPropertyScopeGlobal,
         kMainElement
     };
+    const AudioObjectPropertyAddress devicesAddr = {
+        kAudioHardwarePropertyDevices,
+        kAudioObjectPropertyScopeGlobal,
+        kMainElement
+    };
     const AudioObjectPropertyAddress aliveAddr = {
         kAudioDevicePropertyDeviceIsAlive,
         kAudioObjectPropertyScopeGlobal,
         kMainElement
     };
 
-    while (m_micRunning.load()) {
+    bool forceDefaultFallback = false;
+    bool fallbackFromSetDevErr = false;
+    std::string loggedFallbackTarget;
+    std::string lastTargetSeen;
+    static std::atomic<bool> s_warnedDigitalSilence{false};
+
+    while (m_micRunning.load() &&
+           m_micStatus.load(std::memory_order_acquire) != MicCaptureStatus::PermissionDenied) {
         std::string targetId = ReplayManager::get()->getSessionConfig().getMicDeviceId();
-        AudioDeviceID devId = resolveTargetInputDevice(targetId);
+        if (targetId != lastTargetSeen) {
+            lastTargetSeen = targetId;
+            forceDefaultFallback = false;
+            fallbackFromSetDevErr = false;
+        }
+
+        bool usingFallback = false;
+        AudioDeviceID devId = resolveTargetInputDevice(targetId, forceDefaultFallback, usingFallback);
         if (devId == kAudioObjectUnknown) {
+            m_micStatus.store(MicCaptureStatus::NoInputDevice, std::memory_order_release);
             sleepInterruptible(1000);
             continue;
         }
 
+        if (usingFallback && loggedFallbackTarget != targetId) {
+            loggedFallbackTarget = targetId;
+            std::string fbName = sanitizeDeviceNameUtf8(getDeviceName(devId));
+            geode::log::warn(
+                "Instant Replay: selected microphone unavailable - falling back to system default '{}'",
+                fbName.empty() ? "Default Input" : fbName);
+            geode::queueInMainThread([fbName]() {
+                std::string msg = "Instant Replay: Mic unavailable - using " +
+                                  (fbName.empty() ? std::string("Default Input") : fbName);
+                geode::Notification::create(msg, geode::NotificationIcon::Warning, 3.0f)->show();
+            });
+        } else if (!usingFallback) {
+            loggedFallbackTarget.clear();
+        }
+
         std::string devUid;
         if (!getDeviceUid(devId, devUid)) {
+            m_micStatus.store(MicCaptureStatus::NoInputDevice, std::memory_order_release);
             sleepInterruptible(1000);
             continue;
         }
@@ -341,14 +472,30 @@ void AudioGrabber::micCaptureThreadFunc() {
 
         bool deviceLost = false;
         bool registeredDefaultListener = false;
+        bool registeredDevicesListener = false;
         bool registeredAliveListener = false;
+        bool reportedDigitalSilence = false;
 
         if (err == noErr && queue) {
-            if (!targetId.empty() && targetId != "default") {
+            bool setDeviceOk = true;
+            if (!usingFallback && !targetId.empty() && targetId != "default") {
                 CFStringRef uidCf = CFStringCreateWithCString(kCFAllocatorDefault, devUid.c_str(), kCFStringEncodingUTF8);
                 if (uidCf) {
-                    AudioQueueSetProperty(queue, kAudioQueueProperty_CurrentDevice, &uidCf, sizeof(uidCf));
+                    OSStatus setDevErr = AudioQueueSetProperty(
+                        queue, kAudioQueueProperty_CurrentDevice, &uidCf, sizeof(uidCf));
                     CFRelease(uidCf);
+                    if (setDevErr != noErr) {
+                        geode::log::warn(
+                            "Instant Replay: AudioQueueSetProperty(CurrentDevice) failed (OSStatus {}), falling back to default mic",
+                            static_cast<int>(setDevErr));
+                        setDeviceOk = false;
+                        forceDefaultFallback = true;
+                        fallbackFromSetDevErr = true;
+                    }
+                } else {
+                    setDeviceOk = false;
+                    forceDefaultFallback = true;
+                    fallbackFromSetDevErr = true;
                 }
             } else {
                 if (AudioObjectAddPropertyListener(
@@ -356,7 +503,15 @@ void AudioGrabber::micCaptureThreadFunc() {
                     registeredDefaultListener = true;
                 }
             }
-            if (AudioObjectAddPropertyListener(
+
+            if (usingFallback) {
+                if (AudioObjectAddPropertyListener(
+                        kAudioObjectSystemObject, &devicesAddr, onAudioObjectPropertyChanged, &qState) == noErr) {
+                    registeredDevicesListener = true;
+                }
+            }
+
+            if (setDeviceOk && AudioObjectAddPropertyListener(
                     devId, &aliveAddr, onAudioObjectPropertyChanged, &qState) == noErr) {
                 registeredAliveListener = true;
             }
@@ -366,8 +521,8 @@ void AudioGrabber::micCaptureThreadFunc() {
             const UInt32 framesPerBuf = std::max<UInt32>(256, static_cast<UInt32>(captureRate / 50));
             const UInt32 bytesPerBuf = framesPerBuf * asbd.mBytesPerFrame;
 
-            bool allocOk = true;
-            for (int i = 0; i < kBufferCount; ++i) {
+            bool allocOk = setDeviceOk;
+            for (int i = 0; allocOk && i < kBufferCount; ++i) {
                 AudioQueueBufferRef buf = nullptr;
                 if (AudioQueueAllocateBuffer(queue, bytesPerBuf, &buf) != noErr || !buf ||
                     AudioQueueEnqueueBuffer(queue, buf, 0, nullptr) != noErr) {
@@ -377,20 +532,63 @@ void AudioGrabber::micCaptureThreadFunc() {
             }
 
             if (allocOk && AudioQueueStart(queue, nullptr) == noErr) {
+                m_micStatus.store(
+                    usingFallback ? MicCaptureStatus::UsingFallbackDevice : MicCaptureStatus::Active,
+                    std::memory_order_release);
                 geode::log::info(
-                    "Instant Replay: CoreAudio mic capture started ({}ch @ {} Hz)",
-                    captureChannels, captureRate);
+                    "Instant Replay: CoreAudio mic capture started ({}ch @ {} Hz{})",
+                    captureChannels, captureRate, usingFallback ? ", fallback default" : "");
 
-                while (m_micRunning.load() && !qState.deviceInvalidated.load(std::memory_order_acquire)) {
+                int pollCount = 0;
+                while (m_micRunning.load() &&
+                       !qState.deviceInvalidated.load(std::memory_order_acquire) &&
+                       m_micStatus.load(std::memory_order_acquire) != MicCaptureStatus::PermissionDenied) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    ++pollCount;
+
+                    if (m_micStatus.load(std::memory_order_acquire) == MicCaptureStatus::PermissionDenied) {
+                        break;
+                    }
+
+                    if (qState.digitalSilenceAlert.load(std::memory_order_acquire) && !reportedDigitalSilence) {
+                        reportedDigitalSilence = true;
+                        m_micStatus.store(MicCaptureStatus::DigitalSilenceDetected, std::memory_order_release);
+                        if (!s_warnedDigitalSilence.exchange(true, std::memory_order_acq_rel)) {
+                            geode::log::warn(
+                                "Instant Replay: microphone captured >3s of pure digital silence (check macOS Microphone TCC permission or hardware mute)");
+                            geode::queueInMainThread([]() {
+                                geode::Notification::create(
+                                    "Instant Replay: Mic audio is silent (check Privacy Settings or mute)",
+                                    geode::NotificationIcon::Warning,
+                                    3.5f
+                                )->show();
+                            });
+                        }
+                    } else if (reportedDigitalSilence && qState.sawNonZeroAudio.load(std::memory_order_relaxed)) {
+                        reportedDigitalSilence = false;
+                        m_micStatus.store(
+                            usingFallback ? MicCaptureStatus::UsingFallbackDevice : MicCaptureStatus::Active,
+                            std::memory_order_release);
+                    }
 
                     std::string latestTarget = ReplayManager::get()->getSessionConfig().getMicDeviceId();
                     if (latestTarget != targetId) {
+                        forceDefaultFallback = false;
+                        fallbackFromSetDevErr = false;
                         break;
                     }
                     if (!isAudioDeviceAlive(devId)) {
                         deviceLost = true;
                         break;
+                    }
+                    bool devListChanged = qState.devicesChanged.exchange(false, std::memory_order_acq_rel);
+                    if (usingFallback && (devListChanged || (!fallbackFromSetDevErr && (pollCount % 20 == 0)))) {
+                        if (isDeviceUidAvailable(targetId)) {
+                            geode::log::info("Instant Replay: preferred microphone reconnected, reattaching");
+                            forceDefaultFallback = false;
+                            fallbackFromSetDevErr = false;
+                            break;
+                        }
                     }
                 }
                 if (qState.deviceInvalidated.load(std::memory_order_acquire)) {
@@ -410,6 +608,10 @@ void AudioGrabber::micCaptureThreadFunc() {
         if (registeredAliveListener) {
             AudioObjectRemovePropertyListener(devId, &aliveAddr, onAudioObjectPropertyChanged, &qState);
         }
+        if (registeredDevicesListener) {
+            AudioObjectRemovePropertyListener(
+                kAudioObjectSystemObject, &devicesAddr, onAudioObjectPropertyChanged, &qState);
+        }
         if (registeredDefaultListener) {
             AudioObjectRemovePropertyListener(
                 kAudioObjectSystemObject, &defaultInAddr, onAudioObjectPropertyChanged, &qState);
@@ -419,6 +621,10 @@ void AudioGrabber::micCaptureThreadFunc() {
             m_micResampler.reset();
             sleepInterruptible(deviceLost ? 500 : 1000);
         }
+    }
+
+    if (m_micStatus.load(std::memory_order_acquire) != MicCaptureStatus::PermissionDenied) {
+        m_micStatus.store(MicCaptureStatus::Idle, std::memory_order_release);
     }
 }
 

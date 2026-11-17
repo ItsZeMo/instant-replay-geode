@@ -35,3 +35,19 @@ jobs:
         with:
           name: instant-replay-macos
           path: ${{ steps.build.outputs.build-output }}
+
+  host-tests-mac:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile and run macOS host integration tests
+        run: |
+          mkdir -p build
+          clang++ -std=c++23 -fobjc-arc -fobjc-arc-exceptions -DGEODE_IS_MACOS -DGL_SILENCE_DEPRECATION \
+            -Isrc -Itests/host/mock_geode \
+            tests/host/test_host_mac.mm src/encoder/VideoToolboxEncoder.mm src/platform/MacVideoCapabilities.mm \
+            -framework Foundation -framework AVFoundation -framework VideoToolbox \
+            -framework CoreMedia -framework CoreVideo -framework CoreAudio \
+            -framework AudioToolbox -framework CoreFoundation -framework OpenGL \
+            -o build/test_host_mac
+          ./build/test_host_mac

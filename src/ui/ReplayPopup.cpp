@@ -716,6 +716,7 @@ void ReplayPopup::setupCodecTab(CCNode* page, CCSize const& winSize, float cente
             cfg.codec = chosen;
             cfg.setCustomCodec("");
             cfg.sanitizeCodecSettings();
+            m_codecBeforeHwOff.reset();
             this->markSettingsDirty(false);
             if (m_customCodecInput) {
                 m_customCodecInput->setString("");
@@ -743,8 +744,26 @@ void ReplayPopup::setupCodecTab(CCNode* page, CCSize const& winSize, float cente
                 return;
             }
             auto& cfg = ReplayConfig::get();
-            cfg.hardwareAcceleration = !curHw;
+            CodecType prevCodec = cfg.codec.load();
+            bool newHw = !curHw;
+            cfg.hardwareAcceleration = newHw;
+            if (!newHw) {
+                if (prevCodec != CodecType::CUSTOM && !ReplayConfig::isPresetCodecSupported(prevCodec, false)) {
+                    m_codecBeforeHwOff = prevCodec;
+                } else {
+                    m_codecBeforeHwOff.reset();
+                }
+            } else if (m_codecBeforeHwOff && ReplayConfig::isPresetCodecSupported(*m_codecBeforeHwOff, true)) {
+                cfg.codec = *m_codecBeforeHwOff;
+                m_codecBeforeHwOff.reset();
+            }
             cfg.sanitizeCodecSettings();
+            CodecType afterCodec = cfg.codec.load();
+            if (afterCodec != prevCodec) {
+                std::string msg = std::string("Hardware accel ") + (newHw ? "on: restored " : "off: switched to ") +
+                                  cfg.getCodecDisplayName();
+                Notification::create(msg, NotificationIcon::Info, 2.0f)->show();
+            }
             this->markSettingsDirty(false);
             this->refreshUI(false);
             this->updateStatusDisplay(0.0f);
@@ -779,6 +798,7 @@ void ReplayPopup::setupCodecTab(CCNode* page, CCSize const& winSize, float cente
             c.codec = ReplayConfig::bestSupportedCodec(c.hardwareAcceleration.load());
             c.sanitizeCodecSettings();
         }
+        m_codecBeforeHwOff.reset();
         this->markSettingsDirty(false);
         this->refreshUI();
         this->updateStatusDisplay(0.0f);
@@ -1294,20 +1314,37 @@ void ReplayPopup::updateStatusDisplay(float dt) {
         }
     }
 
+    bool captureReady = ReplayManager::isCaptureBackendReady();
+
     if (m_statusLabel) {
-        if (mgr->isSaving()) {
+        if (!captureReady) {
+            m_statusLabel->setString("Capture Hook Failed (Check Log)");
+        } else if (mgr->isSaving()) {
             m_statusLabel->setString("Saving Replay...");
         } else if (isStopping) {
             m_statusLabel->setString(mgr->isRestartPending() ? "Stopping (Restart Queued)..." : "Stopping...");
         } else if (isRec) {
-            m_statusLabel->setString("Replay Active (Settings Locked)");
+            if (ReplayConfig::get().recordMic.load()) {
+                auto micSt = AudioGrabber::get()->getMicCaptureStatus();
+                if (micSt == MicCaptureStatus::PermissionDenied) {
+                    m_statusLabel->setString("Replay Active (Mic Permission Denied)");
+                } else if (micSt == MicCaptureStatus::DigitalSilenceDetected) {
+                    m_statusLabel->setString("Replay Active (Mic Silent - Check Privacy)");
+                } else {
+                    m_statusLabel->setString("Replay Active (Settings Locked)");
+                }
+            } else {
+                m_statusLabel->setString("Replay Active (Settings Locked)");
+            }
         } else {
             m_statusLabel->setString("Replay Disabled (Ready to Configure)");
         }
     }
 
     if (m_statusDot) {
-        if (mgr->isSaving()) {
+        if (!captureReady) {
+            m_statusDot->setColor(ccc3(255, 60, 60)); // Red
+        } else if (mgr->isSaving()) {
             m_statusDot->setColor(ccc3(0, 220, 255)); // Cyan
         } else if (isStopping) {
             m_statusDot->setColor(ccc3(255, 185, 50)); // Amber
@@ -1319,7 +1356,10 @@ void ReplayPopup::updateStatusDisplay(float dt) {
     }
 
     if (m_lockWarningBanner) {
-        if (isStopping) {
+        if (!captureReady) {
+            m_lockWarningBanner->setString("(!) Video capture hook failed to load - recording unavailable.");
+            m_lockWarningBanner->setColor(ccc3(255, 85, 85));
+        } else if (isStopping) {
             m_lockWarningBanner->setString("(!) Stopping recording in background...");
             m_lockWarningBanner->setColor(ccc3(255, 185, 50));
         } else if (isRec) {
@@ -1437,24 +1477,55 @@ void ReplayPopup::refreshUI(bool syncTogglers) {
             m_codecConflictLabel->setVisible(true);
         } else {
 #ifdef GEODE_IS_MACOS
+            auto codecDisplayShort = [](CodecType ct) -> const char* {
+                switch (ct) {
+                    case CodecType::AV1:  return "AV1";
+                    case CodecType::HEVC: return "HEVC";
+                    case CodecType::H264:
+                    default:              return "H.264";
+                }
+            };
+
             bool customUnsupported = false;
+            bool customHw = hwAccel;
             if (curCodec == CodecType::CUSTOM) {
                 CodecTargetSpec customSpec = parseCustomCodecSpec(hwAccel, cfg.getCustomCodec());
+                customHw = customSpec.hardware;
                 customUnsupported = !ReplayConfig::isCodecFamilySupported(customSpec.family, customSpec.hardware);
             }
+
             if (customUnsupported) {
-                m_codecConflictLabel->setString("Note: Custom codec unsupported on this Mac (fallback)");
+                CodecType fb = ReplayConfig::bestSupportedCodec(customHw);
+                std::string note = std::string("Note: Custom codec unsupported on this Mac (using ") +
+                                   codecDisplayShort(fb) + ")";
+                m_codecConflictLabel->setString(note.c_str());
                 m_codecConflictLabel->setColor(ccc3(255, 120, 80));
                 m_codecConflictLabel->setVisible(true);
-            } else if (!ReplayConfig::isPresetCodecSupported(CodecType::AV1, hwAccel)) {
-                m_codecConflictLabel->setString(
-                    hwAccel
-                        ? "Note: AV1 HW encode unsupported on this Mac (using HEVC)"
-                        : "Note: VideoToolbox AV1 is unsupported on this Mac");
+            } else if (curCodec != CodecType::CUSTOM && !ReplayConfig::isPresetCodecSupported(curCodec, hwAccel)) {
+                CodecType fb = ReplayConfig::bestSupportedCodec(hwAccel);
+                std::string note = std::string("Note: ") + codecDisplayShort(curCodec) +
+                                   " unsupported on this Mac (using " + codecDisplayShort(fb) + ")";
+                m_codecConflictLabel->setString(note.c_str());
                 m_codecConflictLabel->setColor(ccc3(255, 195, 95));
                 m_codecConflictLabel->setVisible(true);
             } else {
-                m_codecConflictLabel->setVisible(false);
+                int natW = 0, natH = 0;
+                bool clampedOversize = false;
+                if (curRes == ResolutionType::NATIVE && ReplayConfig::getNativeFramebufferSize(natW, natH) &&
+                    (natW > kH264MaxWidth || natH > kH264MaxHeight)) {
+                    bool clampedAny = false;
+                    (void)cfg.getSessionResolutionDimensions(natW, natH, &clampedAny, &clampedOversize);
+                    if (clampedAny && !clampedOversize) {
+                        clampedOversize = true; // H.264 > 4096x2304 native clamp
+                    }
+                }
+                if (clampedOversize) {
+                    m_codecConflictLabel->setString("Note: Native resolution exceeds encoder limit (clamped)");
+                    m_codecConflictLabel->setColor(ccc3(255, 195, 95));
+                    m_codecConflictLabel->setVisible(true);
+                } else {
+                    m_codecConflictLabel->setVisible(false);
+                }
             }
 #else
             m_codecConflictLabel->setVisible(false);

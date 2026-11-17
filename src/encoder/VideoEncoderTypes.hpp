@@ -27,6 +27,7 @@ struct EncoderOpResult {
 #endif
     std::string message;
     bool fatalStorage = false;
+    bool retryable = false;
 
     explicit operator bool() const noexcept { return ok; }
 

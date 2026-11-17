@@ -138,21 +138,30 @@ struct ReplayConfig {
 
     static inline std::atomic<int> s_nativeFrameHeight{1080};
 
+    // Resolves physical OpenGL drawable dimensions across Windows and macOS Retina (backing pixels).
+    // On macOS, getMacOpenGLDrawableSize() already accounts for Retina wantsBestResolutionOpenGLSurface
+    // and falls back to CCEGLView * getDisplayFactor(). Must ONLY be called on main / GL render thread (#18, M4).
+    static bool getNativeFramebufferSize(int& outW, int& outH) noexcept {
+        outW = 0;
+        outH = 0;
+#ifdef GEODE_IS_MACOS
+        getMacOpenGLDrawableSize(outW, outH);
+#endif
+        if (outW < 16 || outH < 16) {
+            if (auto view = cocos2d::CCEGLView::get()) {
+                auto fs = view->getFrameSize();
+                outW = static_cast<int>(fs.width + 0.5f);
+                outH = static_cast<int>(fs.height + 0.5f);
+            }
+        }
+        return outW >= 16 && outH >= 16;
+    }
+
     // Must ONLY be called on the main / OpenGL render thread (#18).
     static void refreshNativeFrameHeight() noexcept {
-#ifdef GEODE_IS_MACOS
         int w = 0, h = 0;
-        getMacOpenGLDrawableSize(w, h);
-        if (h > 0) {
+        if (getNativeFramebufferSize(w, h) && h > 0) {
             s_nativeFrameHeight.store(h, std::memory_order_relaxed);
-            return;
-        }
-#endif
-        if (auto view = cocos2d::CCEGLView::get()) {
-            auto fs = view->getFrameSize();
-            if (fs.height > 0.0f) {
-                s_nativeFrameHeight.store(static_cast<int>(fs.height + 0.5f), std::memory_order_relaxed);
-            }
         }
     }
 
@@ -544,9 +553,16 @@ struct ReplayConfig {
 
     static CodecType bestSupportedCodec(bool hwAccel) noexcept {
 #ifdef GEODE_IS_MACOS
-        if (isPresetCodecSupported(CodecType::AV1, hwAccel))  return CodecType::AV1;
-        if (isPresetCodecSupported(CodecType::HEVC, hwAccel)) return CodecType::HEVC;
-        if (isPresetCodecSupported(CodecType::H264, hwAccel)) return CodecType::H264;
+        if (!hwAccel) {
+            // In CPU software mode prefer H.264 before heavy HEVC software encode (M16).
+            if (isPresetCodecSupported(CodecType::H264, false)) return CodecType::H264;
+            if (isPresetCodecSupported(CodecType::HEVC, false)) return CodecType::HEVC;
+            if (isPresetCodecSupported(CodecType::AV1, false))  return CodecType::AV1;
+            return CodecType::H264;
+        }
+        if (isPresetCodecSupported(CodecType::AV1, true))  return CodecType::AV1;
+        if (isPresetCodecSupported(CodecType::HEVC, true)) return CodecType::HEVC;
+        if (isPresetCodecSupported(CodecType::H264, true)) return CodecType::H264;
         return CodecType::H264;
 #else
         (void)hwAccel;
@@ -732,23 +748,38 @@ struct ReplayConfig {
     }
 
     // Resolves the session output dimensions, clamping requested H.264 sessions to <= 4096x2304
-    // with aspect ratio preserved and even dimensions (so ultrawide 21:9/32:9 presets work with H.264).
+    // (or oversized >4096x2304 Retina displays on macOS to <= 3840x2160 if VideoToolbox rejects them)
+    // with aspect ratio preserved and even dimensions.
     std::pair<int, int> getSessionResolutionDimensions(
         int nativeW,
         int nativeH,
-        bool* outClampedForH264 = nullptr
+        bool* outClamped = nullptr,
+        bool* outClampedOversizeMac = nullptr
     ) const {
-        if (outClampedForH264) *outClampedForH264 = false;
+        if (outClamped) *outClamped = false;
+        if (outClampedOversizeMac) *outClampedOversizeMac = false;
         auto [w, h] = getResolutionDimensions(nativeW, nativeH);
         const CodecTargetSpec spec = resolveRequestedCodecSpec(
             static_cast<int>(codec.load()), hardwareAcceleration.load(), getCustomCodec());
         if (spec.family == VideoCodecFamily::H264) {
             VideoDimensions clamped = clampDimensionsToBounds(w, h, kH264MaxWidth, kH264MaxHeight);
             if (clamped.clamped) {
-                if (outClampedForH264) *outClampedForH264 = true;
+                if (outClamped) *outClamped = true;
                 return {clamped.width, clamped.height};
             }
         }
+#ifdef GEODE_IS_MACOS
+        if (w > kH264MaxWidth || h > kH264MaxHeight) {
+            if (!isMacVideoEncodeSizeSupported(spec.family, spec.hardware, w, h)) {
+                VideoDimensions clamped4k = clampDimensionsToBounds(w, h, 3840, 2160);
+                if (clamped4k.clamped) {
+                    if (outClamped) *outClamped = true;
+                    if (outClampedOversizeMac) *outClampedOversizeMac = true;
+                    return {clamped4k.width, clamped4k.height};
+                }
+            }
+        }
+#endif
         return {w, h};
     }
 

@@ -2,19 +2,22 @@
 
 ## v1.0.5
 - **SDK, Build & Documentation:**
-  - Updated target Geode SDK to `v5.11.2` (Geometry Dash `2.2081`).
-  - Added GitHub Actions Windows x64 build workflow (`.github/workflows/build.yml`).
-  - Updated `AGENTS.md` (main-thread invariant #6, session-fixed resolution, pre-warm, recovery, `262144`-frame ring buffer), `README.md`, and `about.md`.
+  - Updated target Geode SDK to `v5.11.2` (Geometry Dash `2.2081`) and added native Universal macOS (`arm64` + `x86_64`, `11.0+`) support alongside Windows x64 (`build`, `build-mac`, and `host-tests-mac` CI jobs).
+  - Updated `AGENTS.md`, `README.md`, `mod.json`, and `about.md` for dual Windows/macOS architecture and host test instructions.
+  - Replaced remaining narrow `std::filesystem::path::string()` calls with `geode::utils::string::pathToString` for Windows non-ANSI paths, fixed CMake macOS `APPLE` ordering before `project()`, and verified executable PID identity on orphaned `pid_*` cleanup (`O_CLOEXEC` on POSIX).
 
 - **Capture, Audio & Encoding Pipeline:**
+  - Added native macOS GPU capture (`NSOpenGLContext::flushBuffer` via `geode::hook::replaceObjcMethod` with CGL context save/restore and install verification), GPU-flipped IOSurface `CVPixelBuffer` BT.709 color tagging, and context-verified OpenGL resource teardown on exit.
+  - Added Retina pixel-backing resolution handling (`getNativeFramebufferSize`) with cached >4K VideoToolbox session checks, CoreAudio `AudioQueue` microphone capture with macOS TCC permission checking, digital-silence alerting, and automatic default-mic fallback/re-attach.
+  - Added bounded (`<= 10 s`) deferred AAC buffer queues in `VideoToolboxEncoder` for transient `readyForMoreMediaData == NO`, passthrough `mediaTimeScale` (1 MHz), `expectsMediaDataInRealTime` + 10s progress watchdog + 60s `finishWriting` timeouts + RAII reader/writer cleanup, delta output-PTS rebasing preserving AAC priming, per-segment autorelease pools, and `@try/@catch` ObjC exception guards (`-fobjc-arc-exceptions`).
   - Added asynchronous next-segment encoder pre-warming (`m_prepareThread`) at `25 s` of the `30 s` segment cycle (capped at `<= 2` live encoders), sample-accurate boundary audio splitting across continuation segments, and non-blocking `F6` replay saving (segment finalization and concatenation run off the worker thread).
   - Locked capture/encoder resolution for the entire recording session (`FrameGrabber::setTargetResolution`) with aspect-preserving letterbox/pillarbox scaling on window resize, eliminating mid-session resolution splits.
-  - Handled OpenGL context switches (`wglGetCurrentContext`) by recreating PBO/FBO/RBO resources cleanly, and replaced permanent FBO-blit disablement with a 5-second retry cooldown.
-  - Stopped recording immediately on fatal storage errors (`ERROR_DISK_FULL`, `ERROR_ACCESS_DENIED`, `ERROR_WRITE_PROTECT`), attempted one encoder recreation/fallback before stopping on repeated non-storage write failures, and passed `CODECAPI_*` parameters via `IMFAttributes` into `SetInputMediaType` while logging `ICodecAPI` errors and effective rate-control mode.
+  - Handled OpenGL context switches (`wglGetCurrentContext` / `CGLGetCurrentContext`) by recreating PBO/FBO/RBO resources cleanly, and replaced permanent FBO-blit disablement with a 5-second retry cooldown.
+  - Stopped recording immediately on fatal storage errors (`ERROR_DISK_FULL`, `ERROR_ACCESS_DENIED`, `ERROR_WRITE_PROTECT`), tolerated transient retryable backpressure, attempted one encoder recreation/fallback before stopping on repeated non-storage write failures, and passed `CODECAPI_*` parameters via `IMFAttributes` into `SetInputMediaType`.
   - Enlarged the FMOD game audio SPSC ring buffer from `65536` (`~1.36 s`) to `262144` stereo frames (`~5.46 s` at `48 kHz`).
 
 - **UI, Responsiveness & Storage Isolation:**
-  - Moved `Stop Recording` teardown (`m_stopThread` / `"Stopping..."` UI state) and WASAPI microphone device enumeration (`m_micEnumTask`) off the main thread, eliminated `ExportThread` synchronous waiting under lock on back-to-back `F6` presses with explicit user feedback when recording is off or an export is already in flight, and switched folder opening to `geode::utils::file::openFolder` on a background thread.
+  - Added runtime `VTCopyVideoEncoderList` capability probing (`AV1` gated cleanly on M1/M2), preferred `H.264 (SW)` in macOS software mode with HW-toggle codec notifications, cleaned up misleading conflict banners, moved macOS `openFolder` (`NSWorkspace`) onto the main thread, and kept disk checks / teardown asynchronous.
   - Updated `ReplayPopup` action button layout when the Toggle Replay button text changes so buttons re-align cleanly without overlap.
   - Isolated temporary segments into per-process `pid_<PID>` subdirectories protected by exclusive `session.lock` handles, hardened orphaned directory cleanup with non-throwing `directory_iterator` loops, and fixed GPU vendor matching so `"Microsoft Corporation"` never false-matches `"AMF"`.
 
