@@ -76,7 +76,8 @@ void writeEncoderSegment(
     int fps = 30,
     replay::CodecType codec = replay::CodecType::H264,
     bool hardware = true,
-    replay::RateControlMode rc = replay::RateControlMode::ADAPTIVE_VBR
+    replay::RateControlMode rc = replay::RateControlMode::ADAPTIVE_VBR,
+    int gameSampleRate = 48000
 ) {
     replay::VideoToolboxEncoder enc;
     const bool splitAudio = (micAudioDurationSec > 0.0);
@@ -93,7 +94,7 @@ void writeEncoderSegment(
         codec,
         hardware,
         "",
-        48000,
+        gameSampleRate,
         nullptr,
         true
     );
@@ -101,42 +102,58 @@ void writeEncoderSegment(
 
     const int numFrames = std::max(1, static_cast<int>(std::llround(videoDurationSec * fps)));
     const int64_t frameDurHns = 10000000LL / fps;
-    CVPixelBufferRef pb = makeTestPixelBuffer(128, 72, 220, 40, 20, 20, 40, 220);
+    const int totalGameSamples = static_cast<int>(std::llround(gameAudioDurationSec * gameSampleRate));
+    const int totalMicSamples = splitAudio ? static_cast<int>(std::llround(micAudioDurationSec * 48000.0)) : 0;
+    const int gameChunk = std::max(1, gameSampleRate / 20); // 50ms chunks
+    constexpr int micChunk = 2400;                          // 50ms @ 48 kHz
 
-    for (int i = 0; i < numFrames; ++i) {
-        for (int w = 0; w < 200 && enc.isVideoQueueSaturated(16, 256ull * 1024 * 1024); ++w) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    CVPixelBufferRef pb = makeTestPixelBuffer(128, 72, 220, 40, 20, 20, 40, 220);
+    std::vector<float> gamePcm(static_cast<size_t>(gameChunk) * 2, 0.0f);
+    std::vector<float> micPcm(static_cast<size_t>(micChunk) * 2, 0.0f);
+
+    int videoIdx = 0;
+    int gameWritten = 0;
+    int micWritten = 0;
+
+    // Interleave video frames and audio chunks in chronological presentation order matching runtime (N1/Sec 6).
+    while (videoIdx < numFrames || gameWritten < totalGameSamples || micWritten < totalMicSamples) {
+        const int64_t nextV = (videoIdx < numFrames)
+            ? static_cast<int64_t>(videoIdx) * frameDurHns
+            : INT64_MAX;
+        const int64_t nextG = (gameWritten < totalGameSamples)
+            ? (static_cast<int64_t>(gameWritten) * 10000000LL) / gameSampleRate
+            : INT64_MAX;
+        const int64_t nextM = (micWritten < totalMicSamples)
+            ? (static_cast<int64_t>(micWritten) * 10000000LL) / 48000LL
+            : INT64_MAX;
+
+        if (nextV <= nextG && nextV <= nextM && videoIdx < numFrames) {
+            for (int w = 0; w < 200 && enc.isVideoQueueSaturated(16, 256ull * 1024 * 1024); ++w) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            CHECK(enc.writeVideoFrame(pb, 128, 72, nextV).ok);
+            videoIdx++;
+        } else if (nextG <= nextM && gameWritten < totalGameSamples) {
+            int n = std::min(gameChunk, totalGameSamples - gameWritten);
+            for (int s = 0; s < n; ++s) {
+                float v = 0.05f * std::sinf(0.02f * static_cast<float>(gameWritten + s));
+                gamePcm[s * 2 + 0] = v;
+                gamePcm[s * 2 + 1] = v;
+            }
+            CHECK(enc.writeGameAudio(gamePcm.data(), n, 2, gameSampleRate, nextG).ok);
+            gameWritten += n;
+        } else if (micWritten < totalMicSamples) {
+            int n = std::min(micChunk, totalMicSamples - micWritten);
+            for (int s = 0; s < n; ++s) {
+                float v = 0.04f * std::sinf(0.03f * static_cast<float>(micWritten + s));
+                micPcm[s * 2 + 0] = v;
+                micPcm[s * 2 + 1] = v;
+            }
+            CHECK(enc.writeMicAudio(micPcm.data(), n, 2, 48000, nextM).ok);
+            micWritten += n;
         }
-        auto wRes = enc.writeVideoFrame(pb, 128, 72, static_cast<int64_t>(i) * frameDurHns);
-        CHECK(wRes.ok);
     }
     CFRelease(pb);
-
-    auto writePcm = [&](bool isGame, double durSec) {
-        constexpr int chunk = 480;
-        const int totalSamples = static_cast<int>(std::llround(durSec * 48000.0));
-        std::vector<float> pcm(chunk * 2, 0.0f);
-        int written = 0;
-        while (written < totalSamples) {
-            int n = std::min(chunk, totalSamples - written);
-            int64_t tsHns = (static_cast<int64_t>(written) * 10000000LL) / 48000LL;
-            for (int s = 0; s < n; ++s) {
-                float v = 0.05f * std::sinf(0.02f * static_cast<float>(written + s));
-                pcm[s * 2 + 0] = v;
-                pcm[s * 2 + 1] = v;
-            }
-            auto aRes = isGame
-                ? enc.writeGameAudio(pcm.data(), n, 2, 48000, tsHns)
-                : enc.writeMicAudio(pcm.data(), n, 2, 48000, tsHns);
-            CHECK(aRes.ok);
-            written += n;
-        }
-    };
-
-    writePcm(true, gameAudioDurationSec);
-    if (splitAudio) {
-        writePcm(false, micAudioDurationSec);
-    }
 
     CHECK(enc.finish());
     CHECK(std::filesystem::exists(path));
@@ -815,90 +832,438 @@ void test240FpsTimescaleAndBT709() {
     std::cout << "  PASS Test 8 (T-M8 + M18 BT.709)\n";
 }
 
-// T-M10: 10 x 1s segments -> verify AAC continuity across all seams (no overlaps, no >25ms gaps).
+// T-M10: 10 x 1s segments across 44.1 kHz & 48 kHz -> verify single continuous AAC edit with <=1 sample continuity.
 void test10SegmentAacContinuity() {
-    std::cout << "[Test 9 / T-M10] 10 x 1s segment remux AAC continuity...\n" << std::flush;
-    auto testDir = std::filesystem::temp_directory_path() / "InstantReplayMacHostTest_M10";
+    std::cout << "[Test 9 / T-M10] 10 x 1s segment remux AAC continuity (44.1 kHz & 48 kHz)...\n" << std::flush;
+    for (int sampleRate : {44100, 48000}) {
+        auto testDir = std::filesystem::temp_directory_path() / ("InstantReplayMacHostTest_M10_" + std::to_string(sampleRate));
+        std::error_code ec;
+        std::filesystem::remove_all(testDir, ec);
+        std::filesystem::create_directories(testDir, ec);
+
+        std::vector<std::filesystem::path> segs;
+        for (int i = 0; i < 10; ++i) {
+            auto seg = testDir / ("seg_" + std::to_string(i + 1) + ".mp4");
+            writeEncoderSegment(seg, 1.0, 1.0, 0.0, 30, replay::CodecType::H264, true,
+                                replay::RateControlMode::ADAPTIVE_VBR, sampleRate);
+            segs.push_back(seg);
+        }
+
+        auto merged = testDir / "merged_10seg.mp4";
+        auto concatRes = replay::VideoToolboxEncoder::concatenateSegments(segs, merged, 0.0);
+        CHECK(concatRes.success);
+        CHECK(concatRes.durationSeconds >= 9.6 && concatRes.durationSeconds <= 10.5);
+        verifyMp4NoOverlapAndDuration(merged, 1, 9.6, 10.5);
+
+        @autoreleasepool {
+            std::string u8 = geode::utils::string::pathToString(merged);
+            NSURL* url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:u8.c_str()]];
+            AVURLAsset* asset = [AVURLAsset URLAssetWithURL:url options:@{ AVURLAssetPreferPreciseDurationAndTimingKey: @YES }];
+            CHECK(asset != nil);
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+            NSArray<AVAssetTrack*>* tracks = [asset tracks];
+#pragma clang diagnostic pop
+            AVAssetTrack* audioTrack = nil;
+            for (AVAssetTrack* tr in tracks) {
+                if ([tr.mediaType isEqualToString:AVMediaTypeAudio]) {
+                    audioTrack = tr;
+                    break;
+                }
+            }
+            CHECK(audioTrack != nil);
+            CHECK(audioTrack.segments.count == 1);
+            CHECK(!audioTrack.segments[0].empty);
+            CHECK(audioTrack.segments.count == 1);
+            CHECK(!audioTrack.segments[0].empty);
+
+            NSError* rErr = nil;
+            AVAssetReader* reader = [AVAssetReader assetReaderWithAsset:asset error:&rErr];
+            CHECK(reader != nil && rErr == nil);
+            AVAssetReaderTrackOutput* out = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:audioTrack outputSettings:nil];
+            out.alwaysCopiesSampleData = NO;
+            [reader addOutput:out];
+            CHECK([reader startReading]);
+
+            // Tighter than 1 sample: 1 sample @ 44.1 kHz ~= 22.68 us (allow 25 us with integer us rounding).
+            const int64_t oneSampleUs = static_cast<int64_t>(std::ceil(1000000.0 / sampleRate)) + 2;
+            int64_t prevPtsUs = -1;
+            int64_t prevEndUs = -1;
+            int64_t totalDurUs = 0;
+            int pktCount = 0;
+            int sampleCountSum = 0;
+            while (CMSampleBufferRef s = [out copyNextSampleBuffer]) {
+                CMItemCount numSamples = CMSampleBufferGetNumSamples(s);
+                if (numSamples > 0 && CMSampleBufferGetDataBuffer(s)) {
+                    int64_t ptsUs = llround(CMTimeGetSeconds(CMSampleBufferGetOutputPresentationTimeStamp(s)) * 1e6);
+                    int64_t durUs = llround(CMTimeGetSeconds(CMSampleBufferGetOutputDuration(s)) * 1e6);
+                    if (prevPtsUs >= 0) CHECK(ptsUs > prevPtsUs);
+                    if (prevEndUs >= 0) {
+                        if (ptsUs + oneSampleUs < prevEndUs || ptsUs - prevEndUs > oneSampleUs) {
+                            std::cerr << "  AAC discontinuity (" << sampleRate << "Hz) at pkt " << pktCount
+                                      << ": ptsUs=" << ptsUs << ", prevEndUs=" << prevEndUs << "\n";
+                        }
+                        CHECK(ptsUs + oneSampleUs >= prevEndUs); // overlap <= 1 sample
+                        CHECK(ptsUs - prevEndUs <= oneSampleUs); // gap <= 1 sample
+                    }
+                    prevPtsUs = ptsUs;
+                    prevEndUs = std::max(prevEndUs, ptsUs + durUs);
+                    totalDurUs += durUs;
+                    pktCount++;
+                    sampleCountSum += static_cast<int>(numSamples);
+                }
+                CFRelease(s);
+            }
+            std::cout << "  T-M10 (" << sampleRate << " Hz) AAC stats: buffers=" << pktCount
+                      << ", totalSamples=" << sampleCountSum
+                      << ", totalDurUs=" << totalDurUs << "\n";
+            CHECK(sampleCountSum > 400);
+            CHECK(totalDurUs >= 9600000LL);
+            CHECK(reader.status == AVAssetReaderStatusCompleted);
+        }
+
+        std::filesystem::remove_all(testDir, ec);
+    }
+    std::cout << "  PASS Test 9 (T-M10)\n";
+}
+
+// Helper for T-N1 matching Appendix A: extracts decoded LPCM beep onsets and BGRA white-flash onsets via AVFoundation.
+void measureMarkerOnsets(
+    NSURL* url,
+    int audioTrackIdx,
+    std::vector<double>& aOn,
+    std::vector<double>& vOn,
+    bool& audioStartsWithEmptyEdit,
+    NSUInteger& audioSegmentCount
+) {
+    AVURLAsset* asset = [AVURLAsset URLAssetWithURL:url options:@{AVURLAssetPreferPreciseDurationAndTimingKey: @YES}];
+    CHECK(asset != nil);
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    NSArray<AVAssetTrack*>* audioTracks = [asset tracksWithMediaType:AVMediaTypeAudio];
+    NSArray<AVAssetTrack*>* videoTracks = [asset tracksWithMediaType:AVMediaTypeVideo];
+#pragma clang diagnostic pop
+    CHECK(audioTrackIdx < static_cast<int>(audioTracks.count));
+    CHECK(videoTracks.count > 0);
+    AVAssetTrack* at = audioTracks[audioTrackIdx];
+    AVAssetTrack* vt = videoTracks[0];
+
+    audioSegmentCount = at.segments.count;
+    audioStartsWithEmptyEdit = at.segments.count > 0 && at.segments[0].empty;
+    CHECK(vt.segments.count == 1 && !vt.segments[0].empty);
+    CHECK(CMTimeCompare(vt.segments[0].timeMapping.target.start, kCMTimeZero) == 0);
+
+    AVAssetReader* ar = [AVAssetReader assetReaderWithAsset:asset error:nil];
+    CHECK(ar != nil);
+    AVAssetReaderTrackOutput* ao = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:at outputSettings:@{
+        AVFormatIDKey: @(kAudioFormatLinearPCM),
+        AVLinearPCMBitDepthKey: @32,
+        AVLinearPCMIsFloatKey: @YES,
+        AVLinearPCMIsNonInterleaved: @NO,
+        AVLinearPCMIsBigEndianKey: @NO,
+        AVNumberOfChannelsKey: @1
+    }];
+    [ar addOutput:ao];
+    CHECK([ar startReading]);
+    double lastHi = -10.0;
+    while (CMSampleBufferRef sb = [ao copyNextSampleBuffer]) {
+        CMFormatDescriptionRef fmt = CMSampleBufferGetFormatDescription(sb);
+        const AudioStreamBasicDescription* asbd = fmt ? CMAudioFormatDescriptionGetStreamBasicDescription(fmt) : nullptr;
+        CMBlockBufferRef bb = CMSampleBufferGetDataBuffer(sb);
+        if (asbd && asbd->mSampleRate > 0.0 && bb) {
+            double rate = asbd->mSampleRate;
+            double t0 = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sb));
+            std::vector<float> pcm(CMBlockBufferGetDataLength(bb) / sizeof(float));
+            CMBlockBufferCopyDataBytes(bb, 0, pcm.size() * sizeof(float), pcm.data());
+            for (size_t i = 0; i < pcm.size(); ++i) {
+                if (std::fabs(pcm[i]) > 0.2f) {
+                    double t = t0 + static_cast<double>(i) / rate;
+                    if (t - lastHi > 1.0) aOn.push_back(t);
+                    lastHi = t;
+                }
+            }
+        }
+        CFRelease(sb);
+    }
+
+    AVAssetReader* vr = [AVAssetReader assetReaderWithAsset:asset error:nil];
+    CHECK(vr != nil);
+    AVAssetReaderTrackOutput* vo = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:vt outputSettings:@{
+        (__bridge NSString*)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA)
+    }];
+    [vr addOutput:vo];
+    CHECK([vr startReading]);
+    bool prevHi = false;
+    while (CMSampleBufferRef sb = [vo copyNextSampleBuffer]) {
+        CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sb);
+        if (pb) {
+            CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+            auto* base = static_cast<uint8_t*>(CVPixelBufferGetBaseAddress(pb));
+            bool hi = base[(CVPixelBufferGetHeight(pb) / 2) * CVPixelBufferGetBytesPerRow(pb) + 4 * 10 + 1] > 128;
+            CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+            if (hi && !prevHi) {
+                vOn.push_back(CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sb)));
+            }
+            prevHi = hi;
+        }
+        CFRelease(sb);
+    }
+}
+
+void writeMarkerSegment(
+    const std::filesystem::path& path,
+    int gameSampleRate,
+    double markerTimeSec,
+    replay::CodecType codec
+) {
+    constexpr int kFps = 60;
+    constexpr double kSegDur = 5.0;
+    constexpr int kNumFrames = 300;
+    const int64_t frameDurHns = 10000000LL / kFps;
+    const int markerFrameStart = static_cast<int>(std::llround(markerTimeSec * kFps));
+    const int gameSamplesTotal = static_cast<int>(std::llround(kSegDur * gameSampleRate));
+    constexpr int micSamplesTotal = 240000; // 5.0s @ 48 kHz
+
+    replay::VideoToolboxEncoder enc;
+    auto startRes = enc.start(
+        path, 128, 72, kFps, 8, 12, 80, replay::RateControlMode::ADAPTIVE_VBR,
+        true, codec, true, "", gameSampleRate, nullptr, true);
+    CHECK(startRes.ok);
+
+    CVPixelBufferRef darkPb = makeTestPixelBuffer(128, 72, 10, 10, 10, 10, 10, 10);
+    CVPixelBufferRef brightPb = makeTestPixelBuffer(128, 72, 240, 240, 240, 240, 240, 240);
+
+    const int gameChunk = std::max(1, gameSampleRate / 20);
+    constexpr int micChunk = 2400;
+    std::vector<float> gamePcm(static_cast<size_t>(gameChunk) * 2, 0.0f);
+    std::vector<float> micPcm(static_cast<size_t>(micChunk) * 2, 0.0f);
+
+    int videoIdx = 0;
+    int gameWritten = 0;
+    int micWritten = 0;
+
+    while (videoIdx < kNumFrames || gameWritten < gameSamplesTotal || micWritten < micSamplesTotal) {
+        const int64_t nextV = (videoIdx < kNumFrames) ? (static_cast<int64_t>(videoIdx) * frameDurHns) : INT64_MAX;
+        const int64_t nextG = (gameWritten < gameSamplesTotal) ? ((static_cast<int64_t>(gameWritten) * 10000000LL) / gameSampleRate) : INT64_MAX;
+        const int64_t nextM = (micWritten < micSamplesTotal) ? ((static_cast<int64_t>(micWritten) * 10000000LL) / 48000LL) : INT64_MAX;
+
+        if (nextV <= nextG && nextV <= nextM && videoIdx < kNumFrames) {
+            for (int w = 0; w < 200 && enc.isVideoQueueSaturated(16, 256ull * 1024 * 1024); ++w) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            CVPixelBufferRef pb = (videoIdx >= markerFrameStart && videoIdx < markerFrameStart + 3) ? brightPb : darkPb;
+            CHECK(enc.writeVideoFrame(pb, 128, 72, nextV).ok);
+            videoIdx++;
+        } else if (nextG <= nextM && gameWritten < gameSamplesTotal) {
+            int n = std::min(gameChunk, gameSamplesTotal - gameWritten);
+            int mStart = static_cast<int>(std::llround(markerTimeSec * gameSampleRate));
+            int mEnd = mStart + (gameSampleRate / 20); // 50ms beep
+            for (int s = 0; s < n; ++s) {
+                int idx = gameWritten + s;
+                float v = (idx >= mStart && idx < mEnd)
+                    ? (0.5f * std::sinf(2.0f * static_cast<float>(M_PI) * 1000.0f * static_cast<float>(idx) / static_cast<float>(gameSampleRate)))
+                    : 0.0f;
+                gamePcm[s * 2 + 0] = v;
+                gamePcm[s * 2 + 1] = v;
+            }
+            CHECK(enc.writeGameAudio(gamePcm.data(), n, 2, gameSampleRate, nextG).ok);
+            gameWritten += n;
+        } else if (micWritten < micSamplesTotal) {
+            int n = std::min(micChunk, micSamplesTotal - micWritten);
+            int mStart = static_cast<int>(std::llround(markerTimeSec * 48000.0));
+            int mEnd = mStart + 2400; // 50ms beep
+            for (int s = 0; s < n; ++s) {
+                int idx = micWritten + s;
+                float v = (idx >= mStart && idx < mEnd)
+                    ? (0.5f * std::sinf(2.0f * static_cast<float>(M_PI) * 1000.0f * static_cast<float>(idx) / 48000.0f))
+                    : 0.0f;
+                micPcm[s * 2 + 0] = v;
+                micPcm[s * 2 + 1] = v;
+            }
+            CHECK(enc.writeMicAudio(micPcm.data(), n, 2, 48000, nextM).ok);
+            micWritten += n;
+        }
+    }
+
+    CFRelease(darkPb);
+    CFRelease(brightPb);
+    CHECK(enc.finish());
+}
+
+// T-N1: 4 x 5s segments with flashed visual + beep markers at 2, 7, 12, 17s for 44.1 kHz H.264 & 48 kHz HEVC.
+void testAudioVideoMarkersContinuousSync() {
+    std::cout << "[Test 10 / T-N1] 4 x 5s A/V marker sync (|A-V| <= 1ms, no EMPTY edit, 1 A/V segment)...\n" << std::flush;
+    struct Case { int rate; replay::CodecType codec; const char* name; };
+    for (const auto& c : {
+             Case{44100, replay::CodecType::H264, "H264@44.1kHz"},
+             Case{48000, replay::CodecType::HEVC, "HEVC@48kHz"},
+         }) {
+        auto testDir = std::filesystem::temp_directory_path() / ("InstantReplayMacHostTest_N1_" + std::string(c.name));
+        std::error_code ec;
+        std::filesystem::remove_all(testDir, ec);
+        std::filesystem::create_directories(testDir, ec);
+
+        std::vector<std::filesystem::path> segs;
+        for (int i = 0; i < 4; ++i) {
+            auto seg = testDir / ("seg_" + std::to_string(i + 1) + ".mp4");
+            writeMarkerSegment(seg, c.rate, 2.0, c.codec);
+            segs.push_back(seg);
+        }
+
+        auto merged = testDir / "merged_markers.mp4";
+        auto concatRes = replay::VideoToolboxEncoder::concatenateSegments(segs, merged, 0.0);
+        CHECK(concatRes.success);
+
+        @autoreleasepool {
+            std::string u8 = geode::utils::string::pathToString(merged);
+            NSURL* url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:u8.c_str()]];
+            for (int audioIdx : {0, 1}) {
+                std::vector<double> aOn, vOn;
+                bool emptyEdit = true;
+                NSUInteger segCount = 0;
+                measureMarkerOnsets(url, audioIdx, aOn, vOn, emptyEdit, segCount);
+                CHECK(!emptyEdit);
+                CHECK(segCount == 1);
+                CHECK(aOn.size() == 4 && vOn.size() == 4);
+                double maxAbsErrMs = 0.0;
+                for (size_t i = 0; i < 4; ++i) {
+                    double diffMs = (aOn[i] - vOn[i]) * 1000.0;
+                    maxAbsErrMs = std::max(maxAbsErrMs, std::fabs(diffMs));
+                    if (std::fabs(diffMs) > 1.0) {
+                        std::cerr << "  FAIL T-N1 (" << c.name << " track " << audioIdx << ") mark " << i
+                                  << ": A=" << aOn[i] << " V=" << vOn[i] << " diff=" << diffMs << "ms\n";
+                    }
+                    CHECK(std::fabs(diffMs) <= 1.0);
+                }
+                std::cout << "  T-N1 (" << c.name << " track " << audioIdx << "): max|A-V|="
+                          << maxAbsErrMs << "ms, segments=" << segCount << "\n";
+            }
+        }
+        std::filesystem::remove_all(testDir, ec);
+    }
+    std::cout << "  PASS Test 10 (T-N1)\n";
+}
+
+// T-N1b: Continuous 1 kHz sine @ 44.1 kHz across 4 segments (3 seams) -> zero clicks/holes on AVAssetReader LPCM decode.
+void testContinuousSineWaveSeamContinuity() {
+    std::cout << "[Test 11 / T-N1b] Continuous 1 kHz sine @ 44.1 kHz across 3 seams (no clicks/holes)...\n" << std::flush;
+    auto testDir = std::filesystem::temp_directory_path() / "InstantReplayMacHostTest_N1b";
     std::error_code ec;
     std::filesystem::remove_all(testDir, ec);
     std::filesystem::create_directories(testDir, ec);
 
+    constexpr int kRate = 44100;
+    constexpr int kFps = 60;
+    constexpr int kFramesPerSeg = 300;
+    constexpr int64_t frameDurHns = 10000000LL / kFps;
+    constexpr int kSamplesPerSeg = kRate * 5;
+    constexpr int kChunk = 2205; // 50ms @ 44.1 kHz
+    constexpr int kNumSegs = 4;
+
+    int64_t globalAudioSample = 0;
     std::vector<std::filesystem::path> segs;
-    for (int i = 0; i < 10; ++i) {
-        auto seg = testDir / ("seg_" + std::to_string(i + 1) + ".mp4");
-        writeEncoderSegment(seg, 1.0, 1.0, 0.0, 30, replay::CodecType::H264, true);
+    CVPixelBufferRef pb = makeTestPixelBuffer(128, 72, 40, 120, 200, 40, 120, 200);
+    std::vector<float> pcm(kChunk * 2);
+
+    for (int segIdx = 0; segIdx < kNumSegs; ++segIdx) {
+        auto seg = testDir / ("seg_" + std::to_string(segIdx + 1) + ".mp4");
+        replay::VideoToolboxEncoder enc;
+        CHECK(enc.start(seg, 128, 72, kFps, 8, 12, 80, replay::RateControlMode::ADAPTIVE_VBR,
+                        false, replay::CodecType::H264, true, "", kRate, nullptr, true).ok);
+
+        int vIdx = 0;
+        int aWritten = 0;
+        while (vIdx < kFramesPerSeg || aWritten < kSamplesPerSeg) {
+            int64_t nextV = (vIdx < kFramesPerSeg) ? (static_cast<int64_t>(vIdx) * frameDurHns) : INT64_MAX;
+            int64_t nextA = (aWritten < kSamplesPerSeg) ? ((static_cast<int64_t>(aWritten) * 10000000LL) / kRate) : INT64_MAX;
+            if (nextV <= nextA && vIdx < kFramesPerSeg) {
+                for (int w = 0; w < 200 && enc.isVideoQueueSaturated(16, 256ull << 20); ++w) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+                CHECK(enc.writeVideoFrame(pb, 128, 72, nextV).ok);
+                vIdx++;
+            } else if (aWritten < kSamplesPerSeg) {
+                int n = std::min(kChunk, kSamplesPerSeg - aWritten);
+                for (int s = 0; s < n; ++s) {
+                    float v = 0.25f * std::sinf(2.0f * static_cast<float>(M_PI) * 1000.0f *
+                                                static_cast<float>(globalAudioSample + s) / static_cast<float>(kRate));
+                    pcm[s * 2 + 0] = v;
+                    pcm[s * 2 + 1] = v;
+                }
+                CHECK(enc.writeGameAudio(pcm.data(), n, 2, kRate, nextA).ok);
+                aWritten += n;
+                globalAudioSample += n;
+            }
+        }
+        CHECK(enc.finish());
         segs.push_back(seg);
     }
+    CFRelease(pb);
 
-    auto merged = testDir / "merged_10seg.mp4";
+    auto merged = testDir / "merged_sine.mp4";
     auto concatRes = replay::VideoToolboxEncoder::concatenateSegments(segs, merged, 0.0);
     CHECK(concatRes.success);
-    CHECK(concatRes.durationSeconds >= 9.6 && concatRes.durationSeconds <= 10.5);
-    verifyMp4NoOverlapAndDuration(merged, 1, 9.6, 10.5);
 
     @autoreleasepool {
         std::string u8 = geode::utils::string::pathToString(merged);
         NSURL* url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:u8.c_str()]];
-        AVURLAsset* asset = [AVURLAsset URLAssetWithURL:url options:@{ AVURLAssetPreferPreciseDurationAndTimingKey: @YES }];
+        AVURLAsset* asset = [AVURLAsset URLAssetWithURL:url options:@{AVURLAssetPreferPreciseDurationAndTimingKey: @YES}];
         CHECK(asset != nil);
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-        NSArray<AVAssetTrack*>* tracks = [asset tracks];
+        AVAssetTrack* at = [asset tracksWithMediaType:AVMediaTypeAudio][0];
 #pragma clang diagnostic pop
-        AVAssetTrack* audioTrack = nil;
-        for (AVAssetTrack* tr in tracks) {
-            if ([tr.mediaType isEqualToString:AVMediaTypeAudio]) {
-                audioTrack = tr;
-                break;
+        CHECK(at.segments.count == 1 && !at.segments[0].empty);
+
+        AVAssetReader* ar = [AVAssetReader assetReaderWithAsset:asset error:nil];
+        AVAssetReaderTrackOutput* ao = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:at outputSettings:@{
+            AVFormatIDKey: @(kAudioFormatLinearPCM),
+            AVLinearPCMBitDepthKey: @32,
+            AVLinearPCMIsFloatKey: @YES,
+            AVLinearPCMIsNonInterleaved: @NO,
+            AVLinearPCMIsBigEndianKey: @NO,
+            AVNumberOfChannelsKey: @1
+        }];
+        [ar addOutput:ao];
+        CHECK([ar startReading]);
+
+        std::vector<float> decoded;
+        decoded.reserve(static_cast<size_t>(globalAudioSample) + 2048);
+        while (CMSampleBufferRef sb = [ao copyNextSampleBuffer]) {
+            if (CMBlockBufferRef bb = CMSampleBufferGetDataBuffer(sb)) {
+                size_t bytes = CMBlockBufferGetDataLength(bb);
+                size_t oldSz = decoded.size();
+                decoded.resize(oldSz + bytes / sizeof(float));
+                CMBlockBufferCopyDataBytes(bb, 0, bytes, decoded.data() + oldSz);
+            }
+            CFRelease(sb);
+        }
+        CHECK(ar.status == AVAssetReaderStatusCompleted);
+
+        const int64_t expectedTotal = globalAudioSample;
+        const int64_t countDiff = std::llabs(static_cast<int64_t>(decoded.size()) - expectedTotal);
+        CHECK(countDiff <= 1024);
+
+        const double omega = 2.0 * M_PI * 1000.0 / static_cast<double>(kRate);
+        const double theoreticalMaxD2 = 0.25 * 4.0 * std::sin(omega / 2.0) * std::sin(omega / 2.0);
+        double maxAbsD2 = 0.0;
+        size_t maxIdx = 0;
+        // Skip first 64 startup samples (AAC priming edge) and inspect entire 20s interior including all 3 joins.
+        for (size_t i = 64; i + 64 < decoded.size(); ++i) {
+            double d2 = std::fabs(static_cast<double>(decoded[i]) - 2.0 * decoded[i - 1] + decoded[i - 2]);
+            if (d2 > maxAbsD2) {
+                maxAbsD2 = d2;
+                maxIdx = i;
             }
         }
-        CHECK(audioTrack != nil);
-
-        NSError* rErr = nil;
-        AVAssetReader* reader = [AVAssetReader assetReaderWithAsset:asset error:&rErr];
-        CHECK(reader != nil && rErr == nil);
-        AVAssetReaderTrackOutput* out = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:audioTrack outputSettings:nil];
-        out.alwaysCopiesSampleData = NO;
-        [reader addOutput:out];
-        CHECK([reader startReading]);
-
-        int64_t prevPtsUs = -1;
-        int64_t prevEndUs = -1;
-        int64_t totalDurUs = 0;
-        int pktCount = 0;
-        int sampleCountSum = 0;
-        while (CMSampleBufferRef s = [out copyNextSampleBuffer]) {
-            CMItemCount numSamples = CMSampleBufferGetNumSamples(s);
-            if (numSamples > 0 && CMSampleBufferGetDataBuffer(s)) {
-                int64_t ptsUs = llround(CMTimeGetSeconds(CMSampleBufferGetOutputPresentationTimeStamp(s)) * 1e6);
-                int64_t durUs = llround(CMTimeGetSeconds(CMSampleBufferGetOutputDuration(s)) * 1e6);
-                if (prevPtsUs >= 0) CHECK(ptsUs > prevPtsUs);
-                if (prevEndUs >= 0) {
-                    if (ptsUs + 1500 < prevEndUs || ptsUs - prevEndUs > 25000) {
-                        std::cerr << "  AAC discontinuity at pkt " << pktCount << ": ptsUs=" << ptsUs
-                                  << ", prevEndUs=" << prevEndUs << ", durUs=" << durUs << "\n";
-                    }
-                    CHECK(ptsUs + 1500 >= prevEndUs);  // no overlap
-                    CHECK(ptsUs - prevEndUs <= 25000); // no >25ms dropped AAC frame gap across seams
-                }
-                prevPtsUs = ptsUs;
-                prevEndUs = std::max(prevEndUs, ptsUs + durUs);
-                totalDurUs += durUs;
-                pktCount++;
-                sampleCountSum += static_cast<int>(numSamples);
-            }
-            CFRelease(s);
-        }
-        std::cout << "  T-M10 AAC stats: buffers=" << pktCount
-                  << ", totalSamples=" << sampleCountSum
-                  << ", totalDurUs=" << totalDurUs << "\n";
-        CHECK(sampleCountSum > 400);
-        CHECK(totalDurUs >= 9600000LL);
-        CHECK(reader.status == AVAssetReaderStatusCompleted);
+        std::cout << "  T-N1b decodedSamples=" << decoded.size() << " (expected=" << expectedTotal
+                  << "), max|D2|=" << maxAbsD2 << " at idx=" << maxIdx
+                  << " (4x theoretical=" << (4.0 * theoreticalMaxD2) << ")\n";
+        CHECK(maxAbsD2 <= 4.0 * theoreticalMaxD2);
     }
 
     std::filesystem::remove_all(testDir, ec);
-    std::cout << "  PASS Test 9 (T-M10)\n";
+    std::cout << "  PASS Test 11 (T-N1b)\n";
 }
 
 } // namespace
@@ -914,6 +1279,8 @@ int main() {
         testLongAudioBurstNoBackpressureError();
         test240FpsTimescaleAndBT709();
         test10SegmentAacContinuity();
+        testAudioVideoMarkersContinuousSync();
+        testContinuousSineWaveSeamContinuity();
     }
     std::cout << "ALL MACOS HOST TESTS PASSED!\n";
     return 0;

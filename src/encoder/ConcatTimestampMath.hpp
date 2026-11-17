@@ -13,7 +13,8 @@ struct ConcatTimestampState {
     int64_t segMaxVideoPts = -1;
     int64_t segMaxVideoEnd = 0;
     int64_t segLastVideoFrameDurHns = 0;
-    int64_t lastVideoDts = -1;
+    int64_t lastVideoDts = 0;
+    bool hasLastVideoDts = false;
     std::map<uint32_t, int64_t> lastAudioEndByWriterStream;
     std::map<uint32_t, int64_t> segAudioEndByWriterStream;
 
@@ -32,17 +33,29 @@ struct ConcatTimestampState {
         return std::max<int64_t>(0, srcPts - segCut + outputBase);
     }
 
-    // Recomputes video DTS monotonically. Windows MF requires PTS >= DTS (clampPtsToDts = true);
-    // macOS VideoToolbox uses signed ctts offsets where B-frames may have PTS < DTS (clampPtsToDts = false).
-    void adjustVideoTimestamps(int64_t rawDts, int64_t segCut, int64_t& inOutPts, int64_t& outNewDts, bool clampPtsToDts = true) noexcept {
-        int64_t newDts = std::max<int64_t>(0, rawDts - segCut + outputBase);
-        if (lastVideoDts >= 0 && newDts <= lastVideoDts) {
+    // Recomputes video DTS monotonically. Windows MF requires non-negative DTS and PTS >= DTS
+    // (clampPtsToDts = true, allowNegativeDts = false); macOS AVAssetWriter preserves negative B-frame
+    // decode lead directly without shifting movie start_time (allowNegativeDts = true, clampPtsToDts = false).
+    void adjustVideoTimestamps(
+        int64_t rawDts,
+        int64_t segCut,
+        int64_t& inOutPts,
+        int64_t& outNewDts,
+        bool clampPtsToDts = true,
+        bool allowNegativeDts = false
+    ) noexcept {
+        int64_t newDts = rawDts - segCut + outputBase;
+        if (!allowNegativeDts && newDts < 0) {
+            newDts = 0;
+        }
+        if (hasLastVideoDts && newDts <= lastVideoDts) {
             newDts = lastVideoDts + 1000LL;
         }
         if (clampPtsToDts && inOutPts < newDts) {
             inOutPts = newDts;
         }
         lastVideoDts = newDts;
+        hasLastVideoDts = true;
         outNewDts = newDts;
     }
 

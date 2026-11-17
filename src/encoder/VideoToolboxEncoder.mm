@@ -1321,6 +1321,60 @@ bool sampleIsSync(CMSampleBufferRef sample) {
     return true;
 }
 
+bool appendPcmChunkToAudioInput(
+    AVAssetWriter* writer,
+    AVAssetWriterInput* input,
+    CMFormatDescriptionRef pcmFmt,
+    const float* pcmInterleavedStereo,
+    int numFrames,
+    int sampleRate,
+    int64_t ptsSampleIndex,
+    std::string& outFailMsg
+) {
+    if (!writer || !input || !pcmFmt || !pcmInterleavedStereo || numFrames <= 0 || sampleRate <= 0) {
+        outFailMsg = "invalid PCM chunk parameters";
+        return false;
+    }
+
+    const size_t byteSize = static_cast<size_t>(numFrames) * 2 * sizeof(float);
+    CMBlockBufferRef blockBuf = nullptr;
+    OSStatus err = CMBlockBufferCreateWithMemoryBlock(
+        kCFAllocatorDefault, nullptr, byteSize, kCFAllocatorDefault, nullptr, 0, byteSize, 0, &blockBuf);
+    if (err != noErr || !blockBuf) {
+        outFailMsg = buildAudioEncoderError(err, "CMBlockBufferCreateWithMemoryBlock");
+        return false;
+    }
+    err = CMBlockBufferAssureBlockMemory(blockBuf);
+    if (err == noErr) {
+        err = CMBlockBufferReplaceDataBytes(pcmInterleavedStereo, blockBuf, 0, byteSize);
+    }
+    if (err != noErr) {
+        CFRelease(blockBuf);
+        outFailMsg = buildAudioEncoderError(err, "CMBlockBufferReplaceDataBytes");
+        return false;
+    }
+
+    CMTime pts = CMTimeMake(ptsSampleIndex, static_cast<CMTimeScale>(sampleRate));
+    CMSampleBufferRef sampleBuf = nullptr;
+    err = CMAudioSampleBufferCreateReadyWithPacketDescriptions(
+        kCFAllocatorDefault, blockBuf, pcmFmt, numFrames, pts, nullptr, &sampleBuf);
+    CFRelease(blockBuf);
+    if (err != noErr || !sampleBuf) {
+        outFailMsg = buildAudioEncoderError(err, "CMAudioSampleBufferCreateReadyWithPacketDescriptions");
+        return false;
+    }
+
+    bool ok = (writer.status == AVAssetWriterStatusWriting && [input appendSampleBuffer:sampleBuf]);
+    CFRelease(sampleBuf);
+    if (!ok) {
+        int64_t c = 0; bool f = false; bool p = false; std::string m;
+        classifyNSError(writer.error, c, f, p, m);
+        outFailMsg = m.empty() ? "failed writing re-encoded AAC sample" : m;
+        return false;
+    }
+    return true;
+}
+
 ConcatResult concatenateImpl(
     const std::vector<std::filesystem::path>& segmentPaths,
     const std::filesystem::path& finalOutputPath,
@@ -1374,11 +1428,28 @@ ConcatResult concatenateImpl(
         struct TrackLayout {
             NSString* mediaType = nil;
             bool isVideo = false;
-            CMFormatDescriptionRef formatDesc = nullptr;
             AVAssetWriterInput* writerInput = nil;
             bool markedFinished = false;
+            // Audio transcoding state (N1: decode LPCM -> single continuous AAC stream with 1 edit).
+            int sampleRate = 48000;
+            int64_t totalOutputSamples = 0;
+            int64_t skipLeadingSamples = 0;
+            int64_t pendingPadSamples = 0;
+            NSDictionary* pcmReadSettings = nil;
+            CMFormatDescriptionRef pcmFmt = nullptr;
         };
-        std::vector<TrackLayout> layout;
+        struct LayoutGuard {
+            std::vector<TrackLayout> tracks;
+            ~LayoutGuard() {
+                for (auto& tr : tracks) {
+                    if (tr.pcmFmt) {
+                        CFRelease(tr.pcmFmt);
+                        tr.pcmFmt = nullptr;
+                    }
+                }
+            }
+        } layoutGuard;
+        std::vector<TrackLayout>& layout = layoutGuard.tracks;
         int64_t videoFrameDurationHns = 0;
 
         NSError* writerErr = nil;
@@ -1392,11 +1463,11 @@ ConcatResult concatenateImpl(
         RemuxGuard remuxGuard;
         remuxGuard.writer = writer;
 
-        // 1 & 2. Inspect first segment inside an inner autorelease pool (M9) for track layout,
-        // initial B-frame DTS lead, and trim keyframe target.
+        // 1 & 2. Inspect first segment inside an inner autorelease pool (M9) for track layout
+        // and trim keyframe target. AVAssetWriter natively accepts negative B-frame decode lead
+        // on segment 0 (creating an internal video elst without shifting movie start_time > 0), so
+        // audio & video both begin cleanly at 0.000s with zero empty audio edits (N1).
         int64_t cutHns = 0;
-        bool hasFirstVideoDts = false;
-        int64_t firstVideoDts = 0;
 
         {
             @autoreleasepool {
@@ -1406,39 +1477,116 @@ ConcatResult concatenateImpl(
                 NSArray<AVAssetTrack*>* firstTracks = loadAssetTracksSync(firstAsset);
                 if (firstTracks.count == 0) return fail("first segment has no media tracks");
 
+                int audioTrackOrd = 0;
                 for (AVAssetTrack* tr in firstTracks) {
                     TrackLayout item;
                     item.mediaType = tr.mediaType;
                     item.isVideo = [tr.mediaType isEqualToString:AVMediaTypeVideo];
                     NSArray* fmts = tr.formatDescriptions;
                     if (fmts.count == 0) return fail("track has no format description");
-                    item.formatDesc = (__bridge CMFormatDescriptionRef)fmts[0];
+                    CMFormatDescriptionRef srcFmt = (__bridge CMFormatDescriptionRef)fmts[0];
 
-                    if (item.isVideo && videoFrameDurationHns == 0) {
-                        float fps = tr.nominalFrameRate;
-                        if (fps > 0.5f) {
-                            videoFrameDurationHns = llround(static_cast<double>(kHnsPerSecond) / static_cast<double>(fps));
-                        }
-                    }
-
-                    AVAssetWriterInput* in = [AVAssetWriterInput assetWriterInputWithMediaType:tr.mediaType
-                                                                                 outputSettings:nil
-                                                                               sourceFormatHint:item.formatDesc];
-                    if (!in) {
-                        return fail("cannot configure pass-through writer input");
-                    }
                     if (item.isVideo) {
+                        if (videoFrameDurationHns == 0) {
+                            float fps = tr.nominalFrameRate;
+                            if (fps > 0.5f) {
+                                videoFrameDurationHns = llround(static_cast<double>(kHnsPerSecond) / static_cast<double>(fps));
+                            }
+                        }
+
+                        AVAssetWriterInput* in = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo
+                                                                                     outputSettings:nil
+                                                                                   sourceFormatHint:srcFmt];
+                        if (!in) {
+                            return fail("cannot configure pass-through video writer input");
+                        }
                         // Preserve 1us video timescale so 120/240 FPS frame timestamps never collapse into 600-tick grid (M8).
                         in.mediaTimeScale = (tr.naturalTimeScale > 0) ? tr.naturalTimeScale : kVideoMediaTimeScale;
+                        // Real-time flag disables cross-track interleaver lockups across segment boundaries (M1).
+                        in.expectsMediaDataInRealTime = YES;
+                        if (![writer canAddInput:in]) {
+                            return fail("cannot configure pass-through video writer input");
+                        }
+                        [writer addInput:in];
+                        item.writerInput = in;
+                    } else if ([tr.mediaType isEqualToString:AVMediaTypeAudio]) {
+                        int sampleRate = 48000;
+                        if (const AudioStreamBasicDescription* srcAsbd = CMAudioFormatDescriptionGetStreamBasicDescription(srcFmt)) {
+                            if (srcAsbd->mSampleRate > 1000.0) {
+                                int sr = static_cast<int>(llround(srcAsbd->mSampleRate));
+                                sampleRate = (sr == 44100) ? 44100 : 48000;
+                            }
+                        }
+                        const int audioBitrate = (audioTrackOrd == 0) ? 192000 : 128000;
+                        audioTrackOrd++;
+
+                        AudioChannelLayout acl{};
+                        acl.mChannelLayoutTag = kAudioChannelLayoutTag_Stereo;
+                        NSData* aclData = [NSData dataWithBytes:&acl length:sizeof(acl)];
+
+                        NSDictionary* aacOutSettings = @{
+                            AVFormatIDKey: @(kAudioFormatMPEG4AAC),
+                            AVSampleRateKey: @(sampleRate),
+                            AVNumberOfChannelsKey: @(2),
+                            AVEncoderBitRateKey: @(audioBitrate),
+                            AVChannelLayoutKey: aclData,
+                        };
+                        if (![writer canApplyOutputSettings:aacOutSettings forMediaType:AVMediaTypeAudio]) {
+                            return fail("AVAssetWriter rejected export AAC settings");
+                        }
+                        AVAssetWriterInput* in = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeAudio
+                                                                                     outputSettings:aacOutSettings];
+                        if (!in) {
+                            return fail("cannot create AAC writer input");
+                        }
+                        in.expectsMediaDataInRealTime = YES;
+                        if (![writer canAddInput:in]) {
+                            return fail("cannot add AAC writer input");
+                        }
+                        [writer addInput:in];
+
+                        AudioStreamBasicDescription pcmAsbd{};
+                        pcmAsbd.mSampleRate = static_cast<Float64>(sampleRate);
+                        pcmAsbd.mFormatID = kAudioFormatLinearPCM;
+                        pcmAsbd.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;
+                        pcmAsbd.mBitsPerChannel = 32;
+                        pcmAsbd.mChannelsPerFrame = 2;
+                        pcmAsbd.mBytesPerFrame = 8;
+                        pcmAsbd.mFramesPerPacket = 1;
+                        pcmAsbd.mBytesPerPacket = 8;
+                        CMFormatDescriptionRef pcmFmt = nullptr;
+                        OSStatus fmtErr = CMAudioFormatDescriptionCreate(
+                            kCFAllocatorDefault, &pcmAsbd, sizeof(acl), &acl, 0, nullptr, nullptr, &pcmFmt);
+                        if (fmtErr != noErr || !pcmFmt) {
+                            return fail(buildAudioEncoderError(fmtErr, "CMAudioFormatDescriptionCreate"));
+                        }
+
+                        item.sampleRate = sampleRate;
+                        item.pcmFmt = pcmFmt;
+                        item.pcmReadSettings = @{
+                            AVFormatIDKey: @(kAudioFormatLinearPCM),
+                            AVSampleRateKey: @(sampleRate),
+                            AVNumberOfChannelsKey: @(2),
+                            AVLinearPCMBitDepthKey: @32,
+                            AVLinearPCMIsFloatKey: @YES,
+                            AVLinearPCMIsBigEndianKey: @NO,
+                            AVLinearPCMIsNonInterleaved: @NO,
+                        };
+                        item.writerInput = in;
+                    } else {
+                        AVAssetWriterInput* in = [AVAssetWriterInput assetWriterInputWithMediaType:tr.mediaType
+                                                                                     outputSettings:nil
+                                                                                   sourceFormatHint:srcFmt];
+                        if (!in) {
+                            return fail("cannot configure pass-through writer input");
+                        }
+                        in.expectsMediaDataInRealTime = YES;
+                        if (![writer canAddInput:in]) {
+                            return fail("cannot configure pass-through writer input");
+                        }
+                        [writer addInput:in];
+                        item.writerInput = in;
                     }
-                    // Real-time passthrough flag disables cross-track interleaver lockups across segment boundaries (M1).
-                    in.expectsMediaDataInRealTime = YES;
-                    if (![writer canAddInput:in]) {
-                        return fail("cannot configure pass-through writer input");
-                    }
-                    [writer addInput:in];
-                    item.writerInput = in;
-                    item.formatDesc = nullptr; // unretained inside inner autoreleasepool; unused beyond addInput
                     layout.push_back(std::move(item));
                 }
 
@@ -1453,10 +1601,8 @@ ConcatResult concatenateImpl(
                         break;
                     }
                 }
-                if (videoTrackIdx < layout.size()) {
-                    const int64_t trimHns = (trimStartSeconds > 0.05)
-                        ? llround(trimStartSeconds * static_cast<double>(kHnsPerSecond))
-                        : 0;
+                if (videoTrackIdx < layout.size() && trimStartSeconds > 0.05) {
+                    const int64_t trimHns = llround(trimStartSeconds * static_cast<double>(kHnsPerSecond));
                     NSError* scanErr = nil;
                     AVAssetReader* scanReader = [AVAssetReader assetReaderWithAsset:firstAsset error:&scanErr];
                     if (!scanReader || scanErr) {
@@ -1471,12 +1617,8 @@ ConcatResult concatenateImpl(
                     [scanReader addOutput:scanOut];
                     [scanReader startReading];
 
-                    struct KeyCandidate {
-                        int64_t pts = -1;
-                        int64_t dts = 0;
-                        bool hasDts = false;
-                    };
-                    KeyCandidate initialSample, lastKeyBefore, firstKeyAfter;
+                    int64_t lastKeyBeforePts = -1;
+                    int64_t firstKeyAfterPts = -1;
 
                     while (CMSampleBufferRef sbuf = [scanOut copyNextSampleBuffer]) {
                         if (CMSampleBufferGetNumSamples(sbuf) <= 0 || !CMSampleBufferGetDataBuffer(sbuf)) {
@@ -1484,27 +1626,15 @@ ConcatResult concatenateImpl(
                             continue;
                         }
                         CMTime pts = CMSampleBufferGetOutputPresentationTimeStamp(sbuf);
-                        CMTime dts = CMSampleBufferGetOutputDecodeTimeStamp(sbuf);
                         int64_t ts = cmTimeToHns(pts);
-                        bool sampleHasDts = CMTIME_IS_VALID(dts);
-                        int64_t sampleDts = sampleHasDts ? cmTimeToHns(dts) : ts;
-
-                        if (initialSample.pts < 0) {
-                            initialSample = {ts, sampleDts, sampleHasDts};
-                            if (trimHns <= 0) {
-                                CFRelease(sbuf);
-                                break;
-                            }
-                        }
-
                         bool isKey = sampleIsSync(sbuf);
                         CFRelease(sbuf);
 
                         if (ts <= trimHns) {
-                            if (isKey) lastKeyBefore = {ts, sampleDts, sampleHasDts};
+                            if (isKey) lastKeyBeforePts = ts;
                         } else {
-                            if (isKey && firstKeyAfter.pts < 0) {
-                                firstKeyAfter = {ts, sampleDts, sampleHasDts};
+                            if (isKey && firstKeyAfterPts < 0) {
+                                firstKeyAfterPts = ts;
                                 break;
                             }
                             if (ts - trimHns > 50000000LL) break;
@@ -1512,25 +1642,17 @@ ConcatResult concatenateImpl(
                     }
                     [scanReader cancelReading];
 
-                    if (trimHns <= 0) {
-                        cutHns = 0;
-                        hasFirstVideoDts = initialSample.hasDts;
-                        firstVideoDts = initialSample.dts;
+                    constexpr int64_t kMaxKeyframeDriftHns = 20000000LL; // 2s
+                    if (lastKeyBeforePts >= 0 && (trimHns - lastKeyBeforePts) <= kMaxKeyframeDriftHns) {
+                        cutHns = lastKeyBeforePts;
+                    } else if (firstKeyAfterPts >= 0 && (firstKeyAfterPts - trimHns) <= kMaxKeyframeDriftHns) {
+                        cutHns = firstKeyAfterPts;
+                    } else if (lastKeyBeforePts >= 0) {
+                        cutHns = lastKeyBeforePts;
+                    } else if (firstKeyAfterPts >= 0) {
+                        cutHns = firstKeyAfterPts;
                     } else {
-                        constexpr int64_t kMaxKeyframeDriftHns = 20000000LL; // 2s
-                        KeyCandidate chosen = {0, initialSample.dts, initialSample.hasDts};
-                        if (lastKeyBefore.pts >= 0 && (trimHns - lastKeyBefore.pts) <= kMaxKeyframeDriftHns) {
-                            chosen = lastKeyBefore;
-                        } else if (firstKeyAfter.pts >= 0 && (firstKeyAfter.pts - trimHns) <= kMaxKeyframeDriftHns) {
-                            chosen = firstKeyAfter;
-                        } else if (lastKeyBefore.pts >= 0) {
-                            chosen = lastKeyBefore;
-                        } else if (firstKeyAfter.pts >= 0) {
-                            chosen = firstKeyAfter;
-                        }
-                        cutHns = chosen.pts;
-                        hasFirstVideoDts = chosen.hasDts;
-                        firstVideoDts = chosen.dts;
+                        cutHns = 0;
                     }
                 }
             }
@@ -1544,11 +1666,7 @@ ConcatResult concatenateImpl(
         remuxGuard.writerStarted = true;
         [writer startSessionAtSourceTime:kCMTimeZero];
 
-        const int64_t initialPtsShift = (hasFirstVideoDts && firstVideoDts < cutHns)
-            ? (cutHns - firstVideoDts)
-            : 0;
-
-        ConcatTimestampState concatState(initialPtsShift);
+        ConcatTimestampState concatState(0);
         size_t samplesWritten = 0;
 
         // 3. Remux every segment inside its own autoreleasepool (M9) so file descriptors & AVAsset objects drop each iteration.
@@ -1623,7 +1741,8 @@ ConcatResult concatenateImpl(
                                         break;
                                     }
                                     AVAssetReaderTrackOutput* out =
-                                        [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:matched outputSettings:nil];
+                                        [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:matched
+                                                                                   outputSettings:layout[li].pcmReadSettings];
                                     out.alwaysCopiesSampleData = NO;
                                     if (![reader canAddOutput:out]) {
                                         segFailMsg = "cannot attach track output in " + segLabel;
@@ -1657,9 +1776,15 @@ ConcatResult concatenateImpl(
                                                 CFRelease(next);
                                                 continue;
                                             }
-                                            CMTime pts = CMSampleBufferGetOutputPresentationTimeStamp(next);
-                                            CMTime dts = CMSampleBufferGetOutputDecodeTimeStamp(next);
-                                            CMTime dur = CMSampleBufferGetOutputDuration(next);
+                                            CMTime pts = sl.isVideo
+                                                ? CMSampleBufferGetOutputPresentationTimeStamp(next)
+                                                : CMSampleBufferGetPresentationTimeStamp(next);
+                                            CMTime dts = sl.isVideo
+                                                ? CMSampleBufferGetOutputDecodeTimeStamp(next)
+                                                : kCMTimeInvalid;
+                                            CMTime dur = sl.isVideo
+                                                ? CMSampleBufferGetOutputDuration(next)
+                                                : CMSampleBufferGetDuration(next);
                                             sl.peek = next;
                                             sl.peekOrigOutPts = pts;
                                             sl.peekOrigOutDts = dts;
@@ -1676,9 +1801,32 @@ ConcatResult concatenateImpl(
                                     bool seenFirstVideoKey = (segCut <= 0);
                                     concatState.beginSegment();
 
+                                    // Align audio sample counters with outputBase when a prior segment had an anomaly gap
+                                    // or when a secondary stream ran slightly longer than primary audio (N1).
+                                    std::vector<float> audioPadScratch;
+                                    std::vector<float> audioPcmScratch;
+                                    for (size_t li = 0; li < layout.size(); ++li) {
+                                        if (layout[li].isVideo || !layout[li].pcmFmt) continue;
+                                        const int sr = layout[li].sampleRate;
+                                        const int64_t expectedStartSamples = llround(
+                                            static_cast<double>(concatState.outputBase) * static_cast<double>(sr) /
+                                            static_cast<double>(kHnsPerSecond));
+                                        if (segIdx == 0) {
+                                            layout[li].totalOutputSamples = expectedStartSamples;
+                                            layout[li].skipLeadingSamples = 0;
+                                            layout[li].pendingPadSamples = 0;
+                                        } else {
+                                            const int64_t diffSamples = expectedStartSamples - layout[li].totalOutputSamples;
+                                            const int64_t tolSamples = std::max<int64_t>(4, sr / 500); // ~2ms rounding guard
+                                            layout[li].skipLeadingSamples = (diffSamples < -tolSamples) ? (-diffSamples) : 0;
+                                            layout[li].pendingPadSamples = (diffSamples > tolSamples) ? diffSamples : 0;
+                                        }
+                                    }
+
                                     for (size_t li = 0; li < slots.size(); ++li) {
                                         pullSlot(slots[li]);
-                                        if (segIdx + 1 == segmentPaths.size() && slots[li].eof && !slots[li].peek && !layout[li].markedFinished) {
+                                        if (segIdx + 1 == segmentPaths.size() && slots[li].eof && !slots[li].peek &&
+                                            layout[li].pendingPadSamples <= 0 && !layout[li].markedFinished) {
                                             [layout[li].writerInput markAsFinished];
                                             layout[li].markedFinished = true;
                                         }
@@ -1689,9 +1837,15 @@ ConcatResult concatenateImpl(
                                         bool anyRemaining = false;
                                         size_t bestIdx = slots.size();
                                         for (size_t i = 0; i < slots.size(); ++i) {
-                                            if (!slots[i].peek) continue;
+                                            const bool hasPendingPad = (!layout[i].isVideo && layout[i].pendingPadSamples > 0);
+                                            if (!slots[i].peek && !hasPendingPad) continue;
                                             anyRemaining = true;
                                             if (!slots[i].writerInput.readyForMoreMediaData) continue;
+                                            if (hasPendingPad) {
+                                                // Drain any inter-segment silence padding before decoded PCM samples for this track.
+                                                bestIdx = i;
+                                                break;
+                                            }
                                             if (bestIdx == slots.size()) {
                                                 bestIdx = i;
                                             } else {
@@ -1719,7 +1873,40 @@ ConcatResult concatenateImpl(
                                             continue;
                                         }
 
+                                        TrackLayout& curLayout = layout[bestIdx];
                                         ReaderSlot& cur = slots[bestIdx];
+
+                                        auto maybeMarkTrackFinished = [&]() {
+                                            if (segIdx + 1 == segmentPaths.size() && cur.eof && !cur.peek &&
+                                                curLayout.pendingPadSamples <= 0 && !curLayout.markedFinished) {
+                                                [curLayout.writerInput markAsFinished];
+                                                curLayout.markedFinished = true;
+                                            }
+                                        };
+
+                                        // Emit pending gap-fill silence (e.g. shorter audio in prior segment, T-M1) before PCM reads.
+                                        if (!cur.isVideo && curLayout.pendingPadSamples > 0) {
+                                            const int sr = curLayout.sampleRate;
+                                            const int chunkFrames = static_cast<int>(
+                                                std::min<int64_t>(curLayout.pendingPadSamples, std::max(480, sr / 10)));
+                                            audioPadScratch.assign(static_cast<size_t>(chunkFrames) * 2, 0.0f);
+                                            const int64_t startSample = curLayout.totalOutputSamples;
+                                            if (!appendPcmChunkToAudioInput(
+                                                    writer, cur.writerInput, curLayout.pcmFmt,
+                                                    audioPadScratch.data(), chunkFrames, sr, startSample, segFailMsg)) {
+                                                break;
+                                            }
+                                            curLayout.totalOutputSamples += chunkFrames;
+                                            curLayout.pendingPadSamples -= chunkFrames;
+                                            const int64_t sHns = llround(static_cast<double>(startSample) * kHnsPerSecond / sr);
+                                            const int64_t eHns = llround(static_cast<double>(curLayout.totalOutputSamples) * kHnsPerSecond / sr);
+                                            (void)concatState.recordWrittenSample(cur.streamId, false, sHns, std::max<int64_t>(1, eHns - sHns));
+                                            lastProgress = std::chrono::steady_clock::now();
+                                            maybeMarkTrackFinished();
+                                            samplesWritten++;
+                                            continue;
+                                        }
+
                                         CMSampleBufferRef sample = cur.peek;
                                         CMTime origOutPts = cur.peekOrigOutPts;
                                         CMTime origOutDts = cur.peekOrigOutDts;
@@ -1733,12 +1920,81 @@ ConcatResult concatenateImpl(
                                         } sampleGuard{sample};
                                         pullSlot(cur);
 
-                                        auto maybeMarkTrackFinished = [&]() {
-                                            if (segIdx + 1 == segmentPaths.size() && cur.eof && !cur.peek && !layout[bestIdx].markedFinished) {
-                                                [layout[bestIdx].writerInput markAsFinished];
-                                                layout[bestIdx].markedFinished = true;
+                                        if (!cur.isVideo && curLayout.pcmFmt) {
+                                            // Audio track (N1): sample is already LPCM Float32 stereo decoded by AVAssetReader
+                                            // with all edit-list priming and remainder trims resolved cleanly. Slice exact
+                                            // segCut / skipLeadingSamples and re-encode as one uninterrupted AAC track.
+                                            CMItemCount rawCount = CMSampleBufferGetNumSamples(sample);
+                                            CMBlockBufferRef dataBuf = CMSampleBufferGetDataBuffer(sample);
+                                            if (rawCount <= 0 || !dataBuf) {
+                                                maybeMarkTrackFinished();
+                                                lastProgress = std::chrono::steady_clock::now();
+                                                continue;
                                             }
-                                        };
+
+                                            const int sr = curLayout.sampleRate;
+                                            const size_t availBytes = CMBlockBufferGetDataLength(dataBuf);
+                                            const size_t totalFrames = std::min<size_t>(
+                                                static_cast<size_t>(rawCount), availBytes / (2 * sizeof(float)));
+                                            if (totalFrames == 0) {
+                                                maybeMarkTrackFinished();
+                                                lastProgress = std::chrono::steady_clock::now();
+                                                continue;
+                                            }
+
+                                            int64_t trimFrames = 0;
+                                            if (segCut > 0) {
+                                                const int64_t cutSamples = llround(
+                                                    static_cast<double>(segCut) * static_cast<double>(sr) /
+                                                    static_cast<double>(kHnsPerSecond));
+                                                const int64_t bufStartSamples = llround(
+                                                    CMTimeGetSeconds(origOutPts) * static_cast<double>(sr));
+                                                if (bufStartSamples < cutSamples) {
+                                                    trimFrames = cutSamples - bufStartSamples;
+                                                }
+                                            }
+                                            if (curLayout.skipLeadingSamples > 0) {
+                                                const int64_t postCutAvail = std::max<int64_t>(0, static_cast<int64_t>(totalFrames) - trimFrames);
+                                                const int64_t extraSkip = std::min(curLayout.skipLeadingSamples, postCutAvail);
+                                                trimFrames += extraSkip;
+                                                curLayout.skipLeadingSamples -= extraSkip;
+                                            }
+                                            if (trimFrames >= static_cast<int64_t>(totalFrames)) {
+                                                maybeMarkTrackFinished();
+                                                lastProgress = std::chrono::steady_clock::now();
+                                                continue;
+                                            }
+
+                                            const size_t skipCount = static_cast<size_t>(std::max<int64_t>(0, trimFrames));
+                                            const size_t keptFrames = totalFrames - skipCount;
+                                            audioPcmScratch.resize(totalFrames * 2);
+                                            OSStatus copyErr = CMBlockBufferCopyDataBytes(
+                                                dataBuf, 0, totalFrames * 2 * sizeof(float), audioPcmScratch.data());
+                                            if (copyErr != noErr) {
+                                                segFailMsg = buildAudioEncoderError(copyErr, "CMBlockBufferCopyDataBytes");
+                                                break;
+                                            }
+
+                                            const int64_t startSample = curLayout.totalOutputSamples;
+                                            const float* srcPtr = audioPcmScratch.data() + (skipCount * 2);
+                                            if (!appendPcmChunkToAudioInput(
+                                                    writer, cur.writerInput, curLayout.pcmFmt,
+                                                    srcPtr, static_cast<int>(keptFrames), sr, startSample, segFailMsg)) {
+                                                break;
+                                            }
+
+                                            curLayout.totalOutputSamples += static_cast<int64_t>(keptFrames);
+                                            const int64_t sHns = llround(static_cast<double>(startSample) * kHnsPerSecond / sr);
+                                            const int64_t eHns = llround(static_cast<double>(curLayout.totalOutputSamples) * kHnsPerSecond / sr);
+                                            int64_t prevAudioEnd = 0;
+                                            (void)concatState.recordWrittenSample(
+                                                cur.streamId, false, sHns, std::max<int64_t>(1, eHns - sHns), &prevAudioEnd);
+
+                                            lastProgress = std::chrono::steady_clock::now();
+                                            maybeMarkTrackFinished();
+                                            samplesWritten++;
+                                            continue;
+                                        }
 
                                         if (ptsHns < segCut) {
                                             maybeMarkTrackFinished();
@@ -1757,7 +2013,7 @@ ConcatResult concatenateImpl(
                                         int64_t sampleTime = concatState.computeSampleTime(ptsHns, segCut);
                                         int64_t newDts = sampleTime;
                                         if (cur.isVideo) {
-                                            concatState.adjustVideoTimestamps(dtsHns, segCut, sampleTime, newDts, false);
+                                            concatState.adjustVideoTimestamps(dtsHns, segCut, sampleTime, newDts, false, true);
                                         }
 
                                         CMItemCount timingCount = 0;
@@ -1774,11 +2030,11 @@ ConcatResult concatenateImpl(
                                             break;
                                         }
 
-                                        // Trim policy across segments (M10):
-                                        // Only segment 0 trims pre-window media at cutHns; continuation segments (segIdx > 0)
-                                        // begin cleanly from segCut == 0 at outputBase. Rebase every timing entry by
-                                        // delta = (targetOutputPTS - origOutputPTS) rather than replacing raw PTS directly,
-                                        // preserving AAC priming/edit-list trim offsets without per-segment shift.
+                                        // Rebase video passthrough sample timing directly onto the unified movie timeline
+                                        // (targetOutPts / targetOutDts). Rebasing from raw track timings[0] strips any
+                                        // source segment B-frame edit-list lead so AVAssetWriter does not emit an initial
+                                        // empty edit entry on H.264 video while keeping DTS monotonic and negative lead intact.
+                                        // Audio streams are transcoded above from LPCM into a single continuous AAC stream (N1).
                                         const CMTimeScale trackScale =
                                             (CMTIME_IS_VALID(timings[0].presentationTimeStamp) && timings[0].presentationTimeStamp.timescale > 0)
                                                 ? timings[0].presentationTimeStamp.timescale
@@ -1787,21 +2043,21 @@ ConcatResult concatenateImpl(
                                                        : static_cast<CMTimeScale>(kHnsPerSecond));
 
                                         const CMTime targetOutPts = hnsToCMTime(sampleTime, trackScale);
-                                        const CMTime origOutScaled = CMTIME_IS_VALID(origOutPts)
-                                            ? CMTimeConvertScale(origOutPts, trackScale, kCMTimeRoundingMethod_RoundHalfAwayFromZero)
-                                            : timings[0].presentationTimeStamp;
-                                        const CMTime ptsDelta = CMTimeSubtract(targetOutPts, origOutScaled);
+                                        const CMTime rawPtsRef = CMTIME_IS_VALID(timings[0].presentationTimeStamp)
+                                            ? CMTimeConvertScale(timings[0].presentationTimeStamp, trackScale, kCMTimeRoundingMethod_RoundHalfAwayFromZero)
+                                            : targetOutPts;
+                                        const CMTime ptsDelta = CMTimeSubtract(targetOutPts, rawPtsRef);
 
                                         CMTime dtsDelta = ptsDelta;
-                                        if (cur.isVideo && CMTIME_IS_VALID(origOutDts)) {
+                                        if (cur.isVideo && CMTIME_IS_VALID(timings[0].decodeTimeStamp)) {
                                             const CMTimeScale dtsScale =
-                                                (CMTIME_IS_VALID(timings[0].decodeTimeStamp) && timings[0].decodeTimeStamp.timescale > 0)
+                                                (timings[0].decodeTimeStamp.timescale > 0)
                                                     ? timings[0].decodeTimeStamp.timescale
                                                     : trackScale;
                                             const CMTime targetOutDts = hnsToCMTime(newDts, dtsScale);
-                                            const CMTime origDtsScaled = CMTimeConvertScale(
-                                                origOutDts, dtsScale, kCMTimeRoundingMethod_RoundHalfAwayFromZero);
-                                            dtsDelta = CMTimeSubtract(targetOutDts, origDtsScaled);
+                                            const CMTime rawDtsRef = CMTimeConvertScale(
+                                                timings[0].decodeTimeStamp, dtsScale, kCMTimeRoundingMethod_RoundHalfAwayFromZero);
+                                            dtsDelta = CMTimeSubtract(targetOutDts, rawDtsRef);
                                         }
 
                                         for (size_t ti = 0; ti < timings.size(); ++ti) {
@@ -1913,7 +2169,7 @@ ConcatResult concatenateImpl(
 
         remuxGuard.completed = true;
         res.success = true;
-        res.durationSeconds = static_cast<double>(std::max<int64_t>(0, concatState.outputBase - initialPtsShift)) /
+        res.durationSeconds = static_cast<double>(std::max<int64_t>(0, concatState.outputBase)) /
                               static_cast<double>(kHnsPerSecond);
         return res;
     } @catch (NSException* ex) {
