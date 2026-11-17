@@ -32,6 +32,7 @@ enum class MicCaptureStatus : uint8_t {
     Idle = 0,
     Active,
     PermissionDenied,
+    BlockedNoUsageDescription,
     UsingFallbackDevice,
     DigitalSilenceDetected,
     NoInputDevice

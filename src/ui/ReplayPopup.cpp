@@ -1328,6 +1328,8 @@ void ReplayPopup::updateStatusDisplay(float dt) {
                 auto micSt = AudioGrabber::get()->getMicCaptureStatus();
                 if (micSt == MicCaptureStatus::PermissionDenied) {
                     m_statusLabel->setString("Replay Active (Mic Permission Denied)");
+                } else if (micSt == MicCaptureStatus::BlockedNoUsageDescription) {
+                    m_statusLabel->setString("Replay Active (Mic Blocked - Use Steam)");
                 } else if (micSt == MicCaptureStatus::DigitalSilenceDetected) {
                     m_statusLabel->setString("Replay Active (Mic Silent - Check Privacy)");
                 } else {

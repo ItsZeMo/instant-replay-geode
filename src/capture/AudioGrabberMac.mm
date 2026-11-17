@@ -333,22 +333,59 @@ void AudioGrabber::micCaptureThreadFunc() {
     MacAutoreleasePoolScope pool;
     m_micResampler.reset();
 
-    // Check macOS Microphone TCC permission before touching CoreAudio input (M3).
+    auto isMicBlocked = [](MicCaptureStatus st) noexcept {
+        return st == MicCaptureStatus::PermissionDenied ||
+               st == MicCaptureStatus::BlockedNoUsageDescription;
+    };
+    auto showBlockedNoUsageNotification = []() {
+        geode::queueInMainThread([]() {
+            geode::Notification::create(
+                "Mic blocked by macOS for this launch. Start GD through Steam (it asks for mic access) or turn off Record Microphone.",
+                geode::NotificationIcon::Warning,
+                5.0f
+            )->show();
+        });
+    };
+
+    // Check macOS Microphone TCC permission before touching CoreAudio input (M3, N2).
+    const bool noUsageKey =
+        ([[NSBundle mainBundle] objectForInfoDictionaryKey:@"NSMicrophoneUsageDescription"] == nil);
     AVAuthorizationStatus authStatus = [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio];
+    const char* authLabel = "Unknown";
+    switch (authStatus) {
+        case AVAuthorizationStatusNotDetermined: authLabel = "NotDetermined"; break;
+        case AVAuthorizationStatusRestricted: authLabel = "Restricted"; break;
+        case AVAuthorizationStatusDenied: authLabel = "Denied"; break;
+        case AVAuthorizationStatusAuthorized: authLabel = "Authorized"; break;
+    }
+    geode::log::info(
+        "Instant Replay: macOS Microphone TCC status={}, hasUsageDescription={}",
+        authLabel, !noUsageKey);
+
     if (authStatus == AVAuthorizationStatusDenied || authStatus == AVAuthorizationStatusRestricted) {
-        m_micStatus.store(MicCaptureStatus::PermissionDenied, std::memory_order_release);
+        m_micStatus.store(
+            noUsageKey ? MicCaptureStatus::BlockedNoUsageDescription : MicCaptureStatus::PermissionDenied,
+            std::memory_order_release);
         static std::atomic<bool> s_notifiedDenied{false};
         if (!s_notifiedDenied.exchange(true, std::memory_order_acq_rel)) {
-            geode::log::warn(
-                "Instant Replay: macOS Microphone permission is denied/restricted; microphone capture disabled "
-                "(enable Geometry Dash in System Settings -> Privacy & Security -> Microphone)");
-            geode::queueInMainThread([]() {
-                geode::Notification::create(
-                    "Instant Replay: Mic permission denied in macOS Privacy Settings",
-                    geode::NotificationIcon::Warning,
-                    4.0f
-                )->show();
-            });
+            if (noUsageKey) {
+                geode::log::warn(
+                    "Instant Replay: macOS Microphone permission is {} and NSMicrophoneUsageDescription is missing; "
+                    "launch Geometry Dash through Steam or disable Record Microphone",
+                    authLabel);
+                showBlockedNoUsageNotification();
+            } else {
+                geode::log::warn(
+                    "Instant Replay: macOS Microphone permission is denied/restricted; microphone capture disabled "
+                    "(enable Geometry Dash in System Settings -> Privacy & Security -> Microphone)");
+                geode::queueInMainThread([]() {
+                    geode::Notification::create(
+                        "Instant Replay: Mic permission denied in macOS Privacy Settings",
+                        geode::NotificationIcon::Warning,
+                        4.0f
+                    )->show();
+                });
+            }
         }
         return;
     }
@@ -356,7 +393,7 @@ void AudioGrabber::micCaptureThreadFunc() {
     if (authStatus == AVAuthorizationStatusNotDetermined) {
         static std::atomic<bool> s_warnedNotDetermined{false};
         if (!s_warnedNotDetermined.exchange(true, std::memory_order_acq_rel)) {
-            if ([[NSBundle mainBundle] objectForInfoDictionaryKey:@"NSMicrophoneUsageDescription"] != nil) {
+            if (!noUsageKey) {
                 geode::log::info("Instant Replay: requesting macOS Microphone permission");
                 [AVCaptureDevice requestAccessForMediaType:AVMediaTypeAudio completionHandler:^(BOOL granted) {
                     if (!granted) {
@@ -365,8 +402,8 @@ void AudioGrabber::micCaptureThreadFunc() {
                 }];
             } else {
                 geode::log::warn(
-                    "Instant Replay: macOS Microphone permission is NotDetermined (no NSMicrophoneUsageDescription); "
-                    "mic audio may remain silent unless granted to Geometry Dash");
+                    "Instant Replay: macOS Microphone TCC is NotDetermined without NSMicrophoneUsageDescription; "
+                    "starting capture (works when launched via Steam, otherwise mic audio will be silent)");
             }
         }
     }
@@ -402,7 +439,7 @@ void AudioGrabber::micCaptureThreadFunc() {
     static std::atomic<bool> s_warnedDigitalSilence{false};
 
     while (m_micRunning.load() &&
-           m_micStatus.load(std::memory_order_acquire) != MicCaptureStatus::PermissionDenied) {
+           !isMicBlocked(m_micStatus.load(std::memory_order_acquire))) {
         std::string targetId = ReplayManager::get()->getSessionConfig().getMicDeviceId();
         if (targetId != lastTargetSeen) {
             lastTargetSeen = targetId;
@@ -542,27 +579,37 @@ void AudioGrabber::micCaptureThreadFunc() {
                 int pollCount = 0;
                 while (m_micRunning.load() &&
                        !qState.deviceInvalidated.load(std::memory_order_acquire) &&
-                       m_micStatus.load(std::memory_order_acquire) != MicCaptureStatus::PermissionDenied) {
+                       !isMicBlocked(m_micStatus.load(std::memory_order_acquire))) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(50));
                     ++pollCount;
 
-                    if (m_micStatus.load(std::memory_order_acquire) == MicCaptureStatus::PermissionDenied) {
+                    if (isMicBlocked(m_micStatus.load(std::memory_order_acquire))) {
                         break;
                     }
 
                     if (qState.digitalSilenceAlert.load(std::memory_order_acquire) && !reportedDigitalSilence) {
                         reportedDigitalSilence = true;
-                        m_micStatus.store(MicCaptureStatus::DigitalSilenceDetected, std::memory_order_release);
+                        const MicCaptureStatus silenceStatus = noUsageKey
+                            ? MicCaptureStatus::BlockedNoUsageDescription
+                            : MicCaptureStatus::DigitalSilenceDetected;
+                        m_micStatus.store(silenceStatus, std::memory_order_release);
                         if (!s_warnedDigitalSilence.exchange(true, std::memory_order_acq_rel)) {
-                            geode::log::warn(
-                                "Instant Replay: microphone captured >3s of pure digital silence (check macOS Microphone TCC permission or hardware mute)");
-                            geode::queueInMainThread([]() {
-                                geode::Notification::create(
-                                    "Instant Replay: Mic audio is silent (check Privacy Settings or mute)",
-                                    geode::NotificationIcon::Warning,
-                                    3.5f
-                                )->show();
-                            });
+                            if (noUsageKey) {
+                                geode::log::warn(
+                                    "Instant Replay: microphone captured >3s of pure digital silence without NSMicrophoneUsageDescription; "
+                                    "macOS TCC blocked access for this launch (start GD through Steam or turn off Record Microphone)");
+                                showBlockedNoUsageNotification();
+                            } else {
+                                geode::log::warn(
+                                    "Instant Replay: microphone captured >3s of pure digital silence (check macOS Microphone TCC permission or hardware mute)");
+                                geode::queueInMainThread([]() {
+                                    geode::Notification::create(
+                                        "Instant Replay: Mic audio is silent (check Privacy Settings or mute)",
+                                        geode::NotificationIcon::Warning,
+                                        3.5f
+                                    )->show();
+                                });
+                            }
                         }
                     } else if (reportedDigitalSilence && qState.sawNonZeroAudio.load(std::memory_order_relaxed)) {
                         reportedDigitalSilence = false;
@@ -623,7 +670,7 @@ void AudioGrabber::micCaptureThreadFunc() {
         }
     }
 
-    if (m_micStatus.load(std::memory_order_acquire) != MicCaptureStatus::PermissionDenied) {
+    if (!isMicBlocked(m_micStatus.load(std::memory_order_acquire))) {
         m_micStatus.store(MicCaptureStatus::Idle, std::memory_order_release);
     }
 }

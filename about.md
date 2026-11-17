@@ -27,7 +27,7 @@ Never lose an epic demon completion, new best, or hilarious fail again! **Instan
 
 ### 🎙️ Multi-Track Studio Audio & Physical Microphone Picker
 * **Separate Audio Tracks:** Game sound and microphone are recorded into **two separate, independent audio streams** inside the single MP4 container. When opened in *Adobe Premiere Pro, DaVinci Resolve,* or *Sony Vegas*, you can adjust voice and game volume independently!
-* **Low-Latency Native Capture:** Event-driven WASAPI capture on Windows and CoreAudio `AudioQueue` on macOS (with automatic fallback if a selected mic disconnects, plus macOS Privacy permission checks) maintain lockstep synchronization with video.
+* **Low-Latency Native Capture:** Event-driven WASAPI capture on Windows and CoreAudio `AudioQueue` on macOS (with automatic fallback if a selected mic disconnects, plus macOS Privacy permission checks). Note: on macOS, launching Geometry Dash through **Steam** is required for the system microphone prompt because standalone/third-party launches without `NSMicrophoneUsageDescription` in the app bundle are muted by macOS Privacy controls.
 * **Native RobTop Sliders:** Precise volume sliders with live percentage indicators for both Game and Microphone audio.
 * **Microphone Device Selector:** Cycle through any physical microphone plugged into your PC/Mac (USB mics, headsets, built-in arrays) while recording is stopped.
 
