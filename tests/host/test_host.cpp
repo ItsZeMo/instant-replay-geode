@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cassert>
 #include <chrono>
+#include <deque>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
@@ -29,6 +30,7 @@
 #include "encoder/SegmentAudioLayout.hpp"
 #include "recorder/MicMixFifo.hpp"
 #include "recorder/SegmentRules.hpp"
+#include "recorder/AudioQueuePolicy.hpp"
 
 #pragma comment(lib, "mfplat.lib")
 #pragma comment(lib, "mfreadwrite.lib")
@@ -1236,6 +1238,38 @@ void testSegmentDurationRuleW14() {
     std::cout << "  PASS Test W14\n";
 }
 
+void testMicQueueDurationLimitW15() {
+    std::cout << "[Test W15] Microphone worker queue is bounded by time, not packet count...\n";
+    constexpr size_t kLimit = 48000 * 3; // 3 s
+    auto frames = [](const std::vector<float>& c) { return c.size() / 2; };
+
+    // 2 s of 5 ms packets (400 packets) fit; the old 150-packet limit dropped 250 of them (1.25 s).
+    std::deque<std::vector<float>> q;
+    uint64_t dropped = 0;
+    for (int i = 0; i < 400; ++i) {
+        dropped += replay::enforceAudioQueueFrameLimit(q, 240, kLimit, frames);
+        q.emplace_back(240 * 2, 0.0f);
+    }
+    CHECK(dropped == 0 && q.size() == 400);
+
+    // Keep pushing 10 ms packets: total never exceeds 3 s and drops are counted in frames.
+    for (int i = 0; i < 200; ++i) {
+        dropped += replay::enforceAudioQueueFrameLimit(q, 480, kLimit, frames);
+        q.emplace_back(480 * 2, 0.0f);
+    }
+    size_t total = 0;
+    for (const auto& c : q) total += frames(c);
+    CHECK(total <= kLimit);
+    CHECK(dropped == 96000 + 200 * 480 - kLimit);
+
+    // A chunk larger than the limit is still accepted alone.
+    std::deque<std::vector<float>> big;
+    big.emplace_back(1000 * 2, 0.0f);
+    CHECK(replay::enforceAudioQueueFrameLimit(big, kLimit + 10, kLimit, frames) == 1000);
+    CHECK(big.empty());
+    std::cout << "  PASS Test W15\n";
+}
+
 // Media Foundation may be missing on CI images (Windows Server without the Media Foundation
 // feature): mfplat / mfreadwrite are delay-loaded and the MF integration tests are skipped then.
 bool mediaFoundationTestsAvailable(std::string& whyNot) {
@@ -1288,6 +1322,7 @@ int main() {
     testCodecFallbackBitratesW1();
     testResolutionBitrateSemanticsW9();
     testSegmentDurationRuleW14();
+    testMicQueueDurationLimitW15();
 
     std::string whyNot;
     if (mediaFoundationTestsAvailable(whyNot)) {

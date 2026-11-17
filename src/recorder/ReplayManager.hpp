@@ -375,6 +375,8 @@ private:
     std::atomic<uint64_t> m_staleDropCount{0};
     std::atomic<uint64_t> m_queueDropCount{0};
     std::atomic<uint64_t> m_inFlightDropCount{0};
+    std::atomic<uint64_t> m_micQueueDroppedFrames{0}; // mic audio dropped by the worker queue limit (W15)
+    uint64_t m_lastLoggedMicQueueDrops = 0;
     std::chrono::steady_clock::time_point m_lastDropLogTime{};
     uint64_t m_lastLoggedQueueDrops = 0;
     uint64_t m_lastLoggedInFlightDrops = 0;

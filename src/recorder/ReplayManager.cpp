@@ -6,6 +6,7 @@
 #include "../ui/ReplayPopup.hpp"
 #include "../capture/FrameBudget.hpp"
 #include "SegmentRules.hpp"
+#include "AudioQueuePolicy.hpp"
 #include <Geode/binding/FMODAudioEngine.hpp>
 #include <Geode/utils/async.hpp>
 #include <Geode/utils/file.hpp>
@@ -68,6 +69,9 @@ static constexpr size_t MAX_IN_FLIGHT_ENCODER_BYTES = 256ull * 1024 * 1024;
 static constexpr size_t IN_FLIGHT_BUDGET_FRAMES = 12;
 static constexpr size_t MAX_SCALED_IN_FLIGHT_ENCODER_BYTES = 512ull * 1024 * 1024;
 static constexpr size_t MAX_MIC_MIX_FRAMES = static_cast<size_t>(AudioGrabber::kMicSampleRate) * 5; // ~5s stereo cap
+// Worker-side microphone queue limits by duration (W15): >= 3 s while recording, 0.25 s while no encoder runs.
+static constexpr size_t MAX_MIC_QUEUE_FRAMES = static_cast<size_t>(AudioGrabber::kMicSampleRate) * 3;
+static constexpr size_t MAX_IDLE_MIC_QUEUE_FRAMES = static_cast<size_t>(AudioGrabber::kMicSampleRate) / 4;
 static constexpr int MAX_ENCODER_START_FAILURES = 3;
 static constexpr int MAX_CONSECUTIVE_WRITE_ERRORS = 5;
 
@@ -654,8 +658,11 @@ void ReplayManager::initialize() {
         {
             std::lock_guard<std::mutex> lock(m_queueMutex);
             if (m_running.load(std::memory_order_relaxed)) {
-                if (m_micAudioQueue.size() >= 150) {
-                    m_micAudioQueue.pop_front();
+                const uint64_t dropped = enforceAudioQueueFrameLimit(
+                    m_micAudioQueue, chunk->samples.size() / 2, MAX_MIC_QUEUE_FRAMES,
+                    [](const std::shared_ptr<AudioChunk>& c) { return c ? c->samples.size() / 2 : size_t{0}; });
+                if (dropped > 0) {
+                    m_micQueueDroppedFrames.fetch_add(dropped, std::memory_order_relaxed);
                 }
                 m_micAudioQueue.push_back(std::move(chunk));
                 queued = true;
@@ -2865,10 +2872,11 @@ void ReplayManager::workerThreadFunc(ReplayConfig sessionConfig) {
                 }
                 m_micAudioQueue.clear();
             } else {
-                if (!hasEnc && m_micAudioQueue.size() > 25) {
-                    while (m_micAudioQueue.size() > 25) {
-                        m_micAudioQueue.pop_front();
-                    }
+                if (!hasEnc && !m_micAudioQueue.empty()) {
+                    // No encoder yet (waiting for the first frame): keep only the newest 0.25 s.
+                    enforceAudioQueueFrameLimit(
+                        m_micAudioQueue, 0, MAX_IDLE_MIC_QUEUE_FRAMES,
+                        [](const std::shared_ptr<AudioChunk>& c) { return c ? c->samples.size() / 2 : size_t{0}; });
                 }
                 if (!m_frameQueue.empty()) {
                     frame = std::move(m_frameQueue.front());
@@ -2911,6 +2919,13 @@ void ReplayManager::workerThreadFunc(ReplayConfig sessionConfig) {
             m_lastLoggedQueueDrops = qDrops;
             m_lastLoggedInFlightDrops = fDrops;
             m_lastDropLogTime = now;
+
+            const uint64_t micDrops = m_micQueueDroppedFrames.load(std::memory_order_relaxed);
+            if (micDrops > m_lastLoggedMicQueueDrops) {
+                geode::log::debug("ReplayManager: microphone queue dropped {} ms of audio in the last 5 s (worker stalled)",
+                                  ((micDrops - m_lastLoggedMicQueueDrops) * 1000) / static_cast<uint64_t>(AudioGrabber::kMicSampleRate));
+            }
+            m_lastLoggedMicQueueDrops = micDrops;
         }
         if (!m_savePendingSwitch && m_prepareFailedLastAttempt.exchange(false)) {
             m_prepareFailedCount++;
