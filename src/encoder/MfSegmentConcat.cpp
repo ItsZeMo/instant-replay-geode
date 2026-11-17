@@ -102,8 +102,13 @@ int64_t hnsToFramesRounded(int64_t hns, UINT32 rate) noexcept {
     return (num >= 0) ? (num + 5000000LL) / 10000000LL : -((-num + 5000000LL) / 10000000LL);
 }
 
-// Native stream indices of one segment, by kind: MF's MP4 sink omits a video track that received no
-// samples (game minimized for a whole segment, W14), so stream indices differ between segments.
+// Native stream indices of one segment, by kind. Two Media Foundation quirks matter here:
+// - the MP4 sink omits a video track that received no samples (game minimized for a whole
+//   segment, W14), so stream indices differ between segments;
+// - the MPEG-4 source enumerates tracks in reverse 'trak' order, so the game track (added before the
+//   microphone track) is listed after it.
+// Audio tracks are therefore identified by the AAC bitrate the encoder gives them (game 192 kbps,
+// microphone 128 kbps) and only fall back to the reversed listing order when bitrates are equal.
 struct SegmentLayout {
     int videoIndex = -1;
     std::vector<DWORD> audioIndices; // by audio track ordinal (0 = game, 1 = split microphone)
@@ -112,6 +117,13 @@ struct SegmentLayout {
 HRESULT readSegmentLayout(IMFSourceReader* reader, SegmentLayout& out,
                           Com<IMFMediaType>* outVideoType, std::vector<Com<IMFMediaType>>* outAudioTypes) {
     out = {};
+    struct AudioEntry {
+        DWORD index = 0;
+        UINT32 bytesPerSecond = 0;
+        size_t listed = 0;
+        Com<IMFMediaType> type;
+    };
+    std::vector<AudioEntry> audio;
     for (DWORD s = 0; s < 16; ++s) {
         Com<IMFMediaType> type;
         HRESULT hr = reader->GetNativeMediaType(s, 0, type.put());
@@ -123,11 +135,24 @@ HRESULT readSegmentLayout(IMFSourceReader* reader, SegmentLayout& out,
             out.videoIndex = static_cast<int>(s);
             if (outVideoType && !*outVideoType) *outVideoType = std::move(type);
         } else if (major == MFMediaType_Audio) {
-            if (outAudioTypes && outAudioTypes->size() <= out.audioIndices.size()) {
-                outAudioTypes->push_back(std::move(type));
-            }
-            out.audioIndices.push_back(s);
+            AudioEntry entry;
+            entry.index = s;
+            type->GetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, &entry.bytesPerSecond);
+            entry.listed = audio.size();
+            entry.type = std::move(type);
+            audio.push_back(std::move(entry));
         }
+    }
+    // Higher bitrate first (game before microphone); ties in reverse listing order (= 'trak' order).
+    std::sort(audio.begin(), audio.end(), [](const AudioEntry& a, const AudioEntry& b) {
+        if (a.bytesPerSecond != b.bytesPerSecond) return a.bytesPerSecond > b.bytesPerSecond;
+        return a.listed > b.listed;
+    });
+    for (auto& entry : audio) {
+        if (outAudioTypes && outAudioTypes->size() <= out.audioIndices.size()) {
+            outAudioTypes->push_back(std::move(entry.type));
+        }
+        out.audioIndices.push_back(entry.index);
     }
     return S_OK;
 }
