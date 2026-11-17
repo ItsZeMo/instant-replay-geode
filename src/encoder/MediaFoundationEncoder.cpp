@@ -331,15 +331,23 @@ EncoderOpResult MediaFoundationEncoder::start(
                     }
                 }
 
-                std::string logKey = requestKey + "->" + codecLabel;
-                if (!isPrimary && !hasForcedCodec && s_lastLoggedCodecKey != logKey) {
-                    s_lastLoggedCodecKey = logKey;
+                // Rotations restart the encoder every 30 s: only a changed codec / size / bitrate is worth
+                // an INFO line, repeats go to debug (W8, Windows counterpart of macOS N5).
+                char rateKey[48];
+                snprintf(rateKey, sizeof(rateKey), "|%d/%d", attemptParams.bitrateMbps, attemptParams.maxBitrateMbps);
+                const std::string logKey = requestKey + "->" + codecLabel + rateKey;
+                const bool firstStartForKey = (s_lastLoggedCodecKey != logKey);
+                s_lastLoggedCodecKey = logKey;
+                if (!isPrimary && !hasForcedCodec && firstStartForKey) {
                     geode::log::warn(
                         "Instant Replay: requested codec unavailable, fell back to {} ({}x{} @ {} FPS, effBitrate={} Mbps, effMaxBitrate={} Mbps)",
                         codecLabel, width, height, fps, attemptParams.bitrateMbps, attemptParams.maxBitrateMbps);
-                } else {
-                    s_lastLoggedCodecKey = logKey;
+                } else if (firstStartForKey) {
                     geode::log::info(
+                        "Instant Replay: encoder started with {} ({}x{} @ {} FPS, effBitrate={} Mbps, effMaxBitrate={} Mbps)",
+                        codecLabel, width, height, fps, attemptParams.bitrateMbps, attemptParams.maxBitrateMbps);
+                } else {
+                    geode::log::debug(
                         "Instant Replay: encoder started with {} ({}x{} @ {} FPS, effBitrate={} Mbps, effMaxBitrate={} Mbps)",
                         codecLabel, width, height, fps, attemptParams.bitrateMbps, attemptParams.maxBitrateMbps);
                 }

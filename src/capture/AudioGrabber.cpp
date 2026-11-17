@@ -705,6 +705,11 @@ void AudioGrabber::micCaptureThreadFunc() {
                 const int64_t silenceThresholdFrames = static_cast<int64_t>(std::max<DWORD>(1, pwfx->nSamplesPerSec)) * 3;
                 int64_t silentFrames = 0;
 
+                // The first packet after IAudioClient::Start always carries DATA_DISCONTINUITY (W8).
+                bool firstPacketAfterStart = true;
+                uint64_t discontinuitiesSinceReport = 0;
+                std::chrono::steady_clock::time_point lastDiscontinuityReport{};
+
                 while (m_micRunning.load()) {
                     if (eventDriven) {
                         WaitForSingleObject(hWakeEvent, 20);
@@ -739,8 +744,22 @@ void AudioGrabber::micCaptureThreadFunc() {
                             break;
                         }
                         if (flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) {
-                            geode::log::warn("AudioGrabber: WASAPI mic capture data discontinuity (numFrames={})", numFrames);
+                            if (firstPacketAfterStart) {
+                                geode::log::debug("AudioGrabber: WASAPI mic stream start discontinuity (numFrames={})", numFrames);
+                            } else {
+                                ++discontinuitiesSinceReport;
+                                const auto reportNow = std::chrono::steady_clock::now();
+                                if (lastDiscontinuityReport == std::chrono::steady_clock::time_point{} ||
+                                    reportNow - lastDiscontinuityReport >= std::chrono::seconds(10)) {
+                                    geode::log::warn(
+                                        "AudioGrabber: WASAPI mic capture data discontinuity (numFrames={}, {} since last report)",
+                                        numFrames, discontinuitiesSinceReport);
+                                    discontinuitiesSinceReport = 0;
+                                    lastDiscontinuityReport = reportNow;
+                                }
+                            }
                         }
+                        firstPacketAfterStart = false;
                         if (numFrames > 0) {
                             int channels = pwfx->nChannels;
                             int sampleRate = pwfx->nSamplesPerSec;
