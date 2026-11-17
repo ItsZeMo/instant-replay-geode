@@ -118,6 +118,7 @@ private:
         RateControlMode rateControl = RateControlMode::ADAPTIVE_VBR;
         bool splitAudio = false;
         int gameSampleRate = 48000;
+        bool colorTags = true; // explicit BT.709 / limited-range signalling on the video types (W12)
     };
 
     bool tryStartLocked(const std::wstring& outputPath, const GUID& subtype, bool hardware,

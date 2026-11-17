@@ -101,6 +101,12 @@ std::string s_lastLoggedRcKey;
 GUID s_cachedSubtype = MFVideoFormat_H264;
 bool s_cachedHardware = true;
 bool s_hasCachedCodec = false;
+// Encoders (subtype + HW/SW) that refused the explicit BT.709 media type attributes (W12).
+std::set<std::string> s_colorTagRejects;
+
+std::string colorTagKey(const GUID& subtype, bool hardware) {
+    return std::string(subtypeName(subtype)) + (hardware ? "|hw" : "|sw");
+}
 
 } // namespace
 
@@ -279,9 +285,39 @@ EncoderOpResult MediaFoundationEncoder::start(
             }
         }
 
+        {
+            std::lock_guard<std::mutex> cacheLock(s_codecCacheMutex);
+            attemptParams.colorTags = (s_colorTagRejects.count(colorTagKey(attempt.subtype, attempt.hardware)) == 0);
+        }
+
         HRESULT failHr = S_OK;
         std::string error;
         bool started = tryStartLocked(outputPath, attempt.subtype, attempt.hardware, attemptParams, failHr, error);
+
+        // Explicit color metadata is accepted by the Microsoft SW and NVENC encoders, but an unknown
+        // MFT could reject it: retry the same codec once without it before falling back (W12).
+        if (!started && attemptParams.colorTags && !isFatalStorageError(failHr)) {
+            cleanupFailedAttempt();
+            StartParams untagged = attemptParams;
+            untagged.colorTags = false;
+            HRESULT untaggedHr = S_OK;
+            std::string untaggedError;
+            if (tryStartLocked(outputPath, attempt.subtype, attempt.hardware, untagged, untaggedHr, untaggedError)) {
+                started = true;
+                attemptParams = untagged;
+                {
+                    std::lock_guard<std::mutex> cacheLock(s_codecCacheMutex);
+                    s_colorTagRejects.insert(colorTagKey(attempt.subtype, attempt.hardware));
+                }
+                geode::log::warn("Instant Replay: {} ({}) rejected BT.709 color metadata ({}), recording without it",
+                                 subtypeName(attempt.subtype), attempt.hardware ? "HW" : "SW", error);
+                failHr = S_OK;
+                error.clear();
+            } else {
+                failHr = untaggedHr;
+                error = std::move(untaggedError);
+            }
+        }
 
         // If the primary hardware codec fails transiently (e.g. concurrent NVENC session limit while
         // the previous segment is still finalizing in the background), wait for background finalization
@@ -299,10 +335,10 @@ EncoderOpResult MediaFoundationEncoder::start(
         if (started) {
             std::string codecLabel = std::string(subtypeName(attempt.subtype)) + (attempt.hardware ? " (HW)" : " (SW)");
             char key[180];
-            snprintf(key, sizeof(key), "%s|%s|%dx%d|%d|a%d|s%d|pre%lld",
+            snprintf(key, sizeof(key), "%s|%s|%dx%d|%d|a%d|s%d|pre%lld|c%d",
                      subtypeName(attempt.subtype), attempt.hardware ? "hw" : "sw",
                      width, height, fps, params.gameSampleRate, splitAudio ? 1 : 0,
-                     static_cast<long long>(kSegmentAudioPrerollHns / 10000));
+                     static_cast<long long>(kSegmentAudioPrerollHns / 10000), attemptParams.colorTags ? 709 : 0);
             m_formatKey = key;
             m_activeSubtype = attempt.subtype;
             m_activeHardware = attempt.hardware;
@@ -438,6 +474,14 @@ bool MediaFoundationEncoder::tryStartLocked(
         MFSetAttributeSize(videoOut.get(), MF_MT_FRAME_SIZE, p.width, p.height);
         MFSetAttributeRatio(videoOut.get(), MF_MT_FRAME_RATE, p.fps, 1);
         MFSetAttributeRatio(videoOut.get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+        if (p.colorTags) {
+            // The sink writer's RGB32 -> NV12 conversion already uses BT.709 limited range for these sizes
+            // (measured); signal it so players do not have to guess (W12, Windows counterpart of M18).
+            videoOut->SetUINT32(MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709);
+            videoOut->SetUINT32(MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709);
+            videoOut->SetUINT32(MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_709);
+            videoOut->SetUINT32(MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235);
+        }
         hr = m_sinkWriter->AddStream(videoOut.get(), &m_videoStreamIndex);
         if (FAILED(hr)) return recordFail(hr, "AddStream(video): " + hrToString(hr));
     }
@@ -468,6 +512,12 @@ bool MediaFoundationEncoder::tryStartLocked(
         videoIn->SetUINT32(MF_MT_DEFAULT_STRIDE, static_cast<UINT32>(-(static_cast<LONG>(p.width) * 4)));
         videoIn->SetUINT32(MF_MT_FIXED_SIZE_SAMPLES, TRUE);
         videoIn->SetUINT32(MF_MT_SAMPLE_SIZE, static_cast<UINT32>(p.width) * p.height * 4);
+        if (p.colorTags) {
+            videoIn->SetUINT32(MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709);
+            videoIn->SetUINT32(MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_sRGB);
+            videoIn->SetUINT32(MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_0_255);
+            videoIn->SetUINT32(MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709);
+        }
 
         ComRef<IMFAttributes> encParams;
         if (SUCCEEDED(MFCreateAttributes(encParams.put(), 4)) && encParams) {
