@@ -87,6 +87,9 @@ public:
     }
     static bool isCaptureBackendReady() noexcept;
     bool isBackendUnavailable() const noexcept { return m_backendUnavailable.load() || !isCaptureBackendReady(); }
+    // Recording was stopped by a fatal error this session; the user's "enabled" setting is kept, so
+    // toggling retries and the next game start records again (W19).
+    bool isStoppedByError() const noexcept { return m_stoppedByError.load(); }
 
     // Direct folder opener
     void openRecordingsFolder();
@@ -294,6 +297,7 @@ private:
     std::atomic<int> m_exportProgressPermille{-1};
     std::atomic<bool> m_shuttingDown{false};
     std::atomic<bool> m_backendUnavailable{false};
+    std::atomic<bool> m_stoppedByError{false};
     uint64_t m_sessionId = 0; // guarded by m_queueMutex (#12, #13)
 
     // Asynchronous teardown thread & lifecycle state guard for non-blocking Stop/Start

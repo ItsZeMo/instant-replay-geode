@@ -93,6 +93,23 @@ static bool isSegmentFile(const std::filesystem::path& path) {
     return true;
 }
 
+namespace {
+// First binding of a keybind setting as text (e.g. "Ctrl+F6"), empty when unbound (W16).
+std::string keybindSettingLabel(std::string_view key) {
+    if (auto* mod = geode::Mod::get()) {
+        if (auto sett = mod->getSetting(key)) {
+            if (auto kbSett = geode::cast::typeinfo_pointer_cast<geode::KeybindSettingV3>(sett)) {
+                const auto& binds = kbSett->getValue();
+                if (!binds.empty()) {
+                    return binds.front().toString();
+                }
+            }
+        }
+    }
+    return {};
+}
+} // namespace
+
 ReplayManager* ReplayManager::get() {
     static ReplayManager instance;
     return &instance;
@@ -727,6 +744,7 @@ void ReplayManager::reportCaptureBackendUnavailable() {
 }
 
 void ReplayManager::startReplay() {
+    m_stoppedByError.store(false);
     {
         std::lock_guard<std::mutex> lc(m_lifecycleMutex);
         if (m_running.load() || m_shuttingDown.load()) return;
@@ -983,6 +1001,7 @@ void ReplayManager::stopReplay() {
 }
 
 void ReplayManager::setReplayEnabled(bool enabled) {
+    m_stoppedByError.store(false);
     auto& cfg = ReplayConfig::get();
     cfg.enabled = enabled;
     if (enabled) {
@@ -1005,6 +1024,7 @@ ToggleReplayResult ReplayManager::toggleReplay() {
         }
     }
     if (handledWhileStopping) {
+        m_stoppedByError.store(false);
         cfg.enabled = restartQueued;
         cfg.saveToSettings();
         return restartQueued ? ToggleReplayResult::RestartQueued : ToggleReplayResult::StopPending;
@@ -1014,6 +1034,13 @@ ToggleReplayResult ReplayManager::toggleReplay() {
         m_backendUnavailable.store(true);
         reportCaptureBackendUnavailable();
         return ToggleReplayResult::Unavailable;
+    }
+
+    // After a fatal error the setting is still on while nothing records: the toggle means "retry" (W19).
+    if (m_stoppedByError.exchange(false) && cfg.enabled.load() && !m_running.load()) {
+        geode::log::info("Instant Replay: restarting recording after the previous error");
+        startReplay();
+        return m_pendingRestart.load() ? ToggleReplayResult::RestartQueued : ToggleReplayResult::Enabled;
     }
 
     bool newState = !cfg.enabled.load();
@@ -1050,15 +1077,22 @@ void ReplayManager::handleFatalRecordingError(const std::string& reason) {
             sameSession = (m_sessionId == failedSession);
         }
         if (sameSession) {
-            ReplayConfig::get().enabled = false;
+            // Stop this session only. A full disk or a vanished temp drive must not switch background
+            // recording off for good: the persisted "enabled" stays as the user set it, the next game
+            // start records again and the toggle retries right away (W19, like macOS N6).
+            m_stoppedByError.store(true);
             stopReplay();
-            ReplayConfig::get().saveToSettings();
             if (auto* popup = ReplayPopup::get()) {
                 popup->refreshUI();
                 popup->updateStatusDisplay(0.0f);
             }
         }
-        geode::Notification::create(reason, geode::NotificationIcon::Error, 4.0f)->show();
+        std::string msg = reason;
+        const std::string toggleBind = keybindSettingLabel("toggle-replay");
+        if (sameSession && !toggleBind.empty()) {
+            msg += " (" + toggleBind + " to retry)";
+        }
+        geode::Notification::create(msg, geode::NotificationIcon::Error, 4.0f)->show();
     });
 }
 
@@ -3242,23 +3276,6 @@ SaveReplayResult ReplayManager::saveReplay() {
     m_cv.notify_all();
     return SaveReplayResult::Started;
 }
-
-namespace {
-// First binding of a keybind setting as text (e.g. "Ctrl+F6"), empty when unbound (W16).
-std::string keybindSettingLabel(std::string_view key) {
-    if (auto* mod = geode::Mod::get()) {
-        if (auto sett = mod->getSetting(key)) {
-            if (auto kbSett = geode::cast::typeinfo_pointer_cast<geode::KeybindSettingV3>(sett)) {
-                const auto& binds = kbSett->getValue();
-                if (!binds.empty()) {
-                    return binds.front().toString();
-                }
-            }
-        }
-    }
-    return {};
-}
-} // namespace
 
 void ReplayManager::showSaveFeedback(SaveReplayResult result) {
     switch (result) {

@@ -1,7 +1,7 @@
 # Changelog
 
 ## Unreleased
-- **Windows review fixes (W1-W18):**
+- **Windows review fixes (W1-W19):**
   - Codec fallbacks (AV1 -> HEVC / H.264) now record at the bitrate of the codec actually used, and custom codec strings use their parsed codec's bitrate factor.
   - Saved replays no longer have a short audio dropout every 30 seconds: segment audio carries a 50 ms pre-roll and the export re-encodes one continuous AAC stream per track.
   - Replays are written to `replay_*.mp4.part` and renamed when finished; saving shows its progress in the menu, the log and on repeated F6, and exiting during a save logs the wait.
@@ -13,6 +13,7 @@
   - 4K frame-drop bursts are explained in the log and the encoder in-flight budget scales with the frame size.
   - Segment length counts game audio as well as video; the microphone queue is bounded by time; the "replay is OFF" hint shows the real toggle keybind; clearing a custom codec restores the previous preset; the FMOD capture DSP is re-attached if the audio system is recreated; temp-folder cleanup treats processes it cannot inspect as alive.
   - CI runs the Windows host tests (`host-tests-win`).
+  - A recording error (e.g. a full disk) now stops only the current session instead of switching Instant Replay off for good: Toggle Replay retries it and the next game start records again.
 
 ## v1.0.5
 - **SDK, Build & Documentation:**

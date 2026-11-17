@@ -1370,6 +1370,8 @@ void ReplayPopup::updateStatusDisplay(float dt) {
             } else {
                 m_statusLabel->setString("Replay Active (Settings Locked)");
             }
+        } else if (mgr->isStoppedByError()) {
+            m_statusLabel->setString("Replay Stopped by Error (Toggle to Retry)");
         } else {
             m_statusLabel->setString("Replay Disabled (Ready to Configure)");
         }
@@ -1384,6 +1386,8 @@ void ReplayPopup::updateStatusDisplay(float dt) {
             m_statusDot->setColor(ccc3(255, 185, 50)); // Amber
         } else if (isRec) {
             m_statusDot->setColor(ccc3(50, 255, 50)); // Green
+        } else if (mgr->isStoppedByError()) {
+            m_statusDot->setColor(ccc3(255, 185, 50)); // Amber: stopped by an error, setting still on
         } else {
             m_statusDot->setColor(ccc3(255, 60, 60)); // Red
         }
@@ -1399,6 +1403,9 @@ void ReplayPopup::updateStatusDisplay(float dt) {
         } else if (isRec) {
             m_lockWarningBanner->setString("(!) Recording is ACTIVE: settings locked! Stop recording to edit.");
             m_lockWarningBanner->setColor(ccc3(255, 85, 85));
+        } else if (mgr->isStoppedByError()) {
+            m_lockWarningBanner->setString("(!) Recording stopped by an error (see log). Toggle Replay retries it.");
+            m_lockWarningBanner->setColor(ccc3(255, 185, 50));
         } else {
             m_lockWarningBanner->setString("Settings Unlocked: modify parameters, then start recording.");
             m_lockWarningBanner->setColor(ccc3(110, 245, 140));
