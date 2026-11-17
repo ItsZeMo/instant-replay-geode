@@ -32,6 +32,15 @@ public:
     ~Com() { reset(); }
     Com(const Com&) = delete;
     Com& operator=(const Com&) = delete;
+    Com(Com&& other) noexcept : m_p(other.m_p) { other.m_p = nullptr; }
+    Com& operator=(Com&& other) noexcept {
+        if (this != &other) {
+            reset();
+            m_p = other.m_p;
+            other.m_p = nullptr;
+        }
+        return *this;
+    }
     void reset() noexcept {
         if (m_p) {
             m_p->Release();
@@ -93,8 +102,37 @@ int64_t hnsToFramesRounded(int64_t hns, UINT32 rate) noexcept {
     return (num >= 0) ? (num + 5000000LL) / 10000000LL : -((-num + 5000000LL) / 10000000LL);
 }
 
+// Native stream indices of one segment, by kind: MF's MP4 sink omits a video track that received no
+// samples (game minimized for a whole segment, W14), so stream indices differ between segments.
+struct SegmentLayout {
+    int videoIndex = -1;
+    std::vector<DWORD> audioIndices; // by audio track ordinal (0 = game, 1 = split microphone)
+};
+
+HRESULT readSegmentLayout(IMFSourceReader* reader, SegmentLayout& out,
+                          Com<IMFMediaType>* outVideoType, std::vector<Com<IMFMediaType>>* outAudioTypes) {
+    out = {};
+    for (DWORD s = 0; s < 16; ++s) {
+        Com<IMFMediaType> type;
+        HRESULT hr = reader->GetNativeMediaType(s, 0, type.put());
+        if (hr == MF_E_INVALIDSTREAMNUMBER) break;
+        if (FAILED(hr) || !type) return FAILED(hr) ? hr : E_FAIL;
+        GUID major = GUID_NULL;
+        type->GetGUID(MF_MT_MAJOR_TYPE, &major);
+        if (major == MFMediaType_Video && out.videoIndex < 0) {
+            out.videoIndex = static_cast<int>(s);
+            if (outVideoType && !*outVideoType) *outVideoType = std::move(type);
+        } else if (major == MFMediaType_Audio) {
+            if (outAudioTypes && outAudioTypes->size() <= out.audioIndices.size()) {
+                outAudioTypes->push_back(std::move(type));
+            }
+            out.audioIndices.push_back(s);
+        }
+    }
+    return S_OK;
+}
+
 struct StreamInfo {
-    DWORD readerIndex = 0;
     DWORD writerIndex = 0;
     bool isVideo = false;
     int audioTrack = -1;      // 0 = first audio track (game), 1 = second (split microphone)
@@ -134,16 +172,25 @@ ConcatResult concatenate(
     if (FAILED(hr)) return fail("MFCreateAttributes: " + hrText(hr));
     readerAttr->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, FALSE);
 
-    // 1. Discover the stream layout from the first segment and configure the output writer:
-    //    video passthrough, audio PCM -> AAC with the segment's rate / channels / bitrate.
+    // 1. Discover the output stream layout (video + audio tracks) from the first segment that has
+    //    video, then configure the writer: video passthrough, audio PCM -> AAC per track.
     std::vector<StreamInfo> streams;
     LONGLONG videoFrameDurationHns = 0;
 
     Com<IMFSinkWriter> writer;
     {
-        Com<IMFSourceReader> firstReader;
-        hr = MFCreateSourceReaderFromURL(segments[0].path.c_str(), readerAttr.get(), firstReader.put());
-        if (FAILED(hr) || !firstReader) return fail("cannot open first segment: " + hrText(hr));
+        Com<IMFMediaType> videoType;
+        std::vector<Com<IMFMediaType>> audioTypes;
+        for (size_t i = 0; i < segments.size(); ++i) {
+            Com<IMFSourceReader> probe;
+            hr = MFCreateSourceReaderFromURL(segments[i].path.c_str(), readerAttr.get(), probe.put());
+            if (FAILED(hr) || !probe) return fail("cannot open segment " + std::to_string(i + 1) + ": " + hrText(hr));
+            SegmentLayout layout;
+            hr = readSegmentLayout(probe.get(), layout, &videoType, &audioTypes);
+            if (FAILED(hr)) return fail("cannot read stream type: " + hrText(hr));
+            if (videoType) break;
+        }
+        if (!videoType && audioTypes.empty()) return fail("segments have no streams");
 
         Com<IMFAttributes> writerAttr;
         hr = MFCreateAttributes(writerAttr.put(), 2);
@@ -155,67 +202,55 @@ ConcatResult concatenate(
         hr = MFCreateSinkWriterFromURL(outputPath.c_str(), NULL, writerAttr.get(), writer.put());
         if (FAILED(hr) || !writer) return fail("cannot create output file: " + hrText(hr));
 
-        int audioTracks = 0;
-        for (DWORD s = 0; s < 16; ++s) {
-            Com<IMFMediaType> type;
-            hr = firstReader->GetNativeMediaType(s, 0, type.put());
-            if (hr == MF_E_INVALIDSTREAMNUMBER) break;
-            if (FAILED(hr) || !type) return fail("cannot read stream type: " + hrText(hr));
-
-            GUID major = GUID_NULL;
-            type->GetGUID(MF_MT_MAJOR_TYPE, &major);
+        if (videoType) {
             StreamInfo info;
-            info.readerIndex = s;
-
-            if (major == MFMediaType_Video) {
-                info.isVideo = true;
-                if (videoFrameDurationHns == 0) {
-                    UINT32 fpsNum = 0, fpsDen = 1;
-                    if (SUCCEEDED(MFGetAttributeRatio(type.get(), MF_MT_FRAME_RATE, &fpsNum, &fpsDen)) &&
-                        fpsNum > 0 && fpsDen > 0) {
-                        videoFrameDurationHns = (10000000LL * static_cast<LONGLONG>(fpsDen)) / static_cast<LONGLONG>(fpsNum);
-                    }
-                }
-                hr = writer->AddStream(type.get(), &info.writerIndex);
-                if (FAILED(hr)) return fail("cannot add output stream: " + hrText(hr));
-                hr = writer->SetInputMediaType(info.writerIndex, type.get(), NULL);
-                if (FAILED(hr)) return fail("cannot configure output stream: " + hrText(hr));
-            } else if (major == MFMediaType_Audio) {
-                info.audioTrack = audioTracks++;
-                UINT32 rate = 0, channels = 0, bytesPerSec = 0;
-                if (FAILED(type->GetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, &rate)) || rate == 0) rate = 48000;
-                if (FAILED(type->GetUINT32(MF_MT_AUDIO_NUM_CHANNELS, &channels)) || channels == 0) channels = 2;
-                if (FAILED(type->GetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, &bytesPerSec)) ||
-                    !isSupportedAacByteRate(bytesPerSec)) {
-                    bytesPerSec = (info.audioTrack == 0) ? 24000 : 16000;
-                }
-                info.rate = rate;
-                info.channels = channels;
-                info.blockAlign = channels * 2;
-
-                Com<IMFMediaType> aacOut;
-                hr = MFCreateMediaType(aacOut.put());
-                if (FAILED(hr)) return fail("MFCreateMediaType: " + hrText(hr));
-                aacOut->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
-                aacOut->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_AAC);
-                aacOut->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
-                aacOut->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, rate);
-                aacOut->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, channels);
-                aacOut->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, bytesPerSec);
-                hr = writer->AddStream(aacOut.get(), &info.writerIndex);
-                if (FAILED(hr)) return fail("cannot add output audio stream: " + hrText(hr));
-
-                Com<IMFMediaType> pcmIn;
-                hr = makePcm16Type(rate, channels, pcmIn.put());
-                if (FAILED(hr)) return fail("MFCreateMediaType: " + hrText(hr));
-                hr = writer->SetInputMediaType(info.writerIndex, pcmIn.get(), NULL);
-                if (FAILED(hr)) return fail("cannot configure AAC encoder: " + hrText(hr));
-            } else {
-                continue; // unknown stream type: not part of a replay
+            info.isVideo = true;
+            UINT32 fpsNum = 0, fpsDen = 1;
+            if (SUCCEEDED(MFGetAttributeRatio(videoType.get(), MF_MT_FRAME_RATE, &fpsNum, &fpsDen)) &&
+                fpsNum > 0 && fpsDen > 0) {
+                videoFrameDurationHns = (10000000LL * static_cast<LONGLONG>(fpsDen)) / static_cast<LONGLONG>(fpsNum);
             }
+            hr = writer->AddStream(videoType.get(), &info.writerIndex);
+            if (FAILED(hr)) return fail("cannot add output stream: " + hrText(hr));
+            hr = writer->SetInputMediaType(info.writerIndex, videoType.get(), NULL);
+            if (FAILED(hr)) return fail("cannot configure output stream: " + hrText(hr));
             streams.push_back(info);
         }
-        if (streams.empty()) return fail("first segment has no streams");
+
+        for (size_t ordinal = 0; ordinal < audioTypes.size(); ++ordinal) {
+            IMFMediaType* type = audioTypes[ordinal].get();
+            StreamInfo info;
+            info.audioTrack = static_cast<int>(ordinal);
+            UINT32 rate = 0, channels = 0, bytesPerSec = 0;
+            if (FAILED(type->GetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, &rate)) || rate == 0) rate = 48000;
+            if (FAILED(type->GetUINT32(MF_MT_AUDIO_NUM_CHANNELS, &channels)) || channels == 0) channels = 2;
+            if (FAILED(type->GetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, &bytesPerSec)) ||
+                !isSupportedAacByteRate(bytesPerSec)) {
+                bytesPerSec = (info.audioTrack == 0) ? 24000 : 16000;
+            }
+            info.rate = rate;
+            info.channels = channels;
+            info.blockAlign = channels * 2;
+
+            Com<IMFMediaType> aacOut;
+            hr = MFCreateMediaType(aacOut.put());
+            if (FAILED(hr)) return fail("MFCreateMediaType: " + hrText(hr));
+            aacOut->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+            aacOut->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_AAC);
+            aacOut->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
+            aacOut->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, rate);
+            aacOut->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, channels);
+            aacOut->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, bytesPerSec);
+            hr = writer->AddStream(aacOut.get(), &info.writerIndex);
+            if (FAILED(hr)) return fail("cannot add output audio stream: " + hrText(hr));
+
+            Com<IMFMediaType> pcmIn;
+            hr = makePcm16Type(rate, channels, pcmIn.put());
+            if (FAILED(hr)) return fail("MFCreateMediaType: " + hrText(hr));
+            hr = writer->SetInputMediaType(info.writerIndex, pcmIn.get(), NULL);
+            if (FAILED(hr)) return fail("cannot configure AAC encoder: " + hrText(hr));
+            streams.push_back(info);
+        }
 
         hr = writer->BeginWriting();
         if (FAILED(hr)) return fail("BeginWriting: " + hrText(hr));
@@ -226,14 +261,18 @@ ConcatResult concatenate(
     LONGLONG firstVideoDts = 0;
     bool hasFirstVideoDts = false;
     const LONGLONG trimHns = static_cast<LONGLONG>(std::max(0.0, trimStartSeconds) * 1e7);
-    auto videoIt = std::find_if(streams.begin(), streams.end(), [](const StreamInfo& s) { return s.isVideo; });
 
-    if (videoIt != streams.end()) {
-        Com<IMFSourceReader> scan;
-        hr = MFCreateSourceReaderFromURL(segments[0].path.c_str(), readerAttr.get(), scan.put());
-        if (FAILED(hr) || !scan) return fail("cannot open first segment: " + hrText(hr));
+    Com<IMFSourceReader> scan;
+    SegmentLayout firstLayout;
+    hr = MFCreateSourceReaderFromURL(segments[0].path.c_str(), readerAttr.get(), scan.put());
+    if (FAILED(hr) || !scan) return fail("cannot open first segment: " + hrText(hr));
+    hr = readSegmentLayout(scan.get(), firstLayout, nullptr, nullptr);
+    if (FAILED(hr)) return fail("cannot read stream type: " + hrText(hr));
+
+    if (firstLayout.videoIndex >= 0) {
+        const DWORD scanIndex = static_cast<DWORD>(firstLayout.videoIndex);
         scan->SetStreamSelection(static_cast<DWORD>(MF_SOURCE_READER_ALL_STREAMS), FALSE);
-        scan->SetStreamSelection(videoIt->readerIndex, TRUE);
+        scan->SetStreamSelection(scanIndex, TRUE);
 
         struct KeyCandidate {
             LONGLONG pts = -1;
@@ -247,7 +286,7 @@ ConcatResult concatenate(
             DWORD flags = 0;
             LONGLONG ts = 0;
             Com<IMFSample> sample;
-            hr = scan->ReadSample(videoIt->readerIndex, 0, nullptr, &flags, &ts, sample.put());
+            hr = scan->ReadSample(scanIndex, 0, nullptr, &flags, &ts, sample.put());
             if (FAILED(hr) || (flags & MF_SOURCE_READERF_ERROR)) return fail("cannot scan first segment: " + hrText(hr));
             if (sample) {
                 UINT64 rawDts = 0;
@@ -277,7 +316,10 @@ ConcatResult concatenate(
             if (flags & MF_SOURCE_READERF_ENDOFSTREAM) break;
         }
 
-        if (trimHns <= 0) {
+        if (initialSample.pts < 0) {
+            // First segment has an empty video track (game minimized, W14): cut the audio exactly.
+            cutHns = std::max<LONGLONG>(0, trimHns);
+        } else if (trimHns <= 0) {
             cutHns = 0;
             hasFirstVideoDts = initialSample.hasDts;
             firstVideoDts = initialSample.dts;
@@ -298,8 +340,9 @@ ConcatResult concatenate(
             firstVideoDts = chosen.dts;
         }
     } else if (trimHns > 0) {
-        cutHns = trimHns;
+        cutHns = trimHns; // no video in the first segment: cut the audio exactly
     }
+    scan.reset();
 
     // Shift all streams equally by any initial B-frame decode lead (cutHns - firstVideoDts)
     // so rebased DTS starts at >= 0 without clamping multiple initial packets to DTS == 0 (#21).
@@ -383,23 +426,33 @@ ConcatResult concatenate(
         if (FAILED(hr) || !reader) return fail("cannot open " + segLabel + ": " + hrText(hr));
 
         reader->SetStreamSelection(static_cast<DWORD>(MF_SOURCE_READER_ALL_STREAMS), FALSE);
+        SegmentLayout layout;
+        hr = readSegmentLayout(reader.get(), layout, nullptr, nullptr);
+        if (FAILED(hr)) return fail("cannot read stream types of " + segLabel + ": " + hrText(hr));
         std::map<DWORD, size_t> readerToStream;
         std::set<DWORD> remaining;
         for (size_t i = 0; i < streams.size(); ++i) {
             StreamInfo& st = streams[i];
-            Com<IMFMediaType> native;
-            hr = reader->GetNativeMediaType(st.readerIndex, 0, native.put());
-            if (FAILED(hr) || !native) return fail(segLabel + " is missing a stream: " + hrText(hr));
+            int readerIndex = -1;
+            if (st.isVideo) {
+                readerIndex = layout.videoIndex;
+            } else if (st.audioTrack >= 0 && static_cast<size_t>(st.audioTrack) < layout.audioIndices.size()) {
+                readerIndex = static_cast<int>(layout.audioIndices[static_cast<size_t>(st.audioTrack)]);
+            }
+            if (readerIndex < 0) {
+                continue; // e.g. no video track (game minimized): the timeline still advances via audio
+            }
+            const DWORD streamIndex = static_cast<DWORD>(readerIndex);
             if (!st.isVideo) {
                 // The source reader inserts Microsoft's AAC decoder for us.
                 Com<IMFMediaType> pcm;
                 hr = makePcm16Type(st.rate, st.channels, pcm.put());
                 if (FAILED(hr)) return fail("MFCreateMediaType: " + hrText(hr));
-                hr = reader->SetCurrentMediaType(st.readerIndex, nullptr, pcm.get());
+                hr = reader->SetCurrentMediaType(streamIndex, nullptr, pcm.get());
                 if (FAILED(hr)) return fail("cannot decode audio in " + segLabel + ": " + hrText(hr));
                 Com<IMFMediaType> current;
                 UINT32 rate = 0, channels = 0, bits = 0;
-                if (FAILED(reader->GetCurrentMediaType(st.readerIndex, current.put())) || !current ||
+                if (FAILED(reader->GetCurrentMediaType(streamIndex, current.put())) || !current ||
                     FAILED(current->GetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, &rate)) ||
                     FAILED(current->GetUINT32(MF_MT_AUDIO_NUM_CHANNELS, &channels)) ||
                     FAILED(current->GetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, &bits)) ||
@@ -407,10 +460,10 @@ ConcatResult concatenate(
                     return fail("unexpected decoded audio format in " + segLabel);
                 }
             }
-            hr = reader->SetStreamSelection(st.readerIndex, TRUE);
+            hr = reader->SetStreamSelection(streamIndex, TRUE);
             if (FAILED(hr)) return fail("cannot select stream in " + segLabel + ": " + hrText(hr));
-            readerToStream[st.readerIndex] = i;
-            remaining.insert(st.readerIndex);
+            readerToStream[streamIndex] = i;
+            remaining.insert(streamIndex);
         }
 
         const LONGLONG segCut = (segIdx == 0) ? cutHns : 0;

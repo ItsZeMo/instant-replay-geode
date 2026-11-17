@@ -1233,7 +1233,9 @@ void testSegmentDurationRuleW14() {
     // Keep rule: needs a finalized file with at least one frame; any track > 0.25 s keeps it.
     CHECK(replay::shouldKeepSegment(true, true, replay::segmentDurationSeconds(0, frame60, 48000, 48000)));
     CHECK(!replay::shouldKeepSegment(true, true, 0.2));
-    CHECK(!replay::shouldKeepSegment(true, false, 30.0)); // MF cannot finalize a video track without samples
+    CHECK(replay::shouldKeepSegment(true, false, 30.0, true));   // Windows: audio-only (minimized) segment kept
+    CHECK(!replay::shouldKeepSegment(true, false, 30.0, false)); // macOS keeps requiring a video frame
+    CHECK(!replay::shouldKeepSegment(true, false, 0.2, true));
     CHECK(!replay::shouldKeepSegment(false, true, 30.0));
     std::cout << "  PASS Test W14\n";
 }
@@ -1268,6 +1270,50 @@ void testMicQueueDurationLimitW15() {
     CHECK(replay::enforceAudioQueueFrameLimit(big, kLimit + 10, kLimit, frames) == 1000);
     CHECK(big.empty());
     std::cout << "  PASS Test W15\n";
+}
+
+// W14 (found in game): with GD minimized no frame is captured, but FMOD audio continues and MF still
+// finalizes the segment (empty video track). Such audio-only segments must survive the export.
+void testAudioOnlySegmentExportW14() {
+    std::cout << "[Test W14b] Export keeps audio-only segments (minimized game) continuous...\n";
+    auto tmp = std::filesystem::temp_directory_path() / L"ir_host_test_w14";
+    std::filesystem::create_directories(tmp);
+
+    constexpr int64_t kSegFrames = 96000;
+    constexpr double kAmp = 16000.0;
+    std::vector<replay::mfconcat::SegmentInput> inputs;
+    for (int seg = 0; seg < 3; ++seg) {
+        auto path = (tmp / (L"w14_seg" + std::to_wstring(seg) + L".mp4")).wstring();
+        const double videoSec = (seg == 1) ? 0.0 : 2.0; // middle segment: no video frames at all
+        writePrerollSegment(path, videoSec, {sineSegment(seg * kSegFrames, kSegFrames, 441.0, kAmp)});
+        replay::mfconcat::SegmentInput in;
+        in.path = path;
+        in.durationSeconds = 2.0;
+        in.audioFrames[0] = kSegFrames;
+        inputs.push_back(in);
+    }
+
+    replay::mfconcat::Options opt;
+    opt.audioPrerollHns = replay::kSegmentAudioPrerollHns;
+    auto out = (tmp / L"w14_out.mp4").wstring();
+    auto res = replay::mfconcat::concatenate(inputs, out, 0.0, opt);
+    if (!res.success) std::cerr << "  concat error: " << res.error << "\n";
+    CHECK(res.success);
+    CHECK(std::abs(res.durationSeconds - 6.0) < 0.05);
+    CHECK(countSeamDropouts(decodeAudioTrack(out, 0), kAmp, 0.020, nullptr) == 0);
+
+    // Replay that starts inside an audio-only segment: the trim must still apply (audio cut).
+    std::vector<replay::mfconcat::SegmentInput> fromAudioOnly(inputs.begin() + 1, inputs.end());
+    auto outTrim = (tmp / L"w14_trim.mp4").wstring();
+    auto resTrim = replay::mfconcat::concatenate(fromAudioOnly, outTrim, 0.5, opt);
+    if (!resTrim.success) std::cerr << "  concat error: " << resTrim.error << "\n";
+    CHECK(resTrim.success);
+    CHECK(std::abs(resTrim.durationSeconds - 3.5) < 0.05);
+    CHECK(countSeamDropouts(decodeAudioTrack(outTrim, 0), kAmp, 0.020, nullptr) == 0);
+
+    std::error_code ec;
+    std::filesystem::remove_all(tmp, ec);
+    std::cout << "  PASS Test W14b\n";
 }
 
 // Media Foundation may be missing on CI images (Windows Server without the Media Foundation
@@ -1328,6 +1374,7 @@ int main() {
     if (mediaFoundationTestsAvailable(whyNot)) {
         testConcatAndC1SeamMath();
         testExportAudioSeamsW2();
+        testAudioOnlySegmentExportW14();
         MFShutdown();
     } else {
         std::cout << "SKIP Media Foundation integration tests (Test 1, Test W2): " << whyNot << "\n";

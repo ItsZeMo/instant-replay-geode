@@ -73,6 +73,11 @@ static constexpr size_t MAX_MIC_MIX_FRAMES = static_cast<size_t>(AudioGrabber::k
 // Worker-side microphone queue limits by duration (W15): >= 3 s while recording, 0.25 s while no encoder runs.
 static constexpr size_t MAX_MIC_QUEUE_FRAMES = static_cast<size_t>(AudioGrabber::kMicSampleRate) * 3;
 static constexpr size_t MAX_IDLE_MIC_QUEUE_FRAMES = static_cast<size_t>(AudioGrabber::kMicSampleRate) / 4;
+#ifdef GEODE_IS_WINDOWS
+static constexpr bool KEEP_AUDIO_ONLY_SEGMENTS = true;  // MF finalizes/remuxes empty video tracks (W14)
+#else
+static constexpr bool KEEP_AUDIO_ONLY_SEGMENTS = false;
+#endif
 static constexpr int MAX_ENCODER_START_FAILURES = 3;
 static constexpr int MAX_CONSECUTIVE_WRITE_ERRORS = 5;
 
@@ -1853,7 +1858,7 @@ ReplayManager::PendingFinalizeInfo ReplayManager::finalizeCurrentSegment(bool sy
         oldEncoder.reset();
         reclaimInFlightFrames(false);
         std::lock_guard<std::mutex> lock(m_segmentMutex);
-        if (shouldKeepSegment(ok, hasVideo, segDuration)) {
+        if (shouldKeepSegment(ok, hasVideo, segDuration, KEEP_AUDIO_ONLY_SEGMENTS)) {
             m_activeSegments.push_back(segInfo);
         } else {
             geode::log::debug("Instant Replay: dropping segment (finalized={}, video={}, {:.2f} s)", ok, hasVideo, segDuration);
@@ -1886,7 +1891,7 @@ ReplayManager::PendingFinalizeInfo ReplayManager::finalizeCurrentSegment(bool sy
             geode::log::debug("Instant Replay: background segment finalize took {:.0f} ms", finalizeMs);
         }
 
-        bool keep = shouldKeepSegment(ok, hasVideo, segDuration);
+        bool keep = shouldKeepSegment(ok, hasVideo, segDuration, KEEP_AUDIO_ONLY_SEGMENTS);
         if (!keep) {
             geode::log::debug("Instant Replay: dropping segment (finalized={}, video={}, {:.2f} s)", ok, hasVideo, segDuration);
         }

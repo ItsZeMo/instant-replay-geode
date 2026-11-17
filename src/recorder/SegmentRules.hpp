@@ -25,10 +25,12 @@ inline double segmentDurationSeconds(
     return std::max(videoEnd, audioEnd);
 }
 
-// Media Foundation cannot finalize an MP4 whose video stream received no samples, so at least one
-// frame is still required; otherwise a segment is kept when any track lasts longer than 0.25 s.
-inline bool shouldKeepSegment(bool finalizedOk, bool hasVideo, double durationSeconds) noexcept {
-    return finalizedOk && hasVideo && durationSeconds > 0.25;
+// A finalized segment is kept when any track lasts longer than 0.25 s. Media Foundation finalizes and
+// remuxes segments whose video track got no frame (seen in game with GD minimized), so Windows keeps
+// audio-only segments; other backends still require at least one frame.
+inline bool shouldKeepSegment(bool finalizedOk, bool hasVideo, double durationSeconds,
+                              bool allowAudioOnly = false) noexcept {
+    return finalizedOk && (hasVideo || allowAudioOnly) && durationSeconds > 0.25;
 }
 
 } // namespace replay
