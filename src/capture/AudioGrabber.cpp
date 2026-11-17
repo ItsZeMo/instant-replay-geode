@@ -502,7 +502,12 @@ namespace {
 // thread re-evaluates the device and does all COM teardown itself (W6).
 class MicEndpointNotifier final : public IMMNotificationClient {
 public:
-    explicit MicEndpointNotifier(std::atomic<bool>& changed) noexcept : m_changed(changed) {}
+    MicEndpointNotifier() noexcept = default;
+
+    // The flag lives inside the ref-counted notifier, so a late callback can never touch freed memory.
+    bool hasChange() const noexcept { return m_changed.load(std::memory_order_acquire); }
+    bool consumeChange() noexcept { return m_changed.exchange(false, std::memory_order_acq_rel); }
+    void clearChange() noexcept { m_changed.store(false, std::memory_order_release); }
 
     ULONG STDMETHODCALLTYPE AddRef() override { return static_cast<ULONG>(InterlockedIncrement(&m_refs)); }
     ULONG STDMETHODCALLTYPE Release() override {
@@ -534,7 +539,7 @@ private:
     ~MicEndpointNotifier() = default;
     void signal() noexcept { m_changed.store(true, std::memory_order_release); }
 
-    std::atomic<bool>& m_changed;
+    std::atomic<bool> m_changed{false};
     LONG m_refs = 1;
 };
 
@@ -633,21 +638,21 @@ void AudioGrabber::micCaptureThreadFunc() {
 
     // Follow device arrival/removal and default-device changes, so a reconnected selected mic is
     // picked up again and "Default System Device" follows Windows' default (W6).
-    std::atomic<bool> deviceChanged{false};
     MicEndpointNotifier* notifier = nullptr;
     ComRef<IMMDeviceEnumerator> notifyEnumerator;
     if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_ALL,
                                    __uuidof(IMMDeviceEnumerator), (void**)notifyEnumerator.put())) && notifyEnumerator) {
-        notifier = new MicEndpointNotifier(deviceChanged);
+        notifier = new MicEndpointNotifier();
         if (FAILED(notifyEnumerator->RegisterEndpointNotificationCallback(notifier))) {
             notifier->Release();
             notifier = nullptr;
         }
     }
 
-    auto sleepInterruptible = [this, &deviceChanged](int totalMs) {
+    auto deviceChangePending = [&notifier]() { return notifier && notifier->hasChange(); };
+    auto sleepInterruptible = [this, &deviceChangePending](int totalMs) {
         int elapsed = 0;
-        while (elapsed < totalMs && m_micRunning.load() && !deviceChanged.load(std::memory_order_acquire)) {
+        while (elapsed < totalMs && m_micRunning.load() && !deviceChangePending()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
             elapsed += 50;
         }
@@ -660,7 +665,7 @@ void AudioGrabber::micCaptureThreadFunc() {
     std::wstring lastDeviceId;
 
     while (m_micRunning.load()) {
-        deviceChanged.store(false, std::memory_order_release);
+        if (notifier) notifier->clearChange();
         ComRef<IMMDeviceEnumerator> enumerator;
         HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_ALL,
                                       __uuidof(IMMDeviceEnumerator), (void**)enumerator.put());
@@ -758,7 +763,7 @@ void AudioGrabber::micCaptureThreadFunc() {
                         std::this_thread::sleep_for(std::chrono::milliseconds(4));
                     }
 
-                    if (deviceChanged.exchange(false, std::memory_order_acq_rel)) {
+                    if (notifier && notifier->consumeChange()) {
                         bool wantedFallback = false;
                         ComRef<IMMDevice> wanted = resolveWantedMic(enumerator.get(), selectedId, wantedFallback);
                         if (wanted && endpointId(wanted.get()) != deviceId) {
