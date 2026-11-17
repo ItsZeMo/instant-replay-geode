@@ -96,6 +96,8 @@ void getMacOpenGLDrawableSize(int& outWidth, int& outHeight) {
     outHeight = 0;
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    // Note (N11): GD runs its Cocos loop on CVDisplayLink rather than AppKit's main thread, so
+    // [NSThread isMainThread] is normally NO here and resolution falls through to GL_VIEWPORT below.
     if ([NSThread isMainThread]) {
         @autoreleasepool {
             id eaglView = getSharedEAGLView();
@@ -124,20 +126,12 @@ void getMacOpenGLDrawableSize(int& outWidth, int& outHeight) {
         }
     }
     if (outWidth <= 0 || outHeight <= 0) {
-        if (auto* view = cocos2d::CCEGLView::get()) {
-            auto fs = view->getFrameSize();
-            float scale = 1.0f;
-            @autoreleasepool {
-                id eaglView = getSharedEAGLView();
-                if (eaglView && [eaglView isKindOfClass:[NSView class]] &&
-                    [static_cast<NSView*>(eaglView) wantsBestResolutionOpenGLSurface]) {
-                    float f = geode::utils::getDisplayFactor();
-                    if (f > 1.0f) scale = f;
-                }
-            }
-            outWidth = static_cast<int>(fs.width * scale + 0.5f);
-            outHeight = static_cast<int>(fs.height * scale + 0.5f);
-        }
+        // Do not fall back to CCEGLView::getFrameSize() on macOS (it reports point-halved sizes such as
+        // 720x450 for a 1440x900 OpenGL drawable, N7). Leave 0x0 so FrameGrabber resolves on render thread.
+        geode::log::debug(
+            "Instant Replay: getMacOpenGLDrawableSize deferred (cglCtx={}, mainThread={})",
+            CGLGetCurrentContext() != nullptr,
+            [NSThread isMainThread] == YES);
     }
 #pragma clang diagnostic pop
 }

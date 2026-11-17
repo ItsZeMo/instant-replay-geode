@@ -139,22 +139,23 @@ struct ReplayConfig {
     static inline std::atomic<int> s_nativeFrameHeight{1080};
 
     // Resolves physical OpenGL drawable dimensions across Windows and macOS Retina (backing pixels).
-    // On macOS, getMacOpenGLDrawableSize() already accounts for Retina wantsBestResolutionOpenGLSurface
-    // and falls back to CCEGLView * getDisplayFactor(). Must ONLY be called on main / GL render thread (#18, M4).
+    // On macOS, delegates strictly to getMacOpenGLDrawableSize() (NSView on AppKit main or active
+    // GL_VIEWPORT on the render thread) and returns false rather than falling back to point-scaled
+    // CCEGLView::getFrameSize() (N7). Must ONLY be called on the main / GL render thread (#18, M4).
     static bool getNativeFramebufferSize(int& outW, int& outH) noexcept {
         outW = 0;
         outH = 0;
 #ifdef GEODE_IS_MACOS
         getMacOpenGLDrawableSize(outW, outH);
-#endif
-        if (outW < 16 || outH < 16) {
-            if (auto view = cocos2d::CCEGLView::get()) {
-                auto fs = view->getFrameSize();
-                outW = static_cast<int>(fs.width + 0.5f);
-                outH = static_cast<int>(fs.height + 0.5f);
-            }
+        return outW >= 16 && outH >= 16;
+#else
+        if (auto view = cocos2d::CCEGLView::get()) {
+            auto fs = view->getFrameSize();
+            outW = static_cast<int>(fs.width + 0.5f);
+            outH = static_cast<int>(fs.height + 0.5f);
         }
         return outW >= 16 && outH >= 16;
+#endif
     }
 
     // Must ONLY be called on the main / OpenGL render thread (#18).
