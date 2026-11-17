@@ -129,23 +129,31 @@ bool isPidProcessAlive(uint32_t pid) {
     if (pid == 0) return false;
     if (pid == currentPid()) return true;
 #ifdef GEODE_IS_WINDOWS
+    // Conservative: only a definitely-gone process (or a different executable reusing the PID) counts
+    // as dead. Access denied (elevated GD, another user's GD) or any unknown state keeps the folder,
+    // cleanup simply retries on the next start (W10).
     HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(pid));
     if (!hProc) {
-        return false;
+        return GetLastError() != ERROR_INVALID_PARAMETER;
     }
     DWORD exitCode = 0;
-    bool alive = GetExitCodeProcess(hProc, &exitCode) && exitCode == STILL_ACTIVE;
-    bool sameApp = false;
-    if (alive) {
-        wchar_t selfExe[MAX_PATH] = {};
-        wchar_t otherExe[MAX_PATH] = {};
-        DWORD selfLen = GetModuleFileNameW(nullptr, selfExe, MAX_PATH);
-        DWORD otherLen = MAX_PATH;
-        if (selfLen > 0 && QueryFullProcessImageNameW(hProc, 0, otherExe, &otherLen)) {
-            std::filesystem::path selfName = std::filesystem::path(selfExe).filename();
-            std::filesystem::path otherName = std::filesystem::path(otherExe).filename();
-            sameApp = !selfName.empty() && _wcsicmp(selfName.c_str(), otherName.c_str()) == 0;
-        }
+    if (!GetExitCodeProcess(hProc, &exitCode)) {
+        CloseHandle(hProc);
+        return true;
+    }
+    if (exitCode != STILL_ACTIVE) {
+        CloseHandle(hProc);
+        return false;
+    }
+    bool sameApp = true; // image name unreadable -> assume it is ours
+    wchar_t selfExe[MAX_PATH] = {};
+    wchar_t otherExe[MAX_PATH] = {};
+    DWORD selfLen = GetModuleFileNameW(nullptr, selfExe, MAX_PATH);
+    DWORD otherLen = MAX_PATH;
+    if (selfLen > 0 && QueryFullProcessImageNameW(hProc, 0, otherExe, &otherLen)) {
+        std::filesystem::path selfName = std::filesystem::path(selfExe).filename();
+        std::filesystem::path otherName = std::filesystem::path(otherExe).filename();
+        sameApp = selfName.empty() || _wcsicmp(selfName.c_str(), otherName.c_str()) == 0;
     }
     CloseHandle(hProc);
     return sameApp;
