@@ -28,6 +28,7 @@
 #include "encoder/MfSegmentConcat.hpp"
 #include "encoder/SegmentAudioLayout.hpp"
 #include "recorder/MicMixFifo.hpp"
+#include "recorder/SegmentRules.hpp"
 
 #pragma comment(lib, "mfplat.lib")
 #pragma comment(lib, "mfreadwrite.lib")
@@ -1217,6 +1218,24 @@ void testResolutionBitrateSemanticsW9() {
     std::cout << "  PASS Test W9\n";
 }
 
+void testSegmentDurationRuleW14() {
+    std::cout << "[Test W14] Segment duration = later of video and game-audio end...\n";
+    const double frame60 = 1.0 / 60.0;
+    // GD minimized: 5 s of video, 30 s of game audio -> 30 s segment (was 5 s).
+    CHECK(std::abs(replay::segmentDurationSeconds(50000000LL - 166667LL, frame60, 30LL * 48000, 48000) - 30.0) < 1e-6);
+    // Normal rotation: audio split exactly at S, video ends one frame later -> video end wins.
+    const double normal = replay::segmentDurationSeconds(300000000LL - 1000LL, frame60, 30LL * 48000, 48000);
+    CHECK(normal > 30.0 && normal < 30.0 + frame60 + 1e-6);
+    // 44.1 kHz game audio is converted with its own rate.
+    CHECK(std::abs(replay::segmentDurationSeconds(-1, frame60, 44100LL * 12, 44100) - 12.0) < 1e-9);
+    // Keep rule: needs a finalized file with at least one frame; any track > 0.25 s keeps it.
+    CHECK(replay::shouldKeepSegment(true, true, replay::segmentDurationSeconds(0, frame60, 48000, 48000)));
+    CHECK(!replay::shouldKeepSegment(true, true, 0.2));
+    CHECK(!replay::shouldKeepSegment(true, false, 30.0)); // MF cannot finalize a video track without samples
+    CHECK(!replay::shouldKeepSegment(false, true, 30.0));
+    std::cout << "  PASS Test W14\n";
+}
+
 // Media Foundation may be missing on CI images (Windows Server without the Media Foundation
 // feature): mfplat / mfreadwrite are delay-loaded and the MF integration tests are skipped then.
 bool mediaFoundationTestsAvailable(std::string& whyNot) {
@@ -1268,6 +1287,7 @@ int main() {
     testH264BoundsAndCodecSpecC3();
     testCodecFallbackBitratesW1();
     testResolutionBitrateSemanticsW9();
+    testSegmentDurationRuleW14();
 
     std::string whyNot;
     if (mediaFoundationTestsAvailable(whyNot)) {

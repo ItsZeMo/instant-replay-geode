@@ -5,6 +5,7 @@
 #include "../ui/ReplayNotification.hpp"
 #include "../ui/ReplayPopup.hpp"
 #include "../capture/FrameBudget.hpp"
+#include "SegmentRules.hpp"
 #include <Geode/binding/FMODAudioEngine.hpp>
 #include <Geode/utils/async.hpp>
 #include <Geode/utils/file.hpp>
@@ -1821,7 +1822,9 @@ ReplayManager::PendingFinalizeInfo ReplayManager::finalizeCurrentSegment(bool sy
     auto segStart = m_currentSegmentStart;
     bool hasVideo = (m_lastVideoHns >= 0);
     double frameDur = 1.0 / static_cast<double>(std::max(1, cfg.targetFps.load()));
-    double segDuration = hasVideo ? (static_cast<double>(m_lastVideoHns) / 1e7 + frameDur) : 0.0;
+    // Later of video end and game-audio end (W14).
+    double segDuration = segmentDurationSeconds(
+        m_lastVideoHns, frameDur, m_gameAudioSamples, (m_segmentGameSampleRate > 0) ? m_segmentGameSampleRate : 48000);
 
     SegmentInfo segInfo;
     segInfo.filePath = segPath;
@@ -1842,9 +1845,10 @@ ReplayManager::PendingFinalizeInfo ReplayManager::finalizeCurrentSegment(bool sy
         oldEncoder.reset();
         reclaimInFlightFrames(false);
         std::lock_guard<std::mutex> lock(m_segmentMutex);
-        if (ok && hasVideo && segDuration > 0.25) {
+        if (shouldKeepSegment(ok, hasVideo, segDuration)) {
             m_activeSegments.push_back(segInfo);
         } else {
+            geode::log::debug("Instant Replay: dropping segment (finalized={}, video={}, {:.2f} s)", ok, hasVideo, segDuration);
             deleteSegmentFileLocked(segPath);
         }
         return {};
@@ -1874,7 +1878,10 @@ ReplayManager::PendingFinalizeInfo ReplayManager::finalizeCurrentSegment(bool sy
             geode::log::debug("Instant Replay: background segment finalize took {:.0f} ms", finalizeMs);
         }
 
-        bool keep = (ok && hasVideo && segDuration > 0.25);
+        bool keep = shouldKeepSegment(ok, hasVideo, segDuration);
+        if (!keep) {
+            geode::log::debug("Instant Replay: dropping segment (finalized={}, video={}, {:.2f} s)", ok, hasVideo, segDuration);
+        }
         {
             std::lock_guard<std::mutex> segLock(m_segmentMutex);
             if (keep) {
