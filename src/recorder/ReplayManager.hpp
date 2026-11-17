@@ -65,6 +65,7 @@ public:
     bool isExportInFlight() const noexcept { return m_exportInFlight.load(); }
     bool isSaving() const noexcept { return m_savePending.load() || m_exportInFlight.load(); }
     static bool isCaptureBackendReady() noexcept;
+    bool isBackendUnavailable() const noexcept { return m_backendUnavailable.load() || !isCaptureBackendReady(); }
 
     // Direct folder opener
     void openRecordingsFolder();
@@ -78,6 +79,7 @@ private:
 
     void startReplay();
     void stopReplay();
+    void reportCaptureBackendUnavailable();
 
     struct PreparedEncoder {
         std::unique_ptr<PlatformEncoder> encoder;
@@ -260,6 +262,7 @@ private:
     std::atomic<bool> m_saveRequested{false};
     std::atomic<bool> m_exportInFlight{false};
     std::atomic<bool> m_shuttingDown{false};
+    std::atomic<bool> m_backendUnavailable{false};
     uint64_t m_sessionId = 0; // guarded by m_queueMutex (#12, #13)
 
     // Asynchronous teardown thread & lifecycle state guard for non-blocking Stop/Start

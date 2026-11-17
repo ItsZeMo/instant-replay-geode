@@ -1314,7 +1314,7 @@ void ReplayPopup::updateStatusDisplay(float dt) {
         }
     }
 
-    bool captureReady = ReplayManager::isCaptureBackendReady();
+    bool captureReady = !mgr->isBackendUnavailable();
 
     if (m_statusLabel) {
         if (!captureReady) {

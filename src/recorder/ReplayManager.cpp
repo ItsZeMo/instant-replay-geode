@@ -521,6 +521,7 @@ void ReplayManager::initialize() {
     m_stopping.store(false);
     m_saveRequested.store(false);
     m_savePending.store(false);
+    m_backendUnavailable.store(!isCaptureBackendReady());
     ReplayConfig::refreshNativeFrameHeight();
 #ifdef GEODE_IS_MACOS
     {
@@ -624,6 +625,21 @@ bool ReplayManager::isCaptureBackendReady() noexcept {
 #endif
 }
 
+void ReplayManager::reportCaptureBackendUnavailable() {
+    geode::log::error("Instant Replay: cannot start recording because the macOS GL capture hook failed to install (M20)");
+    geode::Loader::get()->queueInMainThread([]() {
+        geode::Notification::create(
+            "Instant Replay: Capture hook failed - cannot record video",
+            geode::NotificationIcon::Error,
+            4.0f
+        )->show();
+        if (auto* popup = ReplayPopup::get()) {
+            popup->refreshUI();
+            popup->updateStatusDisplay(0.0f);
+        }
+    });
+}
+
 void ReplayManager::startReplay() {
     {
         std::lock_guard<std::mutex> lc(m_lifecycleMutex);
@@ -641,22 +657,12 @@ void ReplayManager::startReplay() {
     if (m_running.load() || m_shuttingDown.load() || m_stopping.load()) return;
 
     if (!isCaptureBackendReady()) {
-        geode::log::error("Instant Replay: cannot start recording because the macOS GL capture hook failed to install (M20)");
-        ReplayConfig::get().enabled = false;
-        ReplayConfig::get().saveToSettings();
-        geode::Loader::get()->queueInMainThread([]() {
-            geode::Notification::create(
-                "Instant Replay: Capture hook failed - cannot record video",
-                geode::NotificationIcon::Error,
-                4.0f
-            )->show();
-            if (auto* popup = ReplayPopup::get()) {
-                popup->refreshUI();
-                popup->updateStatusDisplay(0.0f);
-            }
-        });
+        // Keep user's persisted "enabled" setting untouched across transient hook failures (N6).
+        m_backendUnavailable.store(true);
+        reportCaptureBackendUnavailable();
         return;
     }
+    m_backendUnavailable.store(false);
 
     ReplayConfig::refreshNativeFrameHeight();
 
@@ -907,15 +913,17 @@ ToggleReplayResult ReplayManager::toggleReplay() {
         return restartQueued ? ToggleReplayResult::RestartQueued : ToggleReplayResult::StopPending;
     }
 
+    if (!isCaptureBackendReady()) {
+        m_backendUnavailable.store(true);
+        reportCaptureBackendUnavailable();
+        return ToggleReplayResult::Unavailable;
+    }
+
     bool newState = !cfg.enabled.load();
     cfg.enabled = newState;
     cfg.saveToSettings();
 
     if (newState) {
-        if (!isCaptureBackendReady()) {
-            startReplay();
-            return ToggleReplayResult::Unavailable;
-        }
         startReplay();
         return m_pendingRestart.load() ? ToggleReplayResult::RestartQueued : ToggleReplayResult::Enabled;
     }
