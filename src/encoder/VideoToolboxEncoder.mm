@@ -1753,7 +1753,6 @@ ConcatResult concatenateImpl(
                                     uint32_t streamId = 0;
                                     CMSampleBufferRef peek = nullptr;
                                     CMTime peekOrigOutPts = kCMTimeInvalid;
-                                    CMTime peekOrigOutDts = kCMTimeInvalid;
                                     int64_t peekPtsHns = 0;
                                     int64_t peekDtsHns = 0;
                                     int64_t peekDurHns = 0;
@@ -1837,7 +1836,6 @@ ConcatResult concatenateImpl(
                                                 : CMSampleBufferGetDuration(next);
                                             sl.peek = next;
                                             sl.peekOrigOutPts = pts;
-                                            sl.peekOrigOutDts = dts;
                                             sl.peekPtsHns = cmTimeToHns(pts);
                                             sl.peekDtsHns = CMTIME_IS_VALID(dts) ? cmTimeToHns(dts) : sl.peekPtsHns;
                                             int64_t durHns = CMTIME_IS_VALID(dur) ? cmTimeToHns(dur) : 0;
@@ -1975,7 +1973,6 @@ ConcatResult concatenateImpl(
 
                                         CMSampleBufferRef sample = cur.peek;
                                         CMTime origOutPts = cur.peekOrigOutPts;
-                                        CMTime origOutDts = cur.peekOrigOutDts;
                                         int64_t ptsHns = cur.peekPtsHns;
                                         int64_t dtsHns = cur.peekDtsHns;
                                         int64_t durHns = cur.peekDurHns;
