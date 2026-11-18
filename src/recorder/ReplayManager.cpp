@@ -540,9 +540,8 @@ void ReplayManager::waitForExportBeforeExit() {
 }
 
 // Removes our own "replay_*.mp4.part" leftovers (export interrupted by a crash or kill) that are
-// older than one hour. Runs off the main thread (W3).
+// older than one hour. Runs off the main thread (W3; macOS too since K2).
 void ReplayManager::cleanupStalePartialReplays() {
-#ifdef GEODE_IS_WINDOWS
     auto cfg = ReplayConfig::get().snapshot();
     geode::async::runtime().spawnBlocking<void>([cfg]() {
         std::error_code ec;
@@ -576,7 +575,6 @@ void ReplayManager::cleanupStalePartialReplays() {
             geode::log::info("Instant Replay: removed {} stale partial replay file(s) from an interrupted export", removed);
         }
     });
-#endif
 }
 
 void ReplayManager::joinStopThread() {
@@ -2766,10 +2764,8 @@ bool ReplayManager::handleSaveRequest(
             finalPath = saveDir / (baseStem + "_" + std::to_string(suffix) + ".mp4");
         }
         // Merge into "<name>.mp4.part" and rename only after a successful finalize, so a killed
-        // process never leaves a moov-less "replay_*.mp4" behind (W3).
-#ifdef GEODE_IS_WINDOWS
+        // process never leaves a moov-less "replay_*.mp4" behind (W3; macOS too since K2).
         const std::filesystem::path writePath = partPathFor(finalPath);
-#endif
 
         geode::log::info(
             "Instant Replay: saving replay: {} segment(s), {:.1f} s buffered, trimming {:.1f} s -> {}",
@@ -2795,24 +2791,32 @@ bool ReplayManager::handleSaveRequest(
             }
             result = PlatformEncoder::concatenateSegments(segDescs, writePath, trimStartSeconds, &m_exportProgressPermille);
 #else
-            result = PlatformEncoder::concatenateSegments(segsToMerge, finalPath, trimStartSeconds);
+            result = PlatformEncoder::concatenateSegments(segsToMerge, writePath, trimStartSeconds);
 #endif
         }
 
         releaseExportSegments(segsToMerge);
-#ifdef GEODE_IS_WINDOWS
         if (result.success) {
+#ifdef GEODE_IS_WINDOWS
             if (!MoveFileExW(writePath.c_str(), finalPath.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
                 const DWORD moveErr = GetLastError();
                 result.success = false;
                 result.error = "cannot rename finished replay (error " + std::to_string(moveErr) + ")";
             }
+#else
+            // Same directory -> rename(2) is atomic: the replay appears complete or not at all (K2).
+            std::error_code mvEc;
+            std::filesystem::rename(writePath, finalPath, mvEc);
+            if (mvEc) {
+                result.success = false;
+                result.error = "cannot rename finished replay (" + mvEc.message() + ")";
+            }
+#endif
         }
         if (!result.success) {
             std::error_code rmEc;
             std::filesystem::remove(writePath, rmEc);
         }
-#endif
         m_exportProgressPermille.store(-1, std::memory_order_relaxed);
 
         std::string finalPathStr = geode::utils::string::pathToString(finalPath);

@@ -1405,6 +1405,55 @@ void testTrimmedExportSync() {
     std::cout << "  PASS Test 14 (T-trim)\n";
 }
 
+// T-K2: the export writes "<name>.mp4.part" (AVAssetWriter with an explicit MPEG-4 file type accepts the
+// extension) and the renamed file is a complete, playable MP4; a failed export leaves neither file.
+void testPartialExportPathK2() {
+    std::cout << "[Test 16 / T-K2] Export into .mp4.part, rename to .mp4, failure leaves no file...\n" << std::flush;
+    auto testDir = std::filesystem::temp_directory_path() / "InstantReplayMacHostTest_K2";
+    std::error_code ec;
+    std::filesystem::remove_all(testDir, ec);
+    std::filesystem::create_directories(testDir, ec);
+
+    std::vector<std::filesystem::path> segs;
+    for (int i = 0; i < 2; ++i) {
+        auto seg = testDir / ("seg_" + std::to_string(i + 1) + ".mp4");
+        writeEncoderSegment(seg, 1.0, 1.0, 1.0, 30, replay::CodecType::H264, true);
+        segs.push_back(seg);
+    }
+
+    auto finalPath = testDir / "replay_k2.mp4";
+    auto partPath = testDir / "replay_k2.mp4.part";
+    auto res = replay::VideoToolboxEncoder::concatenateSegments(segs, partPath, 0.0);
+    CHECK(res.success);
+    CHECK(std::filesystem::exists(partPath));
+    CHECK(!std::filesystem::exists(finalPath));
+    std::filesystem::rename(partPath, finalPath, ec);
+    CHECK(!ec);
+    CHECK(!std::filesystem::exists(partPath));
+    @autoreleasepool {
+        std::string u8 = geode::utils::string::pathToString(finalPath);
+        AVURLAsset* asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:[NSString stringWithUTF8String:u8.c_str()]]
+                                                options:@{AVURLAssetPreferPreciseDurationAndTimingKey: @YES}];
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        CHECK(asset.playable);
+        CHECK([asset tracksWithMediaType:AVMediaTypeVideo].count == 1);
+        CHECK([asset tracksWithMediaType:AVMediaTypeAudio].count == 2);
+        CHECK(std::fabs(CMTimeGetSeconds(asset.duration) - 2.0) < 0.1);
+#pragma clang diagnostic pop
+    }
+
+    // A failed export (unreadable segment) removes its partial output.
+    auto badSeg = testDir / "missing_seg.mp4";
+    auto badPart = testDir / "replay_bad.mp4.part";
+    auto bad = replay::VideoToolboxEncoder::concatenateSegments({segs[0], badSeg}, badPart, 0.0);
+    CHECK(!bad.success);
+    CHECK(!std::filesystem::exists(badPart));
+
+    std::filesystem::remove_all(testDir, ec);
+    std::cout << "  PASS Test 16 (T-K2)\n";
+}
+
 // Writes one ~30 s segment the way the recorder does in game: jittered 60 FPS video with dropped
 // frames, irregular FMOD-like game chunks and CoreAudio-like mic chunks, audio padded to the boundary.
 // The marker flash and both beeps start at the same presentation time (the flashed frame's PTS).
@@ -1534,6 +1583,7 @@ int main(int argc, char** argv) {
         testHevcSoftwareWritableConsistency();
         testAacRoundingOverlapTolerance();
         testTrimmedExportSync();
+        testPartialExportPathK2();
         if (runLong) {
             testLongProductionLikeExport();
         } else {
