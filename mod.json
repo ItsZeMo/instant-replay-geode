@@ -38,7 +38,7 @@
             "max": 3600,
             "control": {
                 "slider": true,
-                "step": 5
+                "slider-step": 5
             }
         },
         "video-title": {
@@ -91,7 +91,7 @@
             "max": 240,
             "control": {
                 "slider": true,
-                "step": 30
+                "slider-step": 30
             }
         },
         "rate-control-title": {
@@ -118,7 +118,7 @@
             "max": 250,
             "control": {
                 "slider": true,
-                "step": 5
+                "slider-step": 5
             }
         },
         "max-bitrate": {
@@ -130,7 +130,7 @@
             "max": 300,
             "control": {
                 "slider": true,
-                "step": 5
+                "slider-step": 5
             }
         },
         "quality-level": {
@@ -142,7 +142,7 @@
             "max": 100,
             "control": {
                 "slider": true,
-                "step": 5
+                "slider-step": 5
             }
         },
         "audio-title": {
