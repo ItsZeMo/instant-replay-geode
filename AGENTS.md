@@ -31,7 +31,8 @@ instant-replay-geode/
 ├── tests/
 │   └── host/
 │       ├── test_host.cpp                # Standalone Windows host unit/MF integration tests (clang-cl /std:c++latest)
-│       ├── test_host_mac.mm             # Standalone macOS VideoToolbox/CGL/remux host integration tests
+│       ├── test_host_mac.mm             # Standalone macOS VideoToolbox/CGL/remux host integration tests (--long: 10-min export)
+│       ├── shared_pure_tests.hpp        # Platform-independent tests run by BOTH drivers (K7; keep platform headers out)
 │       └── mock_geode/                  # Minimal header mocks for standalone macOS host tests
 └── src/
     ├── main.cpp                         # Hooks ($on_game(Exiting), CCEGLView / NSOpenGLContext flushBuffer, FMODAudioEngine, menus), keybinds
@@ -47,7 +48,8 @@ instant-replay-geode/
     │   ├── FrameBudget.hpp              # Dynamic byte-budgeted pool/queue/in-flight frame helpers
     │   ├── FrameGrabber.hpp / .cpp      # OpenGL FBO scaling + async PBO readback + IMFMediaBuffer / BT.709 CVPixelBuffer pool
     │   ├── GameAudioRing.hpp            # Lock-free SPSC ring buffer + packet metadata ring for FMOD audio
-    │   └── AudioGrabber.hpp/.cpp/.mm    # FMOD DSP capture + WASAPI (Win) / CoreAudio + TCC mic capture (Mac)
+    │   ├── AudioGrabber.hpp/.cpp/.mm    # FMOD DSP capture + WASAPI (Win) / CoreAudio + TCC mic capture (Mac)
+    │   └── MicStatusPolicy.hpp          # MicCaptureStatus + Geode-free mic status policy (K1, host-tested)
     ├── encoder/
     │   ├── VideoEncoderTypes.hpp        # Shared EncoderOpResult struct (+ ConcatResult.hpp, Geode-free)
     │   ├── PlatformEncoder.hpp          # Platform encoder type alias (MediaFoundationEncoder / VideoToolboxEncoder)
@@ -80,7 +82,7 @@ instant-replay-geode/
 
 2. **Audio Capture (`src/capture/AudioGrabber.cpp`, `src/capture/AudioGrabberMac.mm`)**
    - **Game Audio:** Custom FMOD DSP attached to the tail of the Master `ChannelGroup`. Writes normalized 2-channel stereo float PCM into a pre-allocated **lock-free SPSC ring buffer + 8192-entry packet metadata ring** (`GameAudioRing`, 262144 stereo frames / ~5.46s @ 48 kHz) with zero heap allocations or mutex locks on the FMOD mixer thread.
-   - **Microphone Audio:** Event-driven WASAPI capture (Windows) and CoreAudio `AudioQueue` (macOS), started only when both `enabled` and `recordMic` are true and stopped immediately in `ReplayManager::stopReplay()`. On Windows an `IMMNotificationClient` flags device arrival/removal and default-device changes; the capture thread re-resolves the wanted device (selected mic while active, else the default) and reports `Active` / `UsingFallbackDevice` / `NoInputDevice` / `DigitalSilenceDetected` (W6). On macOS, checks `[AVCaptureDevice authorizationStatusForMediaType:]` + bundle `NSMicrophoneUsageDescription` before touching CoreAudio (`BlockedNoUsageDescription` alerts when non-Steam launches are muted by TCC after 3s silence or denied without usage key, vs `PermissionDenied` / `DigitalSilenceDetected`), and falls back to the system default input when a chosen mic disconnects (reattaching when it returns).
+   - **Microphone Audio:** Event-driven WASAPI capture (Windows) and CoreAudio `AudioQueue` (macOS), started only when both `enabled` and `recordMic` are true and stopped immediately in `ReplayManager::stopReplay()`. On Windows an `IMMNotificationClient` flags device arrival/removal and default-device changes; the capture thread re-resolves the wanted device (selected mic while active, else the default) and reports `Active` / `UsingFallbackDevice` / `NoInputDevice` / `DigitalSilenceDetected` (W6). On macOS, checks `[AVCaptureDevice authorizationStatusForMediaType:]` + bundle `NSMicrophoneUsageDescription` before touching CoreAudio and falls back to the system default input when a chosen mic disconnects (reattaching when it returns). GD ships without `NSMicrophoneUsageDescription` (Steam and launcher builds), so macOS grants the mic only through the responsible app (Steam asks for it). Status policy (`MicStatusPolicy.hpp`, K1): only an explicit privacy denial (`Denied` / `Restricted` or a refused prompt) is `PermissionDenied` and stops capture for the launch; >= 3 s of pure digital silence is a *soft* status (`BlockedNoUsageDescription` when the grant is undetermined and the bundle has no usage key, `DigitalSilenceDetected` when granted) that keeps the `AudioQueue` running and returns to `Active` on real audio. Every capture run resets the status, and live statuses are published with a CAS that never overwrites a denial.
 
 3. **Worker Thread & Rolling Segments (`src/recorder/ReplayManager.cpp`)**
    - Takes an immutable `ReplayConfig` snapshot (`m_sessionConfig`) at `startReplay()`, locks the session output resolution and video bitrates once.
@@ -90,12 +92,12 @@ instant-replay-geode/
 
 4. **Platform Encoders & Fallback Cascade (`MediaFoundationEncoder` / `VideoToolboxEncoder`)**
    - **Windows (`MediaFoundationEncoder.cpp`):** `IMFSinkWriter` with `MF_SINK_WRITER_DISABLE_THROTTLING = TRUE` and fallback cascade `Cached -> Requested (HW) -> HEVC (HW) -> H.264 (HW) -> H.264 (SW)`. Each attempt uses its own family's bitrate from the session `CodecBitrateTable` (W1); video types carry BT.709 / limited-range metadata and H.264 uses High profile with level 5.2 (6.2 when needed) so NVENC does not clamp the peak bitrate, with one retry without these extensions (W12, W13). Mean/max bitrates are read back via `ICodecAPI`. Every segment AAC track starts with 50 ms of silence pre-roll (`SegmentAudioLayout.hpp`, W2).
-   - **macOS (`VideoToolboxEncoder.mm`):** `AVAssetWriter` + VideoToolbox (`VTCompressionSession` probe, `VTCopyVideoEncoderList` + `AVAssetWriter canApplyOutputSettings` gating so unsupported codecs like AV1 or non-writable SW HEVC switch cleanly to `H.264`; `H.264 (SW)` preferred in software mode if the selected codec is unsupported), BT.709 color properties, buffered deferred AAC FIFO (`kMaxPendingAudioSeconds = 10.0`), 60s `finishWriting` timeouts, `@try/@catch` ObjC exception guards with `-fobjc-arc-exceptions`, and `-fobjc-arc`.
+   - **macOS (`VideoToolboxEncoder.mm`):** each cascade attempt encodes at its own family's bitrate from the session `CodecBitrateTable` (`setFamilyBitrateTable`, `activeBitrateMbps()`, K3, like W1). `AVAssetWriter` + VideoToolbox (`VTCompressionSession` probe, `VTCopyVideoEncoderList` + `AVAssetWriter canApplyOutputSettings` gating so unsupported codecs like AV1 or non-writable SW HEVC switch cleanly to `H.264`; `H.264 (SW)` preferred in software mode if the selected codec is unsupported), BT.709 color properties, buffered deferred AAC FIFO (`kMaxPendingAudioSeconds = 10.0`), 60s `finishWriting` timeouts, `@try/@catch` ObjC exception guards with `-fobjc-arc-exceptions`, and `-fobjc-arc`.
 
 5. **Saving & Segment Export (`concatenateSegments`)**
    - On `F6`, performs a hot-swap onto the pre-warmed encoder, locks selected segment paths in `m_exportLockedSegments`, and scans segment 0 for a keyframe near `trimStartSeconds`.
    - **Windows (`MfSegmentConcat.cpp`):** remuxes compressed video chronologically via `IMFSourceReader`/`IMFSinkWriter`; decodes every segment's AAC tracks to PCM, drops the pre-roll and trailing AAC padding using the real frame counts recorded in `SegmentInfo`, stitches them sample-exactly and re-encodes one continuous AAC stream per track (`192 kbps` / `128 kbps`), the counterpart of macOS N1 (W2). Writes `replay_*.mp4.part` and renames on success; progress is exposed via `ReplayManager::getExportProgressPercent()` (W3).
-   - **macOS (`VideoToolboxEncoder.mm`):** passes through compressed video rebased directly from raw track timings (`allowNegativeDts = true`, `clampPtsToDts = false`, `1 MHz` `mediaTimeScale` preserved, zero empty edit on H.264 B-frames), decodes all audio tracks via `AVAssetReaderTrackOutput` to Float32 interleaved LPCM (resolving AAC priming & remainder edits automatically), and encodes uninterrupted AAC streams (`192 kbps` first track / `128 kbps` split track) with sample-exact seam padding/trimming and per-iteration `@autoreleasepool` cleanup (M9). Uses `expectsMediaDataInRealTime = YES` + 10s stall watchdog (M1) and 1-sample HNS overlap tolerance (`ConcatTimestampState::audioOverlapToleranceHns`, N4).
+   - **macOS (`VideoToolboxEncoder.mm`):** passes through compressed video rebased directly from raw track timings (`allowNegativeDts = true`, `clampPtsToDts = false`, `1 MHz` `mediaTimeScale` preserved, zero empty edit on H.264 B-frames), decodes all audio tracks via `AVAssetReaderTrackOutput` to Float32 interleaved LPCM (resolving AAC priming & remainder edits automatically), and encodes uninterrupted AAC streams (`192 kbps` first track / `128 kbps` split track) with sample-exact seam padding/trimming and per-iteration `@autoreleasepool` cleanup (M9). Uses `expectsMediaDataInRealTime = YES` + 10s stall watchdog (M1) and 1-sample HNS overlap tolerance (`ConcatTimestampState::audioOverlapToleranceHns`, N4). Like Windows, the merge writes `replay_*.mp4.part` and `ReplayManager` renames it on success (`std::filesystem::rename`, same directory, K2); `concatenateSegments` advances the shared `m_exportProgressPermille` monotonically (<= 990 until `finishWriting`, 1000 on success, K4).
 
 ---
 
@@ -110,7 +112,7 @@ instant-replay-geode/
 4. **Do Not Overwrite Focused `geode::TextInput`:**
    In `ReplayPopup::refreshUI()`, `updateFolderDisplay()`, and `syncUnfocusedInputsToConfig()`, always check `!isInputFocused(input)` before calling `input->setString(...)`, otherwise typing multi-digit numbers (like `"35"` or `"100"`) will clobber the user's input mid-keystroke.
 5. **Clean Shutdown, OpenGL Contexts & COM Lifetime:**
-   `ReplayManager::shutdown()` is hooked on `$on_game(Exiting)` in `src/main.cpp` (disabling the macOS `flushBuffer` hook first) so OpenGL FBOs/PBOs and FMOD DSPs are released while valid. On macOS/Windows `FrameGrabber::resetGlResources(true)` verifies the current thread holds the owning GL context before `glDelete*`, and the `flushBuffer` hook saves/restores any previous CGL context. All `ComRef` wrappers on Windows worker/WASAPI threads must be destroyed before `CoUninitialize()`.
+   `ReplayManager::shutdown()` is hooked on `$on_game(Exiting)` in `src/main.cpp` (disabling the macOS `flushBuffer` hook first) so OpenGL FBOs/PBOs and FMOD DSPs are released while valid. On macOS/Windows `FrameGrabber::resetGlResources(true)` verifies the current thread holds the owning GL context before `glDelete*`, and the `flushBuffer` hook saves/restores any previous CGL context. **macOS:** Geode sends `Exiting` from `-[AppController gameDidSave]` on the AppKit main thread (`[Main]` in the log) while cocos / `FMODAudioEngine::update` keep running on `[CVDisplayLink]`: the GD context is not current there, so `glDelete*` is skipped (harmless at exit), and state shared with the game thread must be synchronized (e.g. the capture DSP behind `AudioGrabber::m_dspMutex`, K5). All `ComRef` wrappers on Windows worker/WASAPI threads must be destroyed before `CoUninitialize()`.
 6. **Game/UI-Thread-Only Cocos2d / GD APIs, `Notification`, and `FMODAudioEngine`:**
    Never call cocos2d-x APIs, Geometry Dash classes, `geode::utils::file::openFolder`, `geode::Notification` / `ReplayNotification`, or `FMODAudioEngine` from worker, finalize, prepare, export, WASAPI/CoreAudio, or FMOD mixer threads. Marshal all GD/notification/audio-engine actions via `geode::queueInMainThread`. Note (N11): on macOS, Cocos2d and `geode::queueInMainThread` run on GD's `CVDisplayLink` thread (`[NSThread isMainThread]` is `NO`), not AppKit's main thread.
 7. **macOS ARC, ObjC Exceptions & Capture Hooks:**
@@ -131,11 +133,13 @@ The packaged mod is written to `build/zemo.instant-replay.geode`.
 
 ### Option B: Standard CMake
 ```bash
-cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DGEODE_DONT_INSTALL_MODS=ON
 cmake --build build --config RelWithDebInfo
 ```
+Without `-DGEODE_DONT_INSTALL_MODS=ON`, `setup_geode_mod` runs `geode package --install` into the Geometry Dash of the active Geode CLI profile after every build.
 
 ### Host Unit & Platform Integration Tests (`tests/host/`)
+- **Shared (`tests/host/shared_pure_tests.hpp`):** platform-independent tests (ConcatTimestampMath, frame budgets, GameAudioRing, MicMixFifo, codec bounds, W1 / W9 / W14 / W15, K1 mic policy) included and run by both drivers below; keep platform headers out of it.
 - **Windows (`tests/host/test_host.cpp`):** needs the MSVC/Windows SDK `INCLUDE` and `LIB` environment (a "Developer PowerShell for VS" prompt, `ilammy/msvc-dev-cmd` on CI, or the same variables set by hand for an xwin sysroot). `MfSegmentConcat.cpp` is the production exporter and is compiled into the tests; Media Foundation is delay-loaded so pure tests still run (and MF tests are reported as skipped) on machines without it.
   ```powershell
   clang-cl /std:c++latest /EHsc /O2 /W3 /I src tests/host/test_host.cpp src/encoder/MfSegmentConcat.cpp /Febuild\test_host.exe /Fobuild\ mfplat.lib mfreadwrite.lib mfuuid.lib ole32.lib /link /DELAYLOAD:mfplat.dll /DELAYLOAD:mfreadwrite.dll delayimp.lib
@@ -143,6 +147,6 @@ cmake --build build --config RelWithDebInfo
   ```
 - **macOS (`tests/host/test_host_mac.mm`):**
   ```bash
-  clang++ -std=c++23 -fobjc-arc -fobjc-arc-exceptions -DGEODE_IS_MACOS -DGL_SILENCE_DEPRECATION -Isrc -Itests/host/mock_geode tests/host/test_host_mac.mm src/encoder/VideoToolboxEncoder.mm src/platform/MacVideoCapabilities.mm -framework Foundation -framework AVFoundation -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework CoreAudio -framework AudioToolbox -framework CoreFoundation -framework OpenGL -o build/test_host_mac
-  ./build/test_host_mac
+  clang++ -std=c++23 -Wall -Wextra -fobjc-arc -fobjc-arc-exceptions -DGEODE_IS_MACOS -DGL_SILENCE_DEPRECATION -Isrc -Itests/host/mock_geode tests/host/test_host_mac.mm src/encoder/VideoToolboxEncoder.mm src/platform/MacVideoCapabilities.mm -framework Foundation -framework AVFoundation -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework CoreAudio -framework AudioToolbox -framework CoreFoundation -framework OpenGL -o build/test_host_mac
+  ./build/test_host_mac          # add --long for the 10-minute production-like export check (~70 s)
   ```

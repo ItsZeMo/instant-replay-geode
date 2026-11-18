@@ -1,11 +1,19 @@
 # Changelog
 
 ## Unreleased
+- **macOS review fixes (K1-K9):**
+  - The microphone keeps recording through digital silence. Three silent seconds at the start (a muted USB mic, a virtual input, a Bluetooth headset switching profiles) now only show a status instead of stopping capture until the game restarts, and real audio clears it. Only an explicit macOS privacy denial stops the mic; its hint points to System Settings > Privacy & Security > Microphone for Steam (or your launcher). Launched outside Steam, a silent mic still shows the "start GD through Steam" hint.
+  - macOS replays are written to `replay_*.mp4.part` and renamed when finished, and saving shows its progress in the menu, the log and on repeated F6, like on Windows.
+  - VideoToolbox codec fallbacks record at the bitrate of the codec actually used (e.g. a custom `av1` codec, which no Mac can encode, records HEVC at the HEVC bitrate), like on Windows.
+  - Quitting while the game-audio capture DSP is re-checked no longer races with its teardown.
+  - The duration / FPS / bitrate / quality sliders snap to their steps again (`slider-step`); the five `unknown key "step"` loader warnings are gone.
+  - The platform-independent host tests also run on macOS (`host-tests-mac`), plus new macOS checks for trimmed exports, `.part` exports, export progress, fallback bitrates and an opt-in 10-minute export (`--long`).
+  - Note (W9 on macOS): VBR / CQ bitrate follows the recorded size, so a 1440x900 window with base 15 / max 35 Mbps (HEVC) now records at 9 / 20 Mbps instead of 11 / 25 Mbps.
 - **Windows review fixes (W1-W19):**
-  - Codec fallbacks (AV1 -> HEVC / H.264) now record at the bitrate of the codec actually used, and custom codec strings use their parsed codec's bitrate factor.
-  - Saved replays no longer have a short audio dropout every 30 seconds: segment audio carries a 50 ms pre-roll and the export re-encodes one continuous AAC stream per track.
-  - Replays are written to `replay_*.mp4.part` and renamed when finished; saving shows its progress in the menu, the log and on repeated F6, and exiting during a save logs the wait.
-  - The menu shows the codec that is actually recording; Windows probes AV1 / HEVC / H.264 encoder support and greys out unsupported codecs; one notification when the encoder falls back.
+  - Codec fallbacks (AV1 -> HEVC / H.264) now record at the bitrate of the codec actually used, and custom codec strings use their parsed codec's bitrate factor (macOS since K3).
+  - Saved replays no longer have a short audio dropout every 30 seconds: segment audio carries a 50 ms pre-roll and the export re-encodes one continuous AAC stream per track (Windows; the macOS export has done this since N1).
+  - Replays are written to `replay_*.mp4.part` and renamed when finished; saving shows its progress in the menu, the log and on repeated F6, and exiting during a save logs the wait (macOS since K2 / K4).
+  - The menu shows the codec that is actually recording; Windows probes AV1 / HEVC / H.264 encoder support and greys out unsupported codecs; one notification when the encoder falls back (Windows; macOS logs the fallback).
   - Windows microphone capture reports its status, follows the default device, returns to the selected mic when it is reconnected and hints at Windows privacy settings on digital silence.
   - Every save request logs its outcome; repeated encoder starts and the WASAPI start-up discontinuity no longer spam the log.
   - VBR / CQ bitrate scales with the size actually recorded (Native 4K equals the 2160p preset) and the bitrate field is labelled as a 1080p60 base; CBR stays exact.

@@ -20,7 +20,7 @@ Hardware-accelerated, ShadowPlay-style background **Instant Replay** recorder bu
 - **Zero-Allocation Real-Time Capture:**
   - **Video:** GPU-side FBO scaling (`glBlitFramebuffer`, with Retina backing pixel awareness and Y-flip blit on macOS), double-buffered asynchronous PBO readback (`GL_BGRA`), reusable `CapturedFrame` (`IMFMediaBuffer` / `CVPixelBuffer`) pools, and phase-preserving frame pacing (`60`, `120`, `240` FPS).
   - **Game Audio:** Lock-free SPSC ring buffer attached to the FMOD Master `ChannelGroup` DSP (zero heap allocations or locks on the audio thread).
-  - **Microphone Audio (Opt-in):** Event-driven WASAPI capture (Windows) and CoreAudio `AudioQueue` capture with TCC permission checking & automatic default-mic fallback (macOS; launching through Steam is required for macOS TCC mic prompts unless the app bundle provides `NSMicrophoneUsageDescription`). Supports **2 separate AAC tracks** (for Premiere Pro / DaVinci Resolve / Vegas) or **real-time single-track mixing**.
+  - **Microphone Audio (Opt-in):** Event-driven WASAPI capture (Windows) and CoreAudio `AudioQueue` capture with TCC permission checking & automatic default-mic fallback (macOS). Geometry Dash has no `NSMicrophoneUsageDescription`, so on macOS the mic works when the game is started through Steam (Steam asks for mic access); digital silence only shows a status (capture keeps running and recovers), and only an explicit privacy denial stops the mic. Supports **2 separate AAC tracks** (for Premiere Pro / DaVinci Resolve / Vegas) or **real-time single-track mixing**.
 - **In-Game Dashboard (`F9`):** 4-tab popup with live Premiere-style file size estimator, Save & TEMP drive disk space warnings, volume sliders, and Unicode-safe folder picker.
 
 ---
@@ -49,6 +49,7 @@ flowchart LR
 | [`src/capture/FrameGrabber.cpp`](./src/capture/FrameGrabber.cpp) | OpenGL FBO downscaler, async PBO pixel readback, BT.709 `CVPixelBuffer` tagging (macOS), and reusable frame buffer pool |
 | [`src/capture/AudioGrabber.cpp`](./src/capture/AudioGrabber.cpp) | Lock-free FMOD DSP game audio ring buffer & stateful WASAPI microphone capture (Windows) |
 | [`src/capture/AudioGrabberMac.mm`](./src/capture/AudioGrabberMac.mm) | CoreAudio `AudioQueue` microphone capture, TCC permission handling, and fallback recovery (macOS) |
+| [`src/capture/MicStatusPolicy.hpp`](./src/capture/MicStatusPolicy.hpp) | Platform-neutral microphone status policy (only a privacy denial stops capture; silence is a soft status) |
 | [`src/encoder/MediaFoundationEncoder.cpp`](./src/encoder/MediaFoundationEncoder.cpp) | `IMFSinkWriter` encoder & `IMFSourceReader` lossless MP4 remuxer (Windows) |
 | [`src/encoder/VideoToolboxEncoder.mm`](./src/encoder/VideoToolboxEncoder.mm) | `AVAssetWriter` + VideoToolbox encoder, bounded deferred audio queues, and `AVAssetReader` MP4 export (passthrough video + continuous AAC audio) (macOS) |
 | [`src/platform/MacPlatformUtils.mm`](./src/platform/MacPlatformUtils.mm) | Cocoa directories, GL drawable size query, `NSOpenGLContext::flushBuffer` hook & PID identity checks (macOS) |
@@ -65,18 +66,18 @@ flowchart LR
 ### Windows
 1. Install [Geode CLI](https://github.com/geode-sdk/cli), [Geode SDK v5.11.2](https://github.com/geode-sdk/geode), CMake 3.21+, Ninja, and Visual Studio 2022 / LLVM (`clang-cl`).
 2. Ensure `GEODE_SDK` points to your Geode SDK directory and run `geode build --ninja`.
-3. Standalone Windows host tests:
-   `clang-cl /std:c++latest /EHsc /O2 /I src tests/host/test_host.cpp /Fe:build/test_host.exe mfplat.lib mfreadwrite.lib mfuuid.lib ole32.lib && .\build\test_host.exe`
+3. Standalone Windows host tests (from a Developer PowerShell; the platform-independent tests in `tests/host/shared_pure_tests.hpp` run on both platforms):
+   `clang-cl /std:c++latest /EHsc /O2 /W3 /I src tests/host/test_host.cpp src/encoder/MfSegmentConcat.cpp /Febuild\test_host.exe /Fobuild\ mfplat.lib mfreadwrite.lib mfuuid.lib ole32.lib /link /DELAYLOAD:mfplat.dll /DELAYLOAD:mfreadwrite.dll delayimp.lib && .\build\test_host.exe`
 
 ### macOS (Universal `arm64` + `x86_64`)
 1. Install Xcode Command Line Tools (`clang++`), CMake 3.21+, Ninja, [Geode CLI](https://github.com/geode-sdk/cli), and [Geode SDK v5.11.2](https://github.com/geode-sdk/geode).
 2. Ensure `GEODE_SDK` points to your Geode SDK directory and build with:
    ```bash
-   cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+   cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DGEODE_DONT_INSTALL_MODS=ON
    cmake --build build
    ```
-   (or `geode build -p macos`).
-3. Standalone macOS host tests (no Geometry Dash runtime required):
+   (or `geode build -p macos`). Without `-DGEODE_DONT_INSTALL_MODS=ON` the Geode SDK installs the packaged mod into the Geometry Dash of your Geode CLI profile after every build.
+3. Standalone macOS host tests (no Geometry Dash runtime required; add `--long` for the 10-minute export check):
    ```bash
-   clang++ -std=c++23 -fobjc-arc -fobjc-arc-exceptions -DGEODE_IS_MACOS -DGL_SILENCE_DEPRECATION -Isrc -Itests/host/mock_geode tests/host/test_host_mac.mm src/encoder/VideoToolboxEncoder.mm src/platform/MacVideoCapabilities.mm -framework Foundation -framework AVFoundation -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework CoreAudio -framework AudioToolbox -framework CoreFoundation -framework OpenGL -o build/test_host_mac && ./build/test_host_mac
+   clang++ -std=c++23 -Wall -Wextra -fobjc-arc -fobjc-arc-exceptions -DGEODE_IS_MACOS -DGL_SILENCE_DEPRECATION -Isrc -Itests/host/mock_geode tests/host/test_host_mac.mm src/encoder/VideoToolboxEncoder.mm src/platform/MacVideoCapabilities.mm -framework Foundation -framework AVFoundation -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework CoreAudio -framework AudioToolbox -framework CoreFoundation -framework OpenGL -o build/test_host_mac && ./build/test_host_mac
    ```
