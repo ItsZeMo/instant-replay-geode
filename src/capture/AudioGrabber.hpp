@@ -13,6 +13,7 @@
 #include <memory>
 #include <functional>
 #include <thread>
+#include <mutex>
 #include <atomic>
 #include <chrono>
 #include <algorithm>
@@ -154,13 +155,18 @@ private:
     AudioGrabber();
     ~AudioGrabber();
 
+    // Call with m_dspMutex held.
     void setupFmodDSP();
     void removeFmodDSP();
     void cleanupSaveBypass();
 
     void micCaptureThreadFunc();
 
-    bool m_initialized = false;
+    // Serializes the capture DSP / save-bypass state: FMODAudioEngine::update re-verifies the DSP on the
+    // game thread while shutdown (macOS: $on_game(Exiting) on the AppKit main thread) tears it down (K5).
+    // The FMOD mixer callback (pushGameAudio) never takes it.
+    std::mutex m_dspMutex;
+    std::atomic<bool> m_initialized{false};
     FMOD::DSP* m_fmodDSP = nullptr;
     FMOD::System* m_dspSystem = nullptr;            // system / master group the DSP was attached to (W18)
     FMOD::ChannelGroup* m_dspMasterGroup = nullptr;

@@ -126,19 +126,23 @@ AudioGrabber::~AudioGrabber() {
 }
 
 void AudioGrabber::initialize() {
-    if (m_initialized) return;
+    std::lock_guard<std::mutex> lock(m_dspMutex);
+    if (m_initialized.load()) return;
 
-    m_initialized = true;
+    m_initialized.store(true);
     m_nextDspRetryTime = {};
     setupFmodDSP();
 }
 
 void AudioGrabber::cleanup() {
-    if (!m_initialized) return;
+    {
+        std::lock_guard<std::mutex> lock(m_dspMutex);
+        if (!m_initialized.load()) return;
 
-    m_initialized = false;
-    cleanupSaveBypass();
-    removeFmodDSP();
+        m_initialized.store(false);
+        cleanupSaveBypass();
+        removeFmodDSP();
+    }
     stopMicCapture();
 }
 
@@ -159,6 +163,7 @@ void AudioGrabber::cleanupSaveBypass() {
 
 bool AudioGrabber::playSaveSoundBypass(const char* soundPath) {
     if (!soundPath || !soundPath[0]) return false;
+    std::lock_guard<std::mutex> lock(m_dspMutex);
     auto engine = FMODAudioEngine::sharedEngine();
     if (!engine || !engine->m_system) return false;
 
@@ -239,7 +244,8 @@ void AudioGrabber::setMicAudioCallback(AudioCallback cb) {
 }
 
 void AudioGrabber::ensureDSPAttached() {
-    if (!m_initialized) return;
+    std::lock_guard<std::mutex> lock(m_dspMutex);
+    if (!m_initialized.load()) return;
     auto now = std::chrono::steady_clock::now();
 
     if (m_fmodDSP) {
@@ -281,7 +287,7 @@ void AudioGrabber::ensureDSPAttached() {
 }
 
 void AudioGrabber::setupFmodDSP() {
-    if (!m_initialized || m_fmodDSP) return;
+    if (!m_initialized.load() || m_fmodDSP) return;
 
     auto engine = FMODAudioEngine::sharedEngine();
     if (!engine || !engine->m_system) return;
