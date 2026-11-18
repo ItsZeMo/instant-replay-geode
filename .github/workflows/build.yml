@@ -43,7 +43,7 @@ jobs:
       - name: Compile and run macOS host integration tests
         run: |
           mkdir -p build
-          clang++ -std=c++23 -fobjc-arc -fobjc-arc-exceptions -DGEODE_IS_MACOS -DGL_SILENCE_DEPRECATION \
+          clang++ -std=c++23 -Wall -Wextra -fobjc-arc -fobjc-arc-exceptions -DGEODE_IS_MACOS -DGL_SILENCE_DEPRECATION \
             -Isrc -Itests/host/mock_geode \
             tests/host/test_host_mac.mm src/encoder/VideoToolboxEncoder.mm src/platform/MacVideoCapabilities.mm \
             -framework Foundation -framework AVFoundation -framework VideoToolbox \
