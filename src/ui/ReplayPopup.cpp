@@ -1359,7 +1359,12 @@ void ReplayPopup::updateStatusDisplay(float dt) {
                 } else if (micSt == MicCaptureStatus::BlockedNoUsageDescription) {
                     m_statusLabel->setString("Replay Active (Mic Blocked - Use Steam)");
                 } else if (micSt == MicCaptureStatus::DigitalSilenceDetected) {
+#ifdef GEODE_IS_MACOS
+                    // macOS reports this only with mic access granted, so the input is muted or silent (K1).
+                    m_statusLabel->setString("Replay Active (Mic Silent - Muted?)");
+#else
                     m_statusLabel->setString("Replay Active (Mic Silent - Check Privacy)");
+#endif
                 } else if (micSt == MicCaptureStatus::UsingFallbackDevice) {
                     m_statusLabel->setString("Replay Active (Mic: Using Default Device)");
                 } else if (micSt == MicCaptureStatus::NoInputDevice) {

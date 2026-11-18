@@ -5,6 +5,7 @@
 #if defined(GEODE_IS_WINDOWS) || defined(GEODE_IS_MACOS)
 
 #include "GameAudioRing.hpp"
+#include "MicStatusPolicy.hpp"
 #include <Geode/fmod/fmod.hpp>
 #include <string>
 #include <string_view>
@@ -26,16 +27,6 @@ struct AudioChunk {
 struct AudioDeviceInfo {
     std::string id;   // Endpoint device ID, or "default"
     std::string name; // Sanitized friendly name for display
-};
-
-enum class MicCaptureStatus : uint8_t {
-    Idle = 0,
-    Active,
-    PermissionDenied,
-    BlockedNoUsageDescription,
-    UsingFallbackDevice,
-    DigitalSilenceDetected,
-    NoInputDevice
 };
 
 // Stateful fractional-phase linear stereo resampler shared by AudioGrabber and ReplayManager.

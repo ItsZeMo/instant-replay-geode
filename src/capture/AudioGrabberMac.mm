@@ -204,10 +204,9 @@ OSStatus onAudioObjectPropertyChanged(
 ) {
     if (auto* state = static_cast<MicQueueState*>(inClientData)) {
         bool deviceListOnly = (inNumberAddresses > 0 && inAddresses != nullptr);
-        for (UInt32 i = 0; i < inNumberAddresses; ++i) {
+        for (UInt32 i = 0; deviceListOnly && i < inNumberAddresses; ++i) {
             if (inAddresses[i].mSelector != kAudioHardwarePropertyDevices) {
                 deviceListOnly = false;
-                break;
             }
         }
         if (deviceListOnly) {
@@ -281,7 +280,7 @@ void onAudioQueueInput(
         }
     }
 
-    if (!state->stopping.load(std::memory_order_acquire)) {
+    if (inBuffer && !state->stopping.load(std::memory_order_acquire)) {
         AudioQueueEnqueueBuffer(inAQ, inBuffer, 0, nullptr);
     }
 }
@@ -332,68 +331,75 @@ std::vector<AudioDeviceInfo> AudioGrabber::getAvailableMicrophones() {
 void AudioGrabber::micCaptureThreadFunc() {
     MacAutoreleasePoolScope pool;
     m_micResampler.reset();
+    // Every capture run re-evaluates permission and silence from scratch (K1): a status left behind by an
+    // earlier session (e.g. a silence warning) must never end this run before it starts.
+    m_micStatus.store(MicCaptureStatus::Idle, std::memory_order_release);
 
-    auto isMicBlocked = [](MicCaptureStatus st) noexcept {
-        return st == MicCaptureStatus::PermissionDenied ||
-               st == MicCaptureStatus::BlockedNoUsageDescription;
+    auto stopsCapture = [this]() noexcept {
+        return micStatusStopsCapture(m_micStatus.load(std::memory_order_acquire));
     };
-    auto showBlockedNoUsageNotification = []() {
-        geode::queueInMainThread([]() {
-            geode::Notification::create(
-                "Mic blocked by macOS for this launch. Start GD through Steam (it asks for mic access) or turn off Record Microphone.",
-                geode::NotificationIcon::Warning,
-                5.0f
-            )->show();
-        });
+    // Publishes a live status without overwriting a denial that the permission callback stored meanwhile.
+    auto setStatusUnlessStopped = [this](MicCaptureStatus next) noexcept {
+        MicCaptureStatus cur = m_micStatus.load(std::memory_order_acquire);
+        while (!micStatusStopsCapture(cur) &&
+               !m_micStatus.compare_exchange_weak(cur, next, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        }
     };
 
-    // Check macOS Microphone TCC permission before touching CoreAudio input (M3, N2).
-    const bool noUsageKey =
-        ([[NSBundle mainBundle] objectForInfoDictionaryKey:@"NSMicrophoneUsageDescription"] == nil);
-    AVAuthorizationStatus authStatus = [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio];
-    const char* authLabel = "Unknown";
+    // Check macOS Microphone TCC permission before touching CoreAudio input (M3, N2, K1).
+    // Geometry Dash ships without NSMicrophoneUsageDescription (Steam and launcher builds alike), so macOS
+    // only grants the mic through the app it holds responsible for the launch (Steam asks for it).
+    const bool hasUsageKey =
+        ([[NSBundle mainBundle] objectForInfoDictionaryKey:@"NSMicrophoneUsageDescription"] != nil);
+    const AVAuthorizationStatus authStatus = [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio];
+    MicPrivacyAuthorization auth = MicPrivacyAuthorization::NotDetermined;
+    const char* authLabel = "NotDetermined";
     switch (authStatus) {
-        case AVAuthorizationStatusNotDetermined: authLabel = "NotDetermined"; break;
-        case AVAuthorizationStatusRestricted: authLabel = "Restricted"; break;
-        case AVAuthorizationStatusDenied: authLabel = "Denied"; break;
-        case AVAuthorizationStatusAuthorized: authLabel = "Authorized"; break;
+        case AVAuthorizationStatusRestricted:
+            auth = MicPrivacyAuthorization::Restricted;
+            authLabel = "Restricted";
+            break;
+        case AVAuthorizationStatusDenied:
+            auth = MicPrivacyAuthorization::Denied;
+            authLabel = "Denied";
+            break;
+        case AVAuthorizationStatusAuthorized:
+            auth = MicPrivacyAuthorization::Authorized;
+            authLabel = "Authorized";
+            break;
+        case AVAuthorizationStatusNotDetermined:
+        default:
+            break;
     }
     geode::log::info(
         "Instant Replay: macOS Microphone TCC status={}, hasUsageDescription={}",
-        authLabel, !noUsageKey);
+        authLabel, hasUsageKey);
 
-    if (authStatus == AVAuthorizationStatusDenied || authStatus == AVAuthorizationStatusRestricted) {
-        m_micStatus.store(
-            noUsageKey ? MicCaptureStatus::BlockedNoUsageDescription : MicCaptureStatus::PermissionDenied,
-            std::memory_order_release);
+    if (micAuthorizationBlocksCapture(auth)) {
+        // An explicit denial is final for this launch: the only status that stops capture (K1).
+        m_micStatus.store(MicCaptureStatus::PermissionDenied, std::memory_order_release);
         static std::atomic<bool> s_notifiedDenied{false};
         if (!s_notifiedDenied.exchange(true, std::memory_order_acq_rel)) {
-            if (noUsageKey) {
-                geode::log::warn(
-                    "Instant Replay: macOS Microphone permission is {} and NSMicrophoneUsageDescription is missing; "
-                    "launch Geometry Dash through Steam or disable Record Microphone",
-                    authLabel);
-                showBlockedNoUsageNotification();
-            } else {
-                geode::log::warn(
-                    "Instant Replay: macOS Microphone permission is denied/restricted; microphone capture disabled "
-                    "(enable Geometry Dash in System Settings -> Privacy & Security -> Microphone)");
-                geode::queueInMainThread([]() {
-                    geode::Notification::create(
-                        "Instant Replay: Mic permission denied in macOS Privacy Settings",
-                        geode::NotificationIcon::Warning,
-                        4.0f
-                    )->show();
-                });
-            }
+            // The grant belongs to the responsible app: Steam (or the launcher) when GD's bundle has no usage
+            // description, Geometry Dash itself otherwise.
+            const char* who = hasUsageKey ? "Geometry Dash" : "Steam (or your launcher)";
+            geode::log::warn(
+                "Instant Replay: macOS Microphone permission is {}; microphone capture disabled for this launch "
+                "(allow {} in System Settings -> Privacy & Security -> Microphone)",
+                authLabel, who);
+            const std::string msg = std::string("Instant Replay: Mic access denied - allow ") + who +
+                                    " in System Settings > Privacy & Security > Microphone";
+            geode::queueInMainThread([msg]() {
+                geode::Notification::create(msg, geode::NotificationIcon::Warning, 5.0f)->show();
+            });
         }
         return;
     }
 
-    if (authStatus == AVAuthorizationStatusNotDetermined) {
+    if (auth == MicPrivacyAuthorization::NotDetermined) {
         static std::atomic<bool> s_warnedNotDetermined{false};
         if (!s_warnedNotDetermined.exchange(true, std::memory_order_acq_rel)) {
-            if (!noUsageKey) {
+            if (hasUsageKey) {
                 geode::log::info("Instant Replay: requesting macOS Microphone permission");
                 [AVCaptureDevice requestAccessForMediaType:AVMediaTypeAudio completionHandler:^(BOOL granted) {
                     if (!granted) {
@@ -438,8 +444,7 @@ void AudioGrabber::micCaptureThreadFunc() {
     std::string lastTargetSeen;
     static std::atomic<bool> s_warnedDigitalSilence{false};
 
-    while (m_micRunning.load() &&
-           !isMicBlocked(m_micStatus.load(std::memory_order_acquire))) {
+    while (m_micRunning.load() && !stopsCapture()) {
         std::string targetId = ReplayManager::get()->getSessionConfig().getMicDeviceId();
         if (targetId != lastTargetSeen) {
             lastTargetSeen = targetId;
@@ -450,7 +455,7 @@ void AudioGrabber::micCaptureThreadFunc() {
         bool usingFallback = false;
         AudioDeviceID devId = resolveTargetInputDevice(targetId, forceDefaultFallback, usingFallback);
         if (devId == kAudioObjectUnknown) {
-            m_micStatus.store(MicCaptureStatus::NoInputDevice, std::memory_order_release);
+            setStatusUnlessStopped(MicCaptureStatus::NoInputDevice);
             sleepInterruptible(1000);
             continue;
         }
@@ -472,7 +477,7 @@ void AudioGrabber::micCaptureThreadFunc() {
 
         std::string devUid;
         if (!getDeviceUid(devId, devUid)) {
-            m_micStatus.store(MicCaptureStatus::NoInputDevice, std::memory_order_release);
+            setStatusUnlessStopped(MicCaptureStatus::NoInputDevice);
             sleepInterruptible(1000);
             continue;
         }
@@ -569,9 +574,8 @@ void AudioGrabber::micCaptureThreadFunc() {
             }
 
             if (allocOk && AudioQueueStart(queue, nullptr) == noErr) {
-                m_micStatus.store(
-                    usingFallback ? MicCaptureStatus::UsingFallbackDevice : MicCaptureStatus::Active,
-                    std::memory_order_release);
+                setStatusUnlessStopped(
+                    usingFallback ? MicCaptureStatus::UsingFallbackDevice : MicCaptureStatus::Active);
                 geode::log::info(
                     "Instant Replay: CoreAudio mic capture started ({}ch @ {} Hz{})",
                     captureChannels, captureRate, usingFallback ? ", fallback default" : "");
@@ -579,32 +583,40 @@ void AudioGrabber::micCaptureThreadFunc() {
                 int pollCount = 0;
                 while (m_micRunning.load() &&
                        !qState.deviceInvalidated.load(std::memory_order_acquire) &&
-                       !isMicBlocked(m_micStatus.load(std::memory_order_acquire))) {
+                       !stopsCapture()) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(50));
                     ++pollCount;
 
-                    if (isMicBlocked(m_micStatus.load(std::memory_order_acquire))) {
+                    if (stopsCapture()) {
                         break;
                     }
 
                     if (qState.digitalSilenceAlert.load(std::memory_order_acquire) && !reportedDigitalSilence) {
+                        // Soft status (K1): the queue keeps running and real audio switches back to Active below.
                         reportedDigitalSilence = true;
-                        const MicCaptureStatus silenceStatus = noUsageKey
-                            ? MicCaptureStatus::BlockedNoUsageDescription
-                            : MicCaptureStatus::DigitalSilenceDetected;
-                        m_micStatus.store(silenceStatus, std::memory_order_release);
+                        const MicCaptureStatus silenceStatus = micStatusForDigitalSilence(auth, hasUsageKey);
+                        setStatusUnlessStopped(silenceStatus);
                         if (!s_warnedDigitalSilence.exchange(true, std::memory_order_acq_rel)) {
-                            if (noUsageKey) {
+                            if (silenceStatus == MicCaptureStatus::BlockedNoUsageDescription) {
                                 geode::log::warn(
-                                    "Instant Replay: microphone captured >3s of pure digital silence without NSMicrophoneUsageDescription; "
-                                    "macOS TCC blocked access for this launch (start GD through Steam or turn off Record Microphone)");
-                                showBlockedNoUsageNotification();
-                            } else {
-                                geode::log::warn(
-                                    "Instant Replay: microphone captured >3s of pure digital silence (check macOS Microphone TCC permission or hardware mute)");
+                                    "Instant Replay: microphone captured >3s of pure digital silence while macOS has not "
+                                    "granted mic access and GD has no NSMicrophoneUsageDescription; TCC most likely blocks "
+                                    "this launch (start GD through Steam or turn off Record Microphone). Capture keeps "
+                                    "running and recovers when audio arrives.");
                                 geode::queueInMainThread([]() {
                                     geode::Notification::create(
-                                        "Instant Replay: Mic audio is silent (check Privacy Settings or mute)",
+                                        "Instant Replay: Mic is silent - macOS blocks it unless GD is started through Steam",
+                                        geode::NotificationIcon::Warning,
+                                        5.0f
+                                    )->show();
+                                });
+                            } else {
+                                geode::log::warn(
+                                    "Instant Replay: microphone captured >3s of pure digital silence (muted or silent "
+                                    "input?); capture keeps running and recovers when audio arrives");
+                                geode::queueInMainThread([]() {
+                                    geode::Notification::create(
+                                        "Instant Replay: Mic is silent (muted or wrong input?)",
                                         geode::NotificationIcon::Warning,
                                         3.5f
                                     )->show();
@@ -613,9 +625,9 @@ void AudioGrabber::micCaptureThreadFunc() {
                         }
                     } else if (reportedDigitalSilence && qState.sawNonZeroAudio.load(std::memory_order_relaxed)) {
                         reportedDigitalSilence = false;
-                        m_micStatus.store(
-                            usingFallback ? MicCaptureStatus::UsingFallbackDevice : MicCaptureStatus::Active,
-                            std::memory_order_release);
+                        setStatusUnlessStopped(
+                            usingFallback ? MicCaptureStatus::UsingFallbackDevice : MicCaptureStatus::Active);
+                        geode::log::info("Instant Replay: microphone audio resumed after digital silence");
                     }
 
                     std::string latestTarget = ReplayManager::get()->getSessionConfig().getMicDeviceId();
@@ -670,9 +682,7 @@ void AudioGrabber::micCaptureThreadFunc() {
         }
     }
 
-    if (!isMicBlocked(m_micStatus.load(std::memory_order_acquire))) {
-        m_micStatus.store(MicCaptureStatus::Idle, std::memory_order_release);
-    }
+    setStatusUnlessStopped(MicCaptureStatus::Idle);
 }
 
 } // namespace replay

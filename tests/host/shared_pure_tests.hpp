@@ -17,6 +17,7 @@
 
 #include "capture/FrameBudget.hpp"
 #include "capture/GameAudioRing.hpp"
+#include "capture/MicStatusPolicy.hpp"
 #include "config/BitrateMath.hpp"
 #include "config/CodecUtils.hpp"
 #include "encoder/ConcatTimestampMath.hpp"
@@ -673,6 +674,44 @@ inline void testMicQueueDurationLimitW15() {
     std::cout << "  PASS Test W15\n";
 }
 
+// T-K1: only an explicit privacy denial stops microphone capture; 3 s of digital silence is a soft status
+// (TCC-block hint without a grant, "muted?" with a grant) that real audio clears.
+inline void testMicStatusPolicyK1() {
+    std::cout << "[Test K1] Microphone status policy: silence is soft, only a denial stops capture...\n";
+    using replay::MicCaptureStatus;
+    using replay::MicPrivacyAuthorization;
+
+    // Granted (e.g. launched through Steam): silence means a muted / silent input, never "use Steam".
+    IR_SHARED_CHECK(replay::micStatusForDigitalSilence(MicPrivacyAuthorization::Authorized, false) ==
+                    MicCaptureStatus::DigitalSilenceDetected);
+    IR_SHARED_CHECK(replay::micStatusForDigitalSilence(MicPrivacyAuthorization::Authorized, true) ==
+                    MicCaptureStatus::DigitalSilenceDetected);
+    // Undetermined grant and no usage description (GD launched outside Steam): TCC-block hint.
+    IR_SHARED_CHECK(replay::micStatusForDigitalSilence(MicPrivacyAuthorization::NotDetermined, false) ==
+                    MicCaptureStatus::BlockedNoUsageDescription);
+    IR_SHARED_CHECK(replay::micStatusForDigitalSilence(MicPrivacyAuthorization::NotDetermined, true) ==
+                    MicCaptureStatus::DigitalSilenceDetected);
+
+    // Silence statuses are soft: they never stop capture and real audio clears them.
+    for (auto s : {MicCaptureStatus::BlockedNoUsageDescription, MicCaptureStatus::DigitalSilenceDetected}) {
+        IR_SHARED_CHECK(replay::isMicSilenceStatus(s));
+        IR_SHARED_CHECK(!replay::micStatusStopsCapture(s));
+    }
+    for (auto s : {MicCaptureStatus::Idle, MicCaptureStatus::Active, MicCaptureStatus::UsingFallbackDevice,
+                   MicCaptureStatus::NoInputDevice}) {
+        IR_SHARED_CHECK(!replay::micStatusStopsCapture(s));
+        IR_SHARED_CHECK(!replay::isMicSilenceStatus(s));
+    }
+
+    // Only an explicit denial (or a restriction) is final for the launch.
+    IR_SHARED_CHECK(replay::micStatusStopsCapture(MicCaptureStatus::PermissionDenied));
+    IR_SHARED_CHECK(replay::micAuthorizationBlocksCapture(MicPrivacyAuthorization::Denied));
+    IR_SHARED_CHECK(replay::micAuthorizationBlocksCapture(MicPrivacyAuthorization::Restricted));
+    IR_SHARED_CHECK(!replay::micAuthorizationBlocksCapture(MicPrivacyAuthorization::NotDetermined));
+    IR_SHARED_CHECK(!replay::micAuthorizationBlocksCapture(MicPrivacyAuthorization::Authorized));
+    std::cout << "  PASS Test K1\n";
+}
+
 // Runs every platform-independent test above.
 inline void runSharedPureTests() {
     testConcatTimestampMathPure();
@@ -684,6 +723,7 @@ inline void runSharedPureTests() {
     testResolutionBitrateSemanticsW9();
     testSegmentDurationRuleW14();
     testMicQueueDurationLimitW15();
+    testMicStatusPolicyK1();
 }
 
 } // namespace replay_host_tests
