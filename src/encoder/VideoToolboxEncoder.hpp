@@ -4,6 +4,7 @@
 
 #ifdef GEODE_IS_MACOS
 
+#include "../config/BitrateMath.hpp"
 #include "../config/CodecUtils.hpp"
 #include "../config/ReplayConfig.hpp"
 #include "VideoEncoderTypes.hpp"
@@ -59,6 +60,13 @@ public:
     EncoderOpResult writeVideoFrame(CVPixelBufferRef pixelBuffer, int width, int height, int64_t timestampHns);
     EncoderOpResult writeGameAudio(const float* pcmFloat, int numSamples, int channels, int sampleRate, int64_t timestampHns);
     EncoderOpResult writeMicAudio(const float* pcmFloat, int numSamples, int channels, int sampleRate, int64_t timestampHns);
+
+    // Per-family session bitrates: each attempt of the fallback cascade (e.g. custom AV1 -> HEVC) encodes at
+    // the bitrate an explicit selection of that codec would get (W1 parity, K3). Unset -> start() arguments.
+    void setFamilyBitrateTable(const CodecBitrateTable& table) noexcept { m_familyBitrates = table; }
+    // Mean / max bitrate the running encoder was started with (after any fallback).
+    int activeBitrateMbps() const noexcept { return m_activeBitrateMbps; }
+    int activeMaxBitrateMbps() const noexcept { return m_activeMaxBitrateMbps; }
 
     bool finish();
     bool isRecording() const noexcept { return m_recording; }
@@ -128,6 +136,9 @@ private:
     bool m_hasActiveCodec = false;
     VideoCodecFamily m_activeCodecFamily = VideoCodecFamily::H264;
     bool m_activeHardware = true;
+    CodecBitrateTable m_familyBitrates{};
+    int m_activeBitrateMbps = 0;
+    int m_activeMaxBitrateMbps = 0;
 
     mutable std::mutex m_mutex;
 };

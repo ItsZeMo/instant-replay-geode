@@ -1955,13 +1955,9 @@ void ReplayManager::publishActiveEncoderInfo(const ReplayConfig& cfg) {
     info.hardware = m_encoder->activeHardware();
     info.width = m_videoWidth;
     info.height = m_videoHeight;
-#ifdef GEODE_IS_WINDOWS
+    // Bitrate of the codec actually running (Windows reads it back from the MFT; macOS since K3).
     info.meanMbps = m_encoder->activeBitrateMbps();
     info.maxMbps = m_encoder->activeMaxBitrateMbps();
-#else
-    info.meanMbps = m_sessionEffBitrateMbps;
-    info.maxMbps = m_sessionEffMaxBitrateMbps;
-#endif
     {
         std::lock_guard<std::mutex> lock(m_activeEncoderInfoMutex);
         m_activeEncoderInfo = info;
@@ -2047,9 +2043,8 @@ bool ReplayManager::startNewSegment(
     int gameSampleRate = AudioGrabber::get()->getEncodedGameSampleRate();
     int effBitrate = m_sessionEffBitrateMbps;
     int effMaxBitrate = std::max(m_sessionEffMaxBitrateMbps, effBitrate);
-#ifdef GEODE_IS_WINDOWS
+    // Fallback attempts encode at their own family's bitrate (W1, macOS since K3).
     m_encoder->setFamilyBitrateTable(m_sessionBitrateTable);
-#endif
 
     m_lastStartError = m_encoder->start(
         m_currentSegmentPath,
@@ -2177,9 +2172,8 @@ void ReplayManager::startPrepareNextSegment(const ReplayConfig& cfg) {
     VideoCodecFamily forcedFamily = m_encoder->activeCodecFamily();
     bool forcedHardware = m_encoder->activeHardware();
     bool allowFallback = !hasForcedCodec;
-#ifdef GEODE_IS_WINDOWS
     // The next segment is forced to the active (possibly fallback) codec: give it that family's bitrate
-    // so rotations keep the bitrate the first segment actually started with (W1).
+    // so rotations keep the bitrate the first segment actually started with (W1, macOS since K3).
     if (hasForcedCodec && m_sessionBitrateTable.valid) {
         const EffectiveBitrates active = m_sessionBitrateTable.forFamily(forcedFamily);
         if (active.meanMbps > 0) {
@@ -2187,7 +2181,6 @@ void ReplayManager::startPrepareNextSegment(const ReplayConfig& cfg) {
             effMaxBitrate = std::max(active.maxMbps, active.meanMbps);
         }
     }
-#endif
 
     m_prepareFailedLastAttempt.store(false);
     m_prepareCancel.store(false);

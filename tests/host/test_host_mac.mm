@@ -1497,6 +1497,58 @@ void testExportProgressK4() {
     std::cout << "  PASS Test 17 (T-K4: " << samples.size() << " samples, last before end=" << prev << ")\n";
 }
 
+// T-K3: with the session's per-family bitrate table, a VideoToolbox fallback encodes at the bitrate of
+// the codec it actually started (custom "av1" -> HEVC on every current Mac), like the MF cascade (W1).
+void testFallbackFamilyBitrateK3() {
+    std::cout << "[Test 18 / T-K3] Codec fallback uses its own family's session bitrate...\n" << std::flush;
+    replay::VideoToolboxEncoder::resetCodecCache();
+    const auto& caps = replay::getMacVideoEncoderCaps();
+    // In-game settings of the review Mac: base 15 / max 35 Mbps, Adaptive VBR, 1440x900 native, 60 FPS.
+    const auto table = replay::computeCodecBitrateTable(
+        15, 35, 80, replay::kRateControlAdaptiveVbr,
+        replay::resolutionBitrateMultiplier(1440, 900), replay::fpsBitrateMultiplier(60));
+    const auto av1 = table.forFamily(replay::VideoCodecFamily::AV1);
+    const auto hevc = table.forFamily(replay::VideoCodecFamily::HEVC);
+    CHECK(av1.meanMbps == 7 && hevc.meanMbps == 9 && hevc.maxMbps == 20);
+
+    auto testDir = std::filesystem::temp_directory_path() / "InstantReplayMacHostTest_K3";
+    std::error_code ec;
+    std::filesystem::remove_all(testDir, ec);
+    std::filesystem::create_directories(testDir, ec);
+
+    {
+        replay::VideoToolboxEncoder enc;
+        enc.setFamilyBitrateTable(table);
+        auto res = enc.start(testDir / "k3_table.mp4", 320, 180, 60, av1.meanMbps, av1.maxMbps, 80,
+                             replay::RateControlMode::ADAPTIVE_VBR, false, replay::CodecType::CUSTOM, true, "av1",
+                             48000, nullptr, true);
+        CHECK(res.ok);
+        const auto active = enc.activeCodecFamily();
+        if (!caps.supports(replay::VideoCodecFamily::AV1, true)) {
+            CHECK(active != replay::VideoCodecFamily::AV1);
+        }
+        const auto expect = table.forFamily(active);
+        CHECK(enc.activeBitrateMbps() == expect.meanMbps);
+        CHECK(enc.activeMaxBitrateMbps() == std::max(expect.maxMbps, expect.meanMbps));
+        std::cout << "  T-K3: custom av1 -> " << enc.activeCodecName() << " @ " << enc.activeBitrateMbps()
+                  << "/" << enc.activeMaxBitrateMbps() << " Mbps (AV1 table " << av1.meanMbps << "/" << av1.maxMbps << ")\n";
+        enc.finish();
+    }
+    {
+        // Without a table the start() arguments are used unchanged (previous behaviour).
+        replay::VideoToolboxEncoder plain;
+        auto res = plain.start(testDir / "k3_plain.mp4", 320, 180, 60, av1.meanMbps, av1.maxMbps, 80,
+                               replay::RateControlMode::ADAPTIVE_VBR, false, replay::CodecType::CUSTOM, true, "av1",
+                               48000, nullptr, true);
+        CHECK(res.ok);
+        CHECK(plain.activeBitrateMbps() == av1.meanMbps);
+        CHECK(plain.activeMaxBitrateMbps() == std::max(av1.maxMbps, av1.meanMbps));
+        plain.finish();
+    }
+    std::filesystem::remove_all(testDir, ec);
+    std::cout << "  PASS Test 18 (T-K3)\n";
+}
+
 // Writes one ~30 s segment the way the recorder does in game: jittered 60 FPS video with dropped
 // frames, irregular FMOD-like game chunks and CoreAudio-like mic chunks, audio padded to the boundary.
 // The marker flash and both beeps start at the same presentation time (the flashed frame's PTS).
@@ -1628,6 +1680,7 @@ int main(int argc, char** argv) {
         testTrimmedExportSync();
         testPartialExportPathK2();
         testExportProgressK4();
+        testFallbackFamilyBitrateK3();
         if (runLong) {
             testLongProductionLikeExport();
         } else {

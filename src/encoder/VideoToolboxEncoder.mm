@@ -496,6 +496,8 @@ EncoderOpResult VideoToolboxEncoder::start(
     m_hasActiveCodec = false;
     m_activeCodecFamily = VideoCodecFamily::H264;
     m_activeHardware = hardwareAcceleration;
+    m_activeBitrateMbps = 0;
+    m_activeMaxBitrateMbps = 0;
 
     const CodecTargetSpec resolvedSpec = resolveRequestedCodecSpec(
         static_cast<int>(codec), hardwareAcceleration, customCodec);
@@ -597,12 +599,23 @@ EncoderOpResult VideoToolboxEncoder::start(
     for (const auto& attempt : attempts) {
         bool isPrimary = (attempt.family == targetFamily && attempt.hardware == enableHardware);
 
+        // Each attempt encodes at its own codec family's session bitrate when ReplayManager provided the
+        // per-family table, like the Media Foundation cascade (W1 parity, K3).
+        StartParams attemptParams = params;
+        if (m_familyBitrates.valid) {
+            const EffectiveBitrates familyRates = m_familyBitrates.forFamily(attempt.family);
+            if (familyRates.meanMbps > 0) {
+                attemptParams.bitrateMbps = familyRates.meanMbps;
+                attemptParams.maxBitrateMbps = std::max(familyRates.maxMbps, familyRates.meanMbps);
+            }
+        }
+
         int64_t failCode = 0;
         bool fatalStorage = false;
         bool permUnsupported = false;
         std::string error;
         bool started = tryStartLocked(
-            outputPath, attempt.family, attempt.hardware, params,
+            outputPath, attempt.family, attempt.hardware, attemptParams,
             failCode, fatalStorage, permUnsupported, error);
 
         if (!started && isPrimary && !permUnsupported && !fatalStorage &&
@@ -615,7 +628,7 @@ EncoderOpResult VideoToolboxEncoder::start(
             permUnsupported = false;
             error.clear();
             started = tryStartLocked(
-                outputPath, attempt.family, attempt.hardware, params,
+                outputPath, attempt.family, attempt.hardware, attemptParams,
                 failCode, fatalStorage, permUnsupported, error);
         }
 
@@ -629,6 +642,8 @@ EncoderOpResult VideoToolboxEncoder::start(
             m_hasActiveCodec = true;
             m_activeCodecFamily = attempt.family;
             m_activeHardware = attempt.hardware;
+            m_activeBitrateMbps = attemptParams.bitrateMbps;
+            m_activeMaxBitrateMbps = attemptParams.maxBitrateMbps;
             m_recording = true;
 
             {
@@ -651,23 +666,23 @@ EncoderOpResult VideoToolboxEncoder::start(
                 }
 
                 std::string logKey = requestKey + "->" + codecLabel + "|" +
-                                     std::to_string(params.bitrateMbps) + "|" +
-                                     std::to_string(params.maxBitrateMbps);
+                                     std::to_string(attemptParams.bitrateMbps) + "|" +
+                                     std::to_string(attemptParams.maxBitrateMbps);
                 if (s_lastLoggedCodecKey != logKey) {
                     s_lastLoggedCodecKey = logKey;
                     if (!isPrimary && !hasForcedCodec) {
                         geode::log::warn(
                             "Instant Replay: requested codec unavailable, fell back to {} ({}x{} @ {} FPS, effBitrate={} Mbps, effMaxBitrate={} Mbps)",
-                            codecLabel, width, height, fps, params.bitrateMbps, params.maxBitrateMbps);
+                            codecLabel, width, height, fps, attemptParams.bitrateMbps, attemptParams.maxBitrateMbps);
                     } else {
                         geode::log::info(
                             "Instant Replay: encoder started with {} ({}x{} @ {} FPS, effBitrate={} Mbps, effMaxBitrate={} Mbps)",
-                            codecLabel, width, height, fps, params.bitrateMbps, params.maxBitrateMbps);
+                            codecLabel, width, height, fps, attemptParams.bitrateMbps, attemptParams.maxBitrateMbps);
                     }
                 } else {
                     geode::log::debug(
                         "Instant Replay: encoder started with {} ({}x{} @ {} FPS, effBitrate={} Mbps, effMaxBitrate={} Mbps)",
-                        codecLabel, width, height, fps, params.bitrateMbps, params.maxBitrateMbps);
+                        codecLabel, width, height, fps, attemptParams.bitrateMbps, attemptParams.maxBitrateMbps);
                 }
             }
             return {true, 0, codecLabel, false};
