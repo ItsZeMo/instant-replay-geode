@@ -1385,7 +1385,8 @@ bool appendPcmChunkToAudioInput(
 ConcatResult concatenateImpl(
     const std::vector<std::filesystem::path>& segmentPaths,
     const std::filesystem::path& finalOutputPath,
-    double trimStartSeconds
+    double trimStartSeconds,
+    std::atomic<int>* progressPermille
 ) {
     ConcatResult res;
     auto fail = [&res](std::string msg) -> ConcatResult& {
@@ -1393,6 +1394,17 @@ ConcatResult concatenateImpl(
         res.error = std::move(msg);
         return res;
     };
+
+    // Monotonic export progress (K4): never moves backwards, whoever else writes the counter.
+    auto reportProgress = [progressPermille](int permille) {
+        if (!progressPermille) return;
+        permille = std::clamp(permille, 0, 1000);
+        int cur = progressPermille->load(std::memory_order_relaxed);
+        while (permille > cur &&
+               !progressPermille->compare_exchange_weak(cur, permille, std::memory_order_relaxed)) {
+        }
+    };
+    reportProgress(0);
 
     if (segmentPaths.empty()) return fail("no recorded segments");
 
@@ -1824,6 +1836,22 @@ ConcatResult concatenateImpl(
                                     bool seenFirstVideoKey = (segCut <= 0);
                                     concatState.beginSegment();
 
+                                    // Progress inside this segment from the local timestamp just written (K4).
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+                                    const int64_t segDurHns = cmTimeToHns(segAsset.duration);
+#pragma clang diagnostic pop
+                                    const double segCount = static_cast<double>(segmentPaths.size());
+                                    auto noteProgress = [&](int64_t localHns) {
+                                        double frac = 0.0;
+                                        if (segDurHns > segCut) {
+                                            frac = std::clamp(
+                                                static_cast<double>(localHns - segCut) / static_cast<double>(segDurHns - segCut),
+                                                0.0, 1.0);
+                                        }
+                                        reportProgress(static_cast<int>(990.0 * (static_cast<double>(segIdx) + frac) / segCount));
+                                    };
+
                                     // Align audio sample counters with outputBase when a prior segment had an anomaly gap
                                     // or when a secondary stream ran slightly longer than primary audio (N1).
                                     std::vector<float> audioPadScratch;
@@ -2010,6 +2038,7 @@ ConcatResult concatenateImpl(
                                             const int64_t sHns = llround(static_cast<double>(startSample) * kHnsPerSecond / sr);
                                             const int64_t eHns = llround(static_cast<double>(curLayout.totalOutputSamples) * kHnsPerSecond / sr);
                                             recordSampleWithOverlapTracking(cur.streamId, false, sHns, std::max<int64_t>(1, eHns - sHns), sr);
+                                            noteProgress(ptsHns);
 
                                             lastProgress = std::chrono::steady_clock::now();
                                             maybeMarkTrackFinished();
@@ -2122,6 +2151,7 @@ ConcatResult concatenateImpl(
                                         }
                                         CFRelease(rebased);
                                         lastProgress = std::chrono::steady_clock::now();
+                                        noteProgress(ptsHns);
                                         maybeMarkTrackFinished();
 
                                         recordSampleWithOverlapTracking(
@@ -2139,6 +2169,8 @@ ConcatResult concatenateImpl(
                                             bool anomalyWarn = false;
                                             int64_t excessHns = 0;
                                             concatState.endSegment(videoFrameDurationHns, &anomalyWarn, &excessHns);
+                                            reportProgress(static_cast<int>(
+                                                990.0 * static_cast<double>(segIdx + 1) / static_cast<double>(segmentPaths.size())));
                                             if (anomalyWarn) {
                                                 geode::log::warn(
                                                     "VideoToolboxEncoder: video end exceeded primary audio end by {:.2f} ms (>1.5 frames) in {}, falling back to max segment end",
@@ -2193,6 +2225,7 @@ ConcatResult concatenateImpl(
         }
 
         remuxGuard.completed = true;
+        reportProgress(1000);
         res.success = true;
         res.durationSeconds = static_cast<double>(std::max<int64_t>(0, concatState.outputBase)) /
                               static_cast<double>(kHnsPerSecond);
@@ -2207,12 +2240,13 @@ ConcatResult concatenateImpl(
 ConcatResult VideoToolboxEncoder::concatenateSegments(
     const std::vector<std::filesystem::path>& segmentPaths,
     const std::filesystem::path& finalOutputPath,
-    double trimStartSeconds
+    double trimStartSeconds,
+    std::atomic<int>* progressPermille
 ) {
     MacAutoreleasePoolScope pool;
     ConcatResult res;
     try {
-        res = concatenateImpl(segmentPaths, finalOutputPath, trimStartSeconds);
+        res = concatenateImpl(segmentPaths, finalOutputPath, trimStartSeconds, progressPermille);
     } catch (const std::exception& e) {
         res.success = false;
         res.error = std::string("exception: ") + e.what();

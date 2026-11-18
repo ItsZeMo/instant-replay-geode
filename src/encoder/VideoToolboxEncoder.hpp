@@ -13,6 +13,7 @@
 #include <CoreVideo/CoreVideo.h>
 #undef CommentType
 #pragma pop_macro("CommentType")
+#include <atomic>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -72,11 +73,14 @@ public:
     // cannot be remuxed into one file without re-encoding.
     const std::string& formatKey() const noexcept { return m_formatKey; }
 
-    // Remuxes segments (oldest first) into finalOutputPath without re-encoding.
+    // Merges segments (oldest first) into finalOutputPath: video passthrough, audio re-encoded into one
+    // continuous AAC stream per track (N1). `progressPermille`, when set, rises monotonically from 0 while
+    // segments are processed, stays <= 990 until the MP4 is finalized and ends at 1000 on success (K4).
     static ConcatResult concatenateSegments(
         const std::vector<std::filesystem::path>& segmentPaths,
         const std::filesystem::path& finalOutputPath,
-        double trimStartSeconds = 0.0
+        double trimStartSeconds = 0.0,
+        std::atomic<int>* progressPermille = nullptr
     );
 
 private:

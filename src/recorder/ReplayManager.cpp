@@ -2773,9 +2773,7 @@ bool ReplayManager::handleSaveRequest(
         const auto exportStart = std::chrono::steady_clock::now();
 
         ConcatResult result;
-#ifdef GEODE_IS_WINDOWS
-        m_exportProgressPermille.store(0, std::memory_order_relaxed);
-#endif
+        m_exportProgressPermille.store(0, std::memory_order_relaxed); // both exporters report progress (W3, K4)
         {
             MediaThreadScope mediaScope;
 #ifdef GEODE_IS_WINDOWS
@@ -2791,7 +2789,7 @@ bool ReplayManager::handleSaveRequest(
             }
             result = PlatformEncoder::concatenateSegments(segDescs, writePath, trimStartSeconds, &m_exportProgressPermille);
 #else
-            result = PlatformEncoder::concatenateSegments(segsToMerge, writePath, trimStartSeconds);
+            result = PlatformEncoder::concatenateSegments(segsToMerge, writePath, trimStartSeconds, &m_exportProgressPermille);
 #endif
         }
 

@@ -1454,6 +1454,49 @@ void testPartialExportPathK2() {
     std::cout << "  PASS Test 16 (T-K2)\n";
 }
 
+// T-K4: the macOS export reports progress through the shared counter: monotonic, intermediate values
+// while segments are merged, <= 990 until the MP4 is finalized and exactly 1000 on success.
+void testExportProgressK4() {
+    std::cout << "[Test 17 / T-K4] Export progress is monotonic 0 -> 1000...\n" << std::flush;
+    auto testDir = std::filesystem::temp_directory_path() / "InstantReplayMacHostTest_K4";
+    std::error_code ec;
+    std::filesystem::remove_all(testDir, ec);
+    std::filesystem::create_directories(testDir, ec);
+
+    std::vector<std::filesystem::path> segs;
+    for (int i = 0; i < 4; ++i) {
+        auto seg = testDir / ("seg_" + std::to_string(i + 1) + ".mp4");
+        writeMarkerSegment(seg, 44100, 2.0, replay::CodecType::HEVC);
+        segs.push_back(seg);
+    }
+
+    std::atomic<int> progress{-1};
+    std::atomic<bool> done{false};
+    std::vector<int> samples;
+    std::thread watcher([&]() {
+        while (!done.load(std::memory_order_acquire)) {
+            samples.push_back(progress.load(std::memory_order_relaxed));
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
+        }
+    });
+    auto res = replay::VideoToolboxEncoder::concatenateSegments(segs, testDir / "merged_k4.mp4", 1.5, &progress);
+    done.store(true, std::memory_order_release);
+    watcher.join();
+
+    CHECK(res.success);
+    CHECK(progress.load() == 1000);
+    int prev = -1;
+    bool sawIntermediate = false;
+    for (int v : samples) {
+        CHECK(v >= prev);
+        if (v > 0 && v < 1000) sawIntermediate = true;
+        prev = v;
+    }
+    CHECK(sawIntermediate);
+    std::filesystem::remove_all(testDir, ec);
+    std::cout << "  PASS Test 17 (T-K4: " << samples.size() << " samples, last before end=" << prev << ")\n";
+}
+
 // Writes one ~30 s segment the way the recorder does in game: jittered 60 FPS video with dropped
 // frames, irregular FMOD-like game chunks and CoreAudio-like mic chunks, audio padded to the boundary.
 // The marker flash and both beeps start at the same presentation time (the flashed frame's PTS).
@@ -1584,6 +1627,7 @@ int main(int argc, char** argv) {
         testAacRoundingOverlapTolerance();
         testTrimmedExportSync();
         testPartialExportPathK2();
+        testExportProgressK4();
         if (runLong) {
             testLongProductionLikeExport();
         } else {
