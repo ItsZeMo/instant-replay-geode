@@ -32,6 +32,8 @@
 #include "platform/MacVideoCapabilities.hpp"
 #include "recorder/MicMixFifo.hpp"
 
+#include "shared_pure_tests.hpp"
+
 namespace {
 
 #define CHECK(expr) do { \
@@ -1337,10 +1339,187 @@ void testAacRoundingOverlapTolerance() {
     std::cout << "  PASS Test 13 (T-N4)\n";
 }
 
+// Measures A/V marker offsets of `merged` on every audio track; returns the worst |A-V| in ms.
+double maxMarkerOffsetMs(const std::filesystem::path& merged, size_t expectedMarkers, const char* label) {
+    double worst = 0.0;
+    @autoreleasepool {
+        std::string u8 = geode::utils::string::pathToString(merged);
+        NSURL* url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:u8.c_str()]];
+        for (int audioIdx : {0, 1}) {
+            std::vector<double> aOn, vOn;
+            bool emptyEdit = true;
+            NSUInteger segCount = 0;
+            measureMarkerOnsets(url, audioIdx, aOn, vOn, emptyEdit, segCount);
+            CHECK(!emptyEdit);
+            CHECK(segCount == 1);
+            if (aOn.size() != expectedMarkers || vOn.size() != expectedMarkers) {
+                std::cerr << "  FAIL " << label << " track " << audioIdx << ": markers A=" << aOn.size()
+                          << " V=" << vOn.size() << " expected=" << expectedMarkers << "\n";
+            }
+            CHECK(aOn.size() == expectedMarkers && vOn.size() == expectedMarkers);
+            for (size_t i = 0; i < expectedMarkers; ++i) {
+                worst = std::max(worst, std::fabs(aOn[i] - vOn[i]) * 1000.0);
+            }
+        }
+    }
+    return worst;
+}
+
+// T-trim (K7): the export trims the oldest segment at a keyframe near trimStartSeconds; audio is cut at
+// the same instant, so markers stay in sync after the trim on both 44.1 kHz H.264 and 48 kHz HEVC.
+void testTrimmedExportSync() {
+    std::cout << "[Test 14 / T-trim] Trimmed export keeps A/V markers in sync (|A-V| <= 1ms)...\n" << std::flush;
+    struct Case { int rate; replay::CodecType codec; const char* name; };
+    for (const auto& c : {
+             Case{44100, replay::CodecType::H264, "H264@44.1kHz"},
+             Case{48000, replay::CodecType::HEVC, "HEVC@48kHz"},
+         }) {
+        auto testDir = std::filesystem::temp_directory_path() / ("InstantReplayMacHostTest_Trim_" + std::string(c.name));
+        std::error_code ec;
+        std::filesystem::remove_all(testDir, ec);
+        std::filesystem::create_directories(testDir, ec);
+
+        std::vector<std::filesystem::path> segs;
+        for (int i = 0; i < 4; ++i) {
+            auto seg = testDir / ("seg_" + std::to_string(i + 1) + ".mp4");
+            writeMarkerSegment(seg, c.rate, 2.0, c.codec); // markers at 2, 7, 12, 17 s of the source timeline
+            segs.push_back(seg);
+        }
+        for (double trim : {1.5, 3.3, 4.7}) {
+            auto merged = testDir / ("merged_trim_" + std::to_string(static_cast<int>(trim * 10)) + ".mp4");
+            auto res = replay::VideoToolboxEncoder::concatenateSegments(segs, merged, trim);
+            CHECK(res.success);
+            // The cut lands on a keyframe at or before the requested trim (<= 1 s GOP), so it never drops
+            // more than asked and keeps at most one extra second.
+            CHECK(res.durationSeconds >= 20.0 - trim - 0.02);
+            CHECK(res.durationSeconds <= 20.0 - trim + 1.05);
+            const double cutSec = 20.0 - res.durationSeconds;
+            const size_t expected = (cutSec <= 2.0) ? 4 : 3; // a cut past 2 s removes the first marker
+            const double worst = maxMarkerOffsetMs(merged, expected, c.name);
+            std::cout << "  T-trim (" << c.name << ", trim " << trim << " s): dur=" << res.durationSeconds
+                      << "s max|A-V|=" << worst << "ms\n";
+            CHECK(worst <= 1.0);
+        }
+        std::filesystem::remove_all(testDir, ec);
+    }
+    std::cout << "  PASS Test 14 (T-trim)\n";
+}
+
+// Writes one ~30 s segment the way the recorder does in game: jittered 60 FPS video with dropped
+// frames, irregular FMOD-like game chunks and CoreAudio-like mic chunks, audio padded to the boundary.
+// The marker flash and both beeps start at the same presentation time (the flashed frame's PTS).
+void writeProductionLikeSegment(
+    const std::filesystem::path& path, int gameRate, double segDurSec, double markerAtSec, unsigned seed
+) {
+    constexpr int kW = 128, kH = 72, kFps = 60;
+    replay::VideoToolboxEncoder enc;
+    auto startRes = enc.start(path, kW, kH, kFps, 8, 12, 80, replay::RateControlMode::ADAPTIVE_VBR,
+                              true, replay::CodecType::HEVC, true, "", gameRate, nullptr, true);
+    CHECK(startRes.ok);
+
+    std::vector<int64_t> frameHns;
+    unsigned rng = seed * 2654435761u + 12345u;
+    for (int i = 0;; ++i) {
+        rng = rng * 1664525u + 1013904223u;
+        const double jitterMs = (static_cast<double>(rng >> 8) / static_cast<double>(1u << 24) - 0.5) * 4.0;
+        const double t = (static_cast<double>(i) / kFps) + jitterMs / 1000.0;
+        if (t >= segDurSec - 0.0001) break;
+        if (i % 97 == 50) continue; // dropped frame
+        const int64_t hns = std::max<int64_t>(0, std::llround(t * 1e7));
+        if (!frameHns.empty() && hns <= frameHns.back()) continue;
+        frameHns.push_back(hns);
+    }
+    size_t markerFrame = 0;
+    while (markerFrame < frameHns.size() && frameHns[markerFrame] < std::llround(markerAtSec * 1e7)) ++markerFrame;
+    CHECK(markerFrame < frameHns.size());
+    const double beepAtSec = static_cast<double>(frameHns[markerFrame]) / 1e7;
+
+    const int64_t gameTotal = std::llround(segDurSec * gameRate);
+    const int64_t micTotal = std::llround(segDurSec * 48000.0);
+    const int gameChunks[] = {1024, 512, 2048, 1024, 1536, 1024};
+    const int micChunks[] = {960, 960, 480, 1440, 960};
+
+    CVPixelBufferRef dark = makeTestPixelBuffer(kW, kH, 10, 10, 10, 10, 10, 10);
+    CVPixelBufferRef bright = makeTestPixelBuffer(kW, kH, 240, 240, 240, 240, 240, 240);
+    std::vector<float> buf;
+    size_t vi = 0;
+    int64_t g = 0, m = 0;
+    int gc = 0, mc = 0;
+    auto beep = [&](int64_t idx, int rate) -> float {
+        const int64_t s = std::llround(beepAtSec * rate);
+        if (idx < s || idx >= s + rate / 20) return 0.0f;
+        return 0.5f * std::sinf(2.0f * static_cast<float>(M_PI) * 1000.0f * static_cast<float>(idx) / static_cast<float>(rate));
+    };
+    while (vi < frameHns.size() || g < gameTotal || m < micTotal) {
+        const int64_t nv = vi < frameHns.size() ? frameHns[vi] : INT64_MAX;
+        const int64_t ng = g < gameTotal ? (g * 10000000LL) / gameRate : INT64_MAX;
+        const int64_t nm = m < micTotal ? (m * 10000000LL) / 48000 : INT64_MAX;
+        if (nv <= ng && nv <= nm) {
+            for (int w = 0; w < 200 && enc.isVideoQueueSaturated(16, 256ull << 20); ++w) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            const bool hi = (vi >= markerFrame && vi < markerFrame + 3);
+            CHECK(enc.writeVideoFrame(hi ? bright : dark, kW, kH, nv).ok);
+            ++vi;
+        } else if (ng <= nm) {
+            const int n = static_cast<int>(std::min<int64_t>(gameChunks[gc++ % 6], gameTotal - g));
+            buf.assign(static_cast<size_t>(n) * 2, 0.0f);
+            for (int s = 0; s < n; ++s) buf[s * 2] = buf[s * 2 + 1] = beep(g + s, gameRate);
+            CHECK(enc.writeGameAudio(buf.data(), n, 2, gameRate, ng).ok);
+            g += n;
+        } else {
+            const int n = static_cast<int>(std::min<int64_t>(micChunks[mc++ % 5], micTotal - m));
+            buf.assign(static_cast<size_t>(n) * 2, 0.0f);
+            for (int s = 0; s < n; ++s) buf[s * 2] = buf[s * 2 + 1] = beep(m + s, 48000);
+            CHECK(enc.writeMicAudio(buf.data(), n, 2, 48000, nm).ok);
+            m += n;
+        }
+    }
+    CFRelease(dark);
+    CFRelease(bright);
+    CHECK(enc.finish());
+}
+
+// T-long (K7, opt-in with --long, ~70 s on M1): a 10-minute replay (20 x ~30 s segments like
+// duration=600) keeps every marker within 1 ms; nothing drifts across 19 seams.
+void testLongProductionLikeExport() {
+    std::cout << "[Test 15 / T-long] 10-minute production-like export (20 x ~30 s, jitter, drops)...\n" << std::flush;
+    auto testDir = std::filesystem::temp_directory_path() / "InstantReplayMacHostTest_Long";
+    std::error_code ec;
+    std::filesystem::remove_all(testDir, ec);
+    std::filesystem::create_directories(testDir, ec);
+
+    std::vector<std::filesystem::path> segs;
+    for (int i = 0; i < 20; ++i) {
+        const double segDur = 30.0 + ((i % 3) - 1) * 0.0137; // 29.986 / 30.000 / 30.014 s like real rotations
+        auto seg = testDir / ("seg_" + std::to_string(i + 1) + ".mp4");
+        writeProductionLikeSegment(seg, 44100, segDur, 2.0 + 0.37 * (i % 5), static_cast<unsigned>(i + 1));
+        segs.push_back(seg);
+    }
+    for (double trim : {0.0, 12.4}) {
+        auto merged = testDir / (trim > 0.0 ? "merged_long_trim.mp4" : "merged_long.mp4");
+        const auto t0 = std::chrono::steady_clock::now();
+        auto res = replay::VideoToolboxEncoder::concatenateSegments(segs, merged, trim);
+        const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        CHECK(res.success);
+        const double worst = maxMarkerOffsetMs(merged, trim > 2.0 ? 19 : 20, "T-long");
+        std::cout << "  T-long (trim " << trim << " s): dur=" << res.durationSeconds << "s merge=" << secs
+                  << "s max|A-V|=" << worst << "ms\n";
+        CHECK(worst <= 1.0);
+    }
+    std::filesystem::remove_all(testDir, ec);
+    std::cout << "  PASS Test 15 (T-long)\n";
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    bool runLong = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--long") runLong = true;
+    }
     @autoreleasepool {
+        replay_host_tests::runSharedPureTests();
         testVideoToolboxAndRemux();
         testOpenGLInvertedBlitAndPboToEncoder();
         testCoreAudioHardwareEnumeration();
@@ -1354,6 +1533,12 @@ int main() {
         testContinuousSineWaveSeamContinuity();
         testHevcSoftwareWritableConsistency();
         testAacRoundingOverlapTolerance();
+        testTrimmedExportSync();
+        if (runLong) {
+            testLongProductionLikeExport();
+        } else {
+            std::cout << "SKIP Test 15 (T-long): pass --long to run the 10-minute export check\n";
+        }
     }
     std::cout << "ALL MACOS HOST TESTS PASSED!\n";
     return 0;
