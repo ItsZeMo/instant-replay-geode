@@ -164,8 +164,9 @@ private:
 
     // Serializes the capture DSP / save-bypass state: FMODAudioEngine::update re-verifies the DSP on the
     // game thread while shutdown (macOS: $on_game(Exiting) on the AppKit main thread) tears it down (K5).
-    // The FMOD mixer callback (pushGameAudio) never takes it.
-    std::mutex m_dspMutex;
+    // Recursive so a same-thread re-entry (e.g. GD code reached from playSaveSoundBypass calling back into
+    // FMODAudioEngine::update) cannot self-deadlock. The FMOD mixer callback (pushGameAudio) never takes it.
+    std::recursive_mutex m_dspMutex;
     std::atomic<bool> m_initialized{false};
     FMOD::DSP* m_fmodDSP = nullptr;
     FMOD::System* m_dspSystem = nullptr;            // system / master group the DSP was attached to (W18)

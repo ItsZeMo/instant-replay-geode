@@ -126,7 +126,7 @@ AudioGrabber::~AudioGrabber() {
 }
 
 void AudioGrabber::initialize() {
-    std::lock_guard<std::mutex> lock(m_dspMutex);
+    std::lock_guard<std::recursive_mutex> lock(m_dspMutex);
     if (m_initialized.load()) return;
 
     m_initialized.store(true);
@@ -136,7 +136,7 @@ void AudioGrabber::initialize() {
 
 void AudioGrabber::cleanup() {
     {
-        std::lock_guard<std::mutex> lock(m_dspMutex);
+        std::lock_guard<std::recursive_mutex> lock(m_dspMutex);
         if (!m_initialized.load()) return;
 
         m_initialized.store(false);
@@ -163,7 +163,7 @@ void AudioGrabber::cleanupSaveBypass() {
 
 bool AudioGrabber::playSaveSoundBypass(const char* soundPath) {
     if (!soundPath || !soundPath[0]) return false;
-    std::lock_guard<std::mutex> lock(m_dspMutex);
+    std::lock_guard<std::recursive_mutex> lock(m_dspMutex);
     auto engine = FMODAudioEngine::sharedEngine();
     if (!engine || !engine->m_system) return false;
 
@@ -244,7 +244,7 @@ void AudioGrabber::setMicAudioCallback(AudioCallback cb) {
 }
 
 void AudioGrabber::ensureDSPAttached() {
-    std::lock_guard<std::mutex> lock(m_dspMutex);
+    std::lock_guard<std::recursive_mutex> lock(m_dspMutex);
     if (!m_initialized.load()) return;
     auto now = std::chrono::steady_clock::now();
 
