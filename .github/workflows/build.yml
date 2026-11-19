@@ -7,7 +7,9 @@ on:
 
 jobs:
   build:
-    runs-on: windows-latest
+    # windows-latest moved to Visual Studio 18 (MSVC STL 14.52 requires Clang 22) while its LLVM is
+    # still clang 20, so every clang-cl / Geode Win64 build stops at STL1000. Pin the VS 2022 image.
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
       - uses: geode-sdk/build-geode-mod@main
@@ -53,7 +55,9 @@ jobs:
           ./build/test_host_mac
 
   host-tests-win:
-    runs-on: windows-latest
+    # windows-latest moved to Visual Studio 18 (MSVC STL 14.52 requires Clang 22) while its LLVM is
+    # still clang 20, so every clang-cl / Geode Win64 build stops at STL1000. Pin the VS 2022 image.
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
       - uses: ilammy/msvc-dev-cmd@v1
