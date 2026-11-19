@@ -4,7 +4,7 @@
 
 namespace replay {
 
-enum class MicCaptureStatus : uint8_t {
+enum class MicCaptureStatus : std::uint8_t {
     Idle = 0,
     Active,
     PermissionDenied,
@@ -16,7 +16,7 @@ enum class MicCaptureStatus : uint8_t {
 
 // macOS microphone privacy (TCC) grant as reported by +[AVCaptureDevice authorizationStatusForMediaType:].
 // Kept platform-neutral so the policy below is host-testable (K1).
-enum class MicPrivacyAuthorization : uint8_t {
+enum class MicPrivacyAuthorization : std::uint8_t {
     NotDetermined = 0,
     Restricted,
     Denied,
@@ -53,5 +53,27 @@ constexpr bool isMicSilenceStatus(MicCaptureStatus status) noexcept {
     return status == MicCaptureStatus::BlockedNoUsageDescription ||
            status == MicCaptureStatus::DigitalSilenceDetected;
 }
+
+// Silence bookkeeping for one capture queue (K1). Both inputs are sticky per queue: the capture callback
+// raises `silenceAlert` after >= 3 s of pure digital silence and `sawNonZero` on the first real sample (after
+// which it stops counting silence). Silence is reported once, only while no real sample has been seen, and
+// recovery once, so the status cannot flip-flop between "silent" and "active" after the input wakes up.
+struct MicSilenceTracker {
+    enum class Event : std::uint8_t { None, EnteredSilence, Recovered };
+
+    bool reported = false;
+
+    Event poll(bool silenceAlert, bool sawNonZero) noexcept {
+        if (!reported && silenceAlert && !sawNonZero) {
+            reported = true;
+            return Event::EnteredSilence;
+        }
+        if (reported && sawNonZero) {
+            reported = false;
+            return Event::Recovered;
+        }
+        return Event::None;
+    }
+};
 
 } // namespace replay

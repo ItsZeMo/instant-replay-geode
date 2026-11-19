@@ -709,6 +709,36 @@ inline void testMicStatusPolicyK1() {
     IR_SHARED_CHECK(replay::micAuthorizationBlocksCapture(MicPrivacyAuthorization::Restricted));
     IR_SHARED_CHECK(!replay::micAuthorizationBlocksCapture(MicPrivacyAuthorization::NotDetermined));
     IR_SHARED_CHECK(!replay::micAuthorizationBlocksCapture(MicPrivacyAuthorization::Authorized));
+
+    // Poll-loop transitions: the capture callback's flags are sticky per queue (the 3 s silence alert is
+    // never cleared), so after the mic wakes up the loop must report recovery once and then stay quiet
+    // instead of flip-flopping silence <-> active every 50 ms poll.
+    {
+        using Event = replay::MicSilenceTracker::Event;
+        replay::MicSilenceTracker tracker;
+        int entered = 0, recovered = 0;
+        auto step = [&](bool alert, bool nonZero) {
+            const Event e = tracker.poll(alert, nonZero);
+            if (e == Event::EnteredSilence) ++entered;
+            if (e == Event::Recovered) ++recovered;
+            return e;
+        };
+        for (int i = 0; i < 60; ++i) IR_SHARED_CHECK(step(false, false) == Event::None); // first 3 s
+        IR_SHARED_CHECK(step(true, false) == Event::EnteredSilence);
+        for (int i = 0; i < 100; ++i) IR_SHARED_CHECK(step(true, false) == Event::None);  // still muted
+        IR_SHARED_CHECK(step(true, true) == Event::Recovered);                               // unmuted
+        for (int i = 0; i < 1000; ++i) IR_SHARED_CHECK(step(true, true) == Event::None);  // no flip-flop
+        IR_SHARED_CHECK(entered == 1 && recovered == 1);
+
+        // Real audio before the first poll saw the alert: never reported as silent.
+        replay::MicSilenceTracker quick;
+        IR_SHARED_CHECK(quick.poll(true, true) == Event::None);
+        IR_SHARED_CHECK(quick.poll(true, true) == Event::None);
+
+        // A new queue (device switch) starts fresh and may report silence again.
+        replay::MicSilenceTracker next;
+        IR_SHARED_CHECK(next.poll(true, false) == Event::EnteredSilence);
+    }
     std::cout << "  PASS Test K1\n";
 }
 

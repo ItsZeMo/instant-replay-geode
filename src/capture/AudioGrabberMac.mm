@@ -516,7 +516,7 @@ void AudioGrabber::micCaptureThreadFunc() {
         bool registeredDefaultListener = false;
         bool registeredDevicesListener = false;
         bool registeredAliveListener = false;
-        bool reportedDigitalSilence = false;
+        MicSilenceTracker silenceTracker; // per queue: silence reported once, recovery once (K1)
 
         if (err == noErr && queue) {
             bool setDeviceOk = true;
@@ -591,9 +591,11 @@ void AudioGrabber::micCaptureThreadFunc() {
                         break;
                     }
 
-                    if (qState.digitalSilenceAlert.load(std::memory_order_acquire) && !reportedDigitalSilence) {
+                    const MicSilenceTracker::Event silenceEvent = silenceTracker.poll(
+                        qState.digitalSilenceAlert.load(std::memory_order_acquire),
+                        qState.sawNonZeroAudio.load(std::memory_order_acquire));
+                    if (silenceEvent == MicSilenceTracker::Event::EnteredSilence) {
                         // Soft status (K1): the queue keeps running and real audio switches back to Active below.
-                        reportedDigitalSilence = true;
                         const MicCaptureStatus silenceStatus = micStatusForDigitalSilence(auth, hasUsageKey);
                         setStatusUnlessStopped(silenceStatus);
                         if (!s_warnedDigitalSilence.exchange(true, std::memory_order_acq_rel)) {
@@ -623,8 +625,7 @@ void AudioGrabber::micCaptureThreadFunc() {
                                 });
                             }
                         }
-                    } else if (reportedDigitalSilence && qState.sawNonZeroAudio.load(std::memory_order_relaxed)) {
-                        reportedDigitalSilence = false;
+                    } else if (silenceEvent == MicSilenceTracker::Event::Recovered) {
                         setStatusUnlessStopped(
                             usingFallback ? MicCaptureStatus::UsingFallbackDevice : MicCaptureStatus::Active);
                         geode::log::info("Instant Replay: microphone audio resumed after digital silence");
