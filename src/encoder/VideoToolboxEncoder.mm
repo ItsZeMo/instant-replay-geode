@@ -1,9 +1,9 @@
 #include "VideoToolboxEncoder.hpp"
 
-#ifdef GEODE_IS_MACOS
+#if defined(GEODE_IS_MACOS) || defined(GEODE_IS_IOS)
 
 #include "ConcatTimestampMath.hpp"
-#include "../platform/MacPlatformUtils.hpp"
+#include "../platform/AppleAutoreleasePool.hpp"
 #include "../platform/MacVideoCapabilities.hpp"
 
 #pragma push_macro("CommentType")
@@ -11,7 +11,11 @@
 #define CommentType AppleScriptCommentTypeDummy
 #import <AVFoundation/AVFoundation.h>
 #import <AudioToolbox/AudioToolbox.h>
+#if TARGET_OS_IPHONE
+#import <CoreAudioTypes/CoreAudioTypes.h>
+#else
 #import <CoreAudio/CoreAudio.h>
+#endif
 #import <CoreFoundation/CoreFoundation.h>
 #import <CoreMedia/CoreMedia.h>
 #import <VideoToolbox/VideoToolbox.h>
@@ -40,6 +44,23 @@ constexpr int64_t kHnsPerSecond = 10000000LL;
 constexpr int32_t kVideoMediaTimeScale = 1000000; // 1 us ticks (safe for >20h, exact divisor of HNS/10)
 constexpr CMVideoCodecType kCodecTypeAV1 = 'av01';
 constexpr double kMaxPendingAudioSeconds = 10.0; // cap deferred AAC buffers during transient writer backpressure (M2)
+
+// VideoToolbox encoder specification. macOS can require or refuse the hardware encoder; iOS only gained
+// these keys in 17.4 and only ships hardware encoders, so earlier iOS versions use the default spec.
+NSDictionary* encoderSpecificationFor(bool hardware) {
+#if TARGET_OS_IPHONE
+    if (@available(iOS 17.4, *)) {
+        return hardware
+            ? @{ (__bridge NSString*)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @YES }
+            : @{ (__bridge NSString*)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @NO };
+    }
+    return @{};
+#else
+    return hardware
+        ? @{ (__bridge NSString*)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @YES }
+        : @{ (__bridge NSString*)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @NO };
+#endif
+}
 
 std::string formatNsException(NSException* ex) {
     if (!ex) return "Objective-C exception";
@@ -223,9 +244,7 @@ bool probeVideoToolboxCodec(
         return false;
     }
 
-    NSDictionary* encoderSpec = hardware
-        ? @{ (__bridge NSString*)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @YES }
-        : @{ (__bridge NSString*)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @NO };
+    NSDictionary* encoderSpec = encoderSpecificationFor(hardware);
 
     NSDictionary* srcAttrs = @{
         (__bridge NSString*)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
@@ -257,7 +276,7 @@ bool probeVideoToolboxCodec(
     VTSessionSetProperty(session, kVTCompressionPropertyKey_ExpectedFrameRate, (__bridge CFTypeRef)@(fps));
 
     if (rateControl == RateControlMode::CONSTANT_CBR) {
-        if (@available(macOS 13.0, *)) {
+        if (@available(macOS 13.0, iOS 16.0, *)) {
             int64_t bitrateBps = static_cast<int64_t>(std::max(1, bitrateMbps)) * 1000000LL;
             OSStatus cbrStatus = VTSessionSetProperty(
                 session, kVTCompressionPropertyKey_ConstantBitRate, (__bridge CFTypeRef)@(bitrateBps));
@@ -593,7 +612,12 @@ EncoderOpResult VideoToolboxEncoder::start(
     if (!targetSupportedByList) {
         lastErrMsg = std::string(familyName(targetFamily)) +
                      (enableHardware ? " (HW)" : " (SW)") +
-                     ": encoder not available in VideoToolbox on this Mac";
+                     ": encoder not available in VideoToolbox on this " +
+#if TARGET_OS_IPHONE
+                     "device";
+#else
+                     "Mac";
+#endif
     }
 
     for (const auto& attempt : attempts) {
@@ -789,14 +813,21 @@ bool VideoToolboxEncoder::tryStartLocked(
         if (family == VideoCodecFamily::H264) {
             compProps[AVVideoProfileLevelKey] = AVVideoProfileLevelH264HighAutoLevel;
         }
+#if TARGET_OS_IPHONE
+        else if (family == VideoCodecFamily::HEVC) {
+            // 8-bit Main: the encoder's default can be Main10, which many editors and players cannot open.
+            compProps[AVVideoProfileLevelKey] = (__bridge NSString*)kVTProfileLevel_HEVC_Main_AutoLevel;
+        }
+#endif
 
         int64_t bitrateBps = static_cast<int64_t>(std::max(1, p.bitrateMbps)) * 1000000LL;
         int64_t maxBitrateBps = static_cast<int64_t>(std::max(p.bitrateMbps, p.maxBitrateMbps)) * 1000000LL;
         bool usingActualCbr = false;
+        bool peakCapDropped = false;
 
         switch (p.rateControl) {
             case RateControlMode::CONSTANT_CBR: {
-                if (@available(macOS 13.0, *)) {
+                if (@available(macOS 13.0, iOS 16.0, *)) {
                     if (supportsCbr) {
                         compProps[(__bridge NSString*)kVTCompressionPropertyKey_ConstantBitRate] = @(bitrateBps);
                         usingActualCbr = true;
@@ -823,40 +854,49 @@ bool VideoToolboxEncoder::tryStartLocked(
             }
         }
 
-        NSDictionary* encoderSpec = hardware
-            ? @{ (__bridge NSString*)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @YES }
-            : @{ (__bridge NSString*)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @NO };
-
-        NSDictionary* videoSettings = @{
+        NSMutableDictionary* videoSettings = [@{
             AVVideoCodecKey: avVideoCodecKeyForFamily(family),
             AVVideoWidthKey: @(p.width),
             AVVideoHeightKey: @(p.height),
-            AVVideoEncoderSpecificationKey: encoderSpec,
             AVVideoCompressionPropertiesKey: compProps,
             AVVideoColorPropertiesKey: @{
                 AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
                 AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
                 AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2,
             },
-        };
+        } mutableCopy];
+#if !TARGET_OS_IPHONE
+        // iOS AVAssetWriter has no encoder-specification key and always encodes in hardware.
+        videoSettings[AVVideoEncoderSpecificationKey] = encoderSpecificationFor(hardware);
+#endif
 
-        if (![writer canApplyOutputSettings:videoSettings forMediaType:AVMediaTypeVideo]) {
+        // Settings an encoder may reject are relaxed in order before giving up on the codec (e.g. HEVC in the
+        // iOS Simulator refuses the peak-rate cap): 1. the peak-rate cap, 2. CQ without a bitrate,
+        // 3. the profile / level.
+        auto canApply = [&]() -> bool {
+            return [writer canApplyOutputSettings:videoSettings forMediaType:AVMediaTypeVideo] == YES;
+        };
+        NSString* const peakCapKey = (__bridge NSString*)kVTCompressionPropertyKey_DataRateLimits;
+        if (!canApply() && compProps[peakCapKey] != nil) {
+            [compProps removeObjectForKey:peakCapKey];
+            peakCapDropped = true;
+            geode::log::info("Instant Replay: {} encoder rejected the peak bitrate cap (DataRateLimits), retrying without it",
+                             familyName(family));
+        }
+        if (!canApply() && p.rateControl == RateControlMode::CONSTANT_QUALITY && compProps[AVVideoQualityKey] != nil) {
             // Fallback for encoders rejecting AVVideoQualityKey without bitrate
-            if (p.rateControl == RateControlMode::CONSTANT_QUALITY) {
-                [compProps removeObjectForKey:AVVideoQualityKey];
-                compProps[AVVideoAverageBitRateKey] = @(bitrateBps);
-                if (![writer canApplyOutputSettings:videoSettings forMediaType:AVMediaTypeVideo]) {
-                    outCode = kVTParameterErr;
-                    outPermUnsupported = true;
-                    outError = "AVAssetWriter rejected video output settings";
-                    return false;
-                }
-            } else {
-                outCode = kVTParameterErr;
-                outPermUnsupported = true;
-                outError = "AVAssetWriter rejected video output settings";
-                return false;
-            }
+            [compProps removeObjectForKey:AVVideoQualityKey];
+            compProps[AVVideoAverageBitRateKey] = @(bitrateBps);
+        }
+        if (!canApply() && compProps[AVVideoProfileLevelKey] != nil) {
+            [compProps removeObjectForKey:AVVideoProfileLevelKey];
+            geode::log::info("Instant Replay: {} encoder rejected the profile / level, retrying without it", familyName(family));
+        }
+        if (!canApply()) {
+            outCode = kVTParameterErr;
+            outPermUnsupported = true;
+            outError = "AVAssetWriter rejected video output settings";
+            return false;
         }
 
         AVAssetWriterInput* videoInput = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo
@@ -883,8 +923,10 @@ bool VideoToolboxEncoder::tryStartLocked(
         // Log effective rate control once per codec/mode transition
         {
             const char* actualRc = (p.rateControl == RateControlMode::CONSTANT_CBR)
-                ? (usingActualCbr ? "ConstantCBR" : "TightConstrainedVBR")
-                : (p.rateControl == RateControlMode::CONSTANT_QUALITY ? "Quality" : "ConstrainedVBR");
+                ? (usingActualCbr ? "ConstantCBR" : (peakCapDropped ? "AverageBitrate" : "TightConstrainedVBR"))
+                : (p.rateControl == RateControlMode::CONSTANT_QUALITY
+                       ? "Quality"
+                       : (peakCapDropped ? "AverageBitrate" : "ConstrainedVBR"));
             char rcLogBuf[128];
             snprintf(rcLogBuf, sizeof(rcLogBuf), "%s|%s|%d|%d->%s",
                      familyName(family), hardware ? "hw" : "sw",
@@ -2272,4 +2314,4 @@ ConcatResult VideoToolboxEncoder::concatenateSegments(
 
 } // namespace replay
 
-#endif // GEODE_IS_MACOS
+#endif // GEODE_IS_MACOS || GEODE_IS_IOS

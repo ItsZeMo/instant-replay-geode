@@ -38,6 +38,36 @@ jobs:
           name: instant-replay-macos
           path: ${{ steps.build.outputs.build-output }}
 
+  build-ios:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: geode-sdk/build-geode-mod@main
+        id: build
+        with:
+          sdk: given
+          cli: v3.9.0
+          target: iOS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: instant-replay-ios
+          path: ${{ steps.build.outputs.build-output }}
+
+  ios-sim-harness:
+    # Real iOS capture + encoder code on an iOS Simulator (no Geometry Dash needed), see tests/ios.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and run the iOS Simulator capture harness
+        run: ./tests/ios/run_capture_harness.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ios-sim-harness
+          path: |
+            build-ios-sim/harness.log
+            build-ios-sim/videos
+
   host-tests-mac:
     runs-on: macos-latest
     steps:

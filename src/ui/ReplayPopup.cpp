@@ -1,8 +1,9 @@
 #include "ReplayPopup.hpp"
 
-#if defined(GEODE_IS_WINDOWS) || defined(GEODE_IS_MACOS)
+#if defined(GEODE_IS_WINDOWS) || defined(GEODE_IS_MACOS) || defined(GEODE_IS_IOS)
 
 #include "CodecGuidePopup.hpp"
+#include "PopupFit.hpp"
 #include <cocos2d.h>
 #include <Geode/loader/SettingV3.hpp>
 #include <Geode/utils/file.hpp>
@@ -238,11 +239,17 @@ std::optional<CodecType> s_codecBeforeCustom;
 
 #ifdef GEODE_IS_MACOS
 constexpr const char* kThisDevice = "this Mac";
+#elif defined(GEODE_IS_IOS)
+constexpr const char* kThisDevice = "this device";
 #else
 constexpr const char* kThisDevice = "this PC";
 #endif
 
 std::string getSaveKeybindLabel() {
+#ifdef GEODE_IS_IOS
+    // Touch devices rarely have the keyboard the keybind needs; keep the button label plain.
+    return "Save Replay";
+#endif
     if (auto mod = geode::Mod::get()) {
         if (auto sett = mod->getSetting("save-replay")) {
             if (auto kbSett = geode::cast::typeinfo_pointer_cast<KeybindSettingV3>(sett)) {
@@ -260,6 +267,11 @@ std::string getSaveKeybindLabel() {
 }
 
 } // namespace
+
+void ReplayPopup::show() {
+    Popup::show();
+    fitPopupToWindow(this);
+}
 
 ReplayPopup* ReplayPopup::create() {
     auto ret = new ReplayPopup();
@@ -598,12 +610,21 @@ void ReplayPopup::setupDashboardTab(CCNode* page, CCSize const& winSize, float c
     setBtnScale(m_toggleBtn, 0.68f);
     m_actionMenu->addChild(m_toggleBtn);
 
+#ifdef GEODE_IS_IOS
+    auto shareSpr = ButtonSprite::create("Share", "goldFont.fnt", "GJ_button_05.png", 0.75f);
+    auto shareBtn = CCMenuItemExt::createSpriteExtra(shareSpr, [](auto*) {
+        ReplayManager::get()->shareLastReplay();
+    });
+    setBtnScale(shareBtn, 0.68f);
+    m_actionMenu->addChild(shareBtn);
+#else
     auto folderSpr = ButtonSprite::create("Open Folder", "goldFont.fnt", "GJ_button_05.png", 0.75f);
     auto folderBtn = CCMenuItemExt::createSpriteExtra(folderSpr, [](auto*) {
         ReplayManager::get()->openRecordingsFolder();
     });
     setBtnScale(folderBtn, 0.68f);
     m_actionMenu->addChild(folderBtn);
+#endif
 
     m_actionMenu->alignItemsHorizontallyWithPadding(6.0f);
 
@@ -694,12 +715,22 @@ void ReplayPopup::setupDashboardTab(CCNode* page, CCSize const& winSize, float c
     folderQuickMenu->setPosition(ccp(winSize.width - 80.0f, winSize.height - 250.0f));
     page->addChild(folderQuickMenu);
 
+#ifdef GEODE_IS_IOS
+    // iOS apps can only write inside their own container: the folder is fixed and opened in the Files app.
+    auto filesSpr = ButtonSprite::create("Files", "goldFont.fnt", "GJ_button_04.png", 0.75f);
+    auto filesBtn = CCMenuItemExt::createSpriteExtra(filesSpr, [](auto*) {
+        ReplayManager::get()->openRecordingsFolder();
+    });
+    setBtnScale(filesBtn, 0.62f);
+    folderQuickMenu->addChild(filesBtn);
+#else
     auto browseSpr = ButtonSprite::create("Browse", "goldFont.fnt", "GJ_button_04.png", 0.75f);
     m_quickBrowseBtn = CCMenuItemExt::createSpriteExtra(browseSpr, [this](auto*) {
         this->onBrowseFolder();
     });
     setBtnScale(m_quickBrowseBtn, 0.62f);
     folderQuickMenu->addChild(m_quickBrowseBtn);
+#endif
 }
 
 void ReplayPopup::setupCodecTab(CCNode* page, CCSize const& winSize, float centerX) {
@@ -742,7 +773,12 @@ void ReplayPopup::setupCodecTab(CCNode* page, CCSize const& winSize, float cente
     m_hwMenu->setPosition(CCPointZero);
     page->addChild(m_hwMenu);
 
+#ifdef GEODE_IS_IOS
+    std::string accelText = "Hardware Encoder (" + ReplayConfig::getGpuAccelName() + ", always on for " +
+                            iosDeviceKindName() + ")";
+#else
     std::string accelText = "Hardware Acceleration (Auto GPU: " + ReplayConfig::getGpuAccelName() + ")";
+#endif
     // Note: CCMenuItemToggler::activate() flips the visual state AFTER invoking this callback.
     m_hwAccelToggle = addLabeledToggler(
         page, m_hwMenu, ccp(35.0f, winSize.height - 105.0f), 0.65f,
@@ -752,6 +788,11 @@ void ReplayPopup::setupCodecTab(CCNode* page, CCSize const& winSize, float cente
             bool curHw = ReplayConfig::get().hardwareAcceleration.load();
             if (this->guardLocked()) {
                 toggler->toggle(!curHw);
+                return;
+            }
+            if (ReplayConfig::kHardwareEncodingOnly) {
+                toggler->toggle(!curHw);
+                Notification::create("Only hardware encoding is available on this device", NotificationIcon::Info, 1.5f)->show();
                 return;
             }
             auto& cfg = ReplayConfig::get();
@@ -788,7 +829,7 @@ void ReplayPopup::setupCodecTab(CCNode* page, CCSize const& winSize, float cente
     customCodecTitle->setPosition(ccp(20.0f, winSize.height - 135.0f));
     page->addChild(customCodecTitle);
 
-#ifdef GEODE_IS_MACOS
+#if defined(GEODE_IS_MACOS) || defined(GEODE_IS_IOS)
     m_customCodecInput = TextInput::create(150.0f, "e.g. hevc_vt", "chatFont.fnt");
 #else
     m_customCodecInput = TextInput::create(150.0f, "e.g. av1_nvenc", "chatFont.fnt");
@@ -1068,6 +1109,8 @@ void ReplayPopup::setupAudioStorageTab(CCNode* page, CCSize const& winSize, floa
         ReplayConfig::get().recordMic.load(),
 #ifdef GEODE_IS_MACOS
         "Record Microphone Audio (CoreAudio)", 0.50f, 24.0f, &m_micRecordLabel,
+#elif defined(GEODE_IS_IOS)
+        "Record Microphone Audio (iOS mic)", 0.50f, 24.0f, &m_micRecordLabel,
 #else
         "Record Microphone Audio (WASAPI)", 0.50f, 24.0f, &m_micRecordLabel,
 #endif
@@ -1161,6 +1204,41 @@ void ReplayPopup::setupAudioStorageTab(CCNode* page, CCSize const& winSize, floa
     );
 
     // Save Location Section
+#ifdef GEODE_IS_IOS
+    auto storageTitle = CCLabelBMFont::create("Replays Folder (Files app):", "goldFont.fnt");
+    storageTitle->setScale(0.50f);
+    storageTitle->setAnchorPoint(ccp(0.0f, 0.5f));
+    storageTitle->setPosition(ccp(20.0f, winSize.height - 198.0f));
+    page->addChild(storageTitle);
+
+    auto iosFolderHint = CCLabelBMFont::create(
+        "Files > On My iPhone/iPad > (your Geode launcher) > ... > Documents > Instant Replay", "chatFont.fnt");
+    iosFolderHint->setScale(0.40f);
+    iosFolderHint->setColor(ccc3(180, 225, 255));
+    iosFolderHint->setPosition(ccp(centerX, winSize.height - 222.0f));
+    page->addChild(iosFolderHint);
+
+    auto storageActionMenu = CCMenu::create();
+    storageActionMenu->setPosition(ccp(centerX, winSize.height - 258.0f));
+    page->addChild(storageActionMenu);
+
+    auto openSpr = ButtonSprite::create("Open in Files", "goldFont.fnt", "GJ_button_05.png", 0.75f);
+    auto openBtn = CCMenuItemExt::createSpriteExtra(openSpr, [](auto*) {
+        ReplayManager::get()->openRecordingsFolder();
+    });
+    setBtnScale(openBtn, 0.65f);
+    storageActionMenu->addChild(openBtn);
+
+    auto shareSpr = ButtonSprite::create("Share Last Replay", "goldFont.fnt", "GJ_button_01.png", 0.75f);
+    auto shareBtn = CCMenuItemExt::createSpriteExtra(shareSpr, [](auto*) {
+        ReplayManager::get()->shareLastReplay();
+    });
+    setBtnScale(shareBtn, 0.65f);
+    storageActionMenu->addChild(shareBtn);
+
+    storageActionMenu->alignItemsHorizontallyWithPadding(8.0f);
+}
+#else
     auto storageTitle = CCLabelBMFont::create("Replays Folder Path:", "goldFont.fnt");
     storageTitle->setScale(0.50f);
     storageTitle->setAnchorPoint(ccp(0.0f, 0.5f));
@@ -1212,6 +1290,7 @@ void ReplayPopup::setupAudioStorageTab(CCNode* page, CCSize const& winSize, floa
 
     storageActionMenu->alignItemsHorizontallyWithPadding(8.0f);
 }
+#endif // GEODE_IS_IOS
 
 void ReplayPopup::switchTab(int tabIndex) {
     m_activeTab = std::clamp(tabIndex, 0, 3);
@@ -1357,9 +1436,13 @@ void ReplayPopup::updateStatusDisplay(float dt) {
                 if (micSt == MicCaptureStatus::PermissionDenied) {
                     m_statusLabel->setString("Replay Active (Mic Permission Denied)");
                 } else if (micSt == MicCaptureStatus::BlockedNoUsageDescription) {
+#ifdef GEODE_IS_IOS
+                    m_statusLabel->setString("Replay Active (Mic Unavailable in Launcher)");
+#else
                     m_statusLabel->setString("Replay Active (Mic Blocked - Use Steam)");
+#endif
                 } else if (micSt == MicCaptureStatus::DigitalSilenceDetected) {
-#ifdef GEODE_IS_MACOS
+#if defined(GEODE_IS_MACOS) || defined(GEODE_IS_IOS)
                     // macOS reports this only with mic access granted, so the input is muted or silent (K1).
                     m_statusLabel->setString("Replay Active (Mic Silent - Muted?)");
 #else
@@ -1673,4 +1756,4 @@ void ReplayPopup::refreshMicDeviceButton() {
 
 } // namespace replay
 
-#endif // GEODE_IS_WINDOWS || GEODE_IS_MACOS
+#endif // GEODE_IS_WINDOWS || GEODE_IS_MACOS || GEODE_IS_IOS

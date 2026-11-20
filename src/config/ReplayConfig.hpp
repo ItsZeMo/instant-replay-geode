@@ -2,7 +2,7 @@
 
 #include <Geode/Geode.hpp>
 
-#if defined(GEODE_IS_WINDOWS) || defined(GEODE_IS_MACOS)
+#if defined(GEODE_IS_WINDOWS) || defined(GEODE_IS_MACOS) || defined(GEODE_IS_IOS)
 
 #include "BitrateMath.hpp"
 #include "CodecUtils.hpp"
@@ -16,6 +16,11 @@
 #include "../platform/MacPlatformUtils.hpp"
 #include "../platform/MacVideoCapabilities.hpp"
 #include <OpenGL/gl.h>
+#include <cstdlib>
+#include <unistd.h>
+#elif defined(GEODE_IS_IOS)
+#include "../platform/IOSPlatformUtils.hpp"
+#include "../platform/MacVideoCapabilities.hpp"
 #include <cstdlib>
 #include <unistd.h>
 #endif
@@ -144,12 +149,16 @@ struct ReplayConfig {
     // Resolves physical OpenGL drawable dimensions across Windows and macOS Retina (backing pixels).
     // On macOS, delegates strictly to getMacOpenGLDrawableSize() (NSView on AppKit main or active
     // GL_VIEWPORT on the render thread) and returns false rather than falling back to point-scaled
-    // CCEGLView::getFrameSize() (N7). Must ONLY be called on the main / GL render thread (#18, M4).
+    // CCEGLView::getFrameSize() (N7). On iOS it reads the EAGLView's renderbuffer size (points x scale).
+    // Must ONLY be called on the main / GL render thread (#18, M4).
     static bool getNativeFramebufferSize(int& outW, int& outH) noexcept {
         outW = 0;
         outH = 0;
 #ifdef GEODE_IS_MACOS
         getMacOpenGLDrawableSize(outW, outH);
+        return outW >= 16 && outH >= 16;
+#elif defined(GEODE_IS_IOS)
+        getIOSGLDrawableSize(outW, outH);
         return outW >= 16 && outH >= 16;
 #else
         if (auto view = cocos2d::CCEGLView::get()) {
@@ -363,7 +372,7 @@ struct ReplayConfig {
 
     // Cached GPU / hardware encoder backend string (populated on the main/GL thread).
     static const std::string& getGpuAccelName() {
-#ifdef GEODE_IS_MACOS
+#if defined(GEODE_IS_MACOS) || defined(GEODE_IS_IOS)
         static const std::string kMacBackend = "VideoToolbox";
         return kMacBackend;
 #else
@@ -505,7 +514,7 @@ struct ReplayConfig {
     }
 
     static bool isCodecFamilySupported(VideoCodecFamily family, bool hardware) noexcept {
-#ifdef GEODE_IS_MACOS
+#if defined(GEODE_IS_MACOS) || defined(GEODE_IS_IOS)
         return getMacVideoEncoderCaps().supports(family, hardware);
 #else
         // Until the background MFTEnumEx probe finishes, assume support: the encoder
@@ -543,9 +552,21 @@ struct ReplayConfig {
         return (res == ResolutionType::UHD_4K && fps >= 240);
     }
 
+    // iPhone and iPad only have hardware video encoders.
+    static constexpr bool kHardwareEncodingOnly =
+#ifdef GEODE_IS_IOS
+        true;
+#else
+        false;
+#endif
+
     bool sanitizeCodecSettings() noexcept {
         bool changed = false;
-#ifdef GEODE_IS_MACOS
+        if (kHardwareEncodingOnly && !hardwareAcceleration.load()) {
+            hardwareAcceleration = true;
+            changed = true;
+        }
+#if defined(GEODE_IS_MACOS) || defined(GEODE_IS_IOS)
         const bool hw = hardwareAcceleration.load();
         if (codec.load() != CodecType::CUSTOM && !isPresetCodecSupported(codec.load(), hw)) {
             codec = bestSupportedCodec(hw);
@@ -615,6 +636,7 @@ struct ReplayConfig {
             s_isSavingSettings.store(true);
             setClampedSetting<geode::IntSettingV3>(mod, "fps", static_cast<int64_t>(targetFps.load()));
             (void)mod->setSettingValue("codec", std::string(codecToString(codec.load())));
+            (void)mod->setSettingValue("hardware-accel", hardwareAcceleration.load());
             s_isSavingSettings.store(false);
         }
     }
@@ -737,7 +759,7 @@ struct ReplayConfig {
                 return {clamped.width, clamped.height};
             }
         }
-#ifdef GEODE_IS_MACOS
+#if defined(GEODE_IS_MACOS) || defined(GEODE_IS_IOS)
         if (w > kH264MaxWidth || h > kH264MaxHeight) {
             if (!isMacVideoEncodeSizeSupported(spec.family, spec.hardware, w, h)) {
                 VideoDimensions clamped4k = clampDimensionsToBounds(w, h, 3840, 2160);
@@ -891,7 +913,9 @@ struct ReplayConfig {
 private:
     static const std::filesystem::path& cachedDefaultVideosDir() {
         static const std::filesystem::path s_videosDir = []() -> std::filesystem::path {
-#ifdef GEODE_IS_WINDOWS
+#if defined(GEODE_IS_IOS)
+            return getIOSDefaultVideosDirectory();
+#elif defined(GEODE_IS_WINDOWS)
             PWSTR pszVideos = nullptr;
             HRESULT hr = SHGetKnownFolderPath(FOLDERID_Videos, 0, nullptr, &pszVideos);
             std::filesystem::path result;
@@ -911,7 +935,9 @@ private:
 
     static const std::filesystem::path& cachedDefaultTempDir() {
         static const std::filesystem::path s_tempDir = []() -> std::filesystem::path {
-#ifdef GEODE_IS_WINDOWS
+#if defined(GEODE_IS_IOS)
+            return getIOSDefaultTempDirectory();
+#elif defined(GEODE_IS_WINDOWS)
             wchar_t tempBuf[MAX_PATH + 1] = {};
             DWORD len = GetTempPathW(MAX_PATH, tempBuf);
             if (len > 0 && len <= MAX_PATH) {
@@ -1008,4 +1034,4 @@ private:
 
 } // namespace replay
 
-#endif // GEODE_IS_WINDOWS || GEODE_IS_MACOS
+#endif // GEODE_IS_WINDOWS || GEODE_IS_MACOS || GEODE_IS_IOS

@@ -1,6 +1,16 @@
 # Changelog
 
 ## Unreleased
+- **iOS / iPadOS port (Geometry Dash 2.2081, Geode 5.11.2, iOS 14+):**
+  - New iOS build (`"ios": "2.2081"` in `mod.json`, iOS branch in `CMakeLists.txt`, `build-ios` CI job).
+  - Capture at `-[EAGLContext presentRenderbuffer:]` (ObjC swizzle, works in Geode's JIT-less mode). The frame is copied and scaled/flipped on the GPU straight into IOSurface `CVPixelBuffer`s through `CVOpenGLESTextureCache` and reaches the encoder after a GPU fence; GD's GL state is restored exactly. A `glReadPixels` fallback covers devices (and the Simulator) where the texture cache cannot map the buffers.
+  - The VideoToolbox encoder and capability probing build for iOS: hardware media engine only, 8-bit HEVC Main, encoder-spec keys only where iOS has them, and encoder settings an encoder rejects (peak bitrate cap, profile) are dropped instead of switching codecs. `codec` defaults to `hevc` on iOS (no AV1 encode on Apple chips).
+  - Recording pauses when the app leaves the foreground: the segment is closed in time (the hardware encoder is unavailable in the background), the replay buffer is kept and recording resumes in a new segment. Saving keeps running briefly in the background.
+  - iOS microphone through `AVAudioSession` + `AudioQueue`, only when the launcher app declares microphone access (iOS kills apps that use the mic without it); the previous audio-session category is restored when it stops.
+  - Touch UI: Save Replay buttons in the pause menu and on the level-complete screen, replays in `Documents/Instant Replay` (Files app), Share buttons (AirDrop / Files / messengers) in the save notification and the dashboard, iOS wording in the dashboard and codec guide; smaller frame-memory budgets on iOS.
+  - Build fix for iOS: the 2.2081 bindings' FMOD C-API thunks are compiled with `fmod.h` force-included into `GeodeBindings`.
+  - The dashboard and codec guide scale down on windows narrower than them (4:3 iPads, 5:4 / 4:3 monitors) instead of being cut off.
+  - New iOS Simulator harness (`tests/ios/run_capture_harness.sh`, `ios-sim-harness` CI job) that runs the real iOS capture + encoder code and checks orientation, colours, letterboxing, motion, A/V sync and GL state restoration.
 - **macOS review fixes (K1-K9):**
   - The microphone keeps recording through digital silence. Three silent seconds at the start (a muted USB mic, a virtual input, a Bluetooth headset switching profiles) now only show a status instead of stopping capture until the game restarts, and real audio clears it. Only an explicit macOS privacy denial stops the mic; its hint points to System Settings > Privacy & Security > Microphone for Steam (or your launcher). Launched outside Steam, a silent mic still shows the "start GD through Steam" hint.
   - macOS replays are written to `replay_*.mp4.part` and renamed when finished, and saving shows its progress in the menu, the log and on repeated F6, like on Windows.

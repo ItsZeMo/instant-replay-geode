@@ -2,7 +2,7 @@
 
 #include <Geode/Geode.hpp>
 
-#if defined(GEODE_IS_WINDOWS) || defined(GEODE_IS_MACOS)
+#if defined(GEODE_IS_WINDOWS) || defined(GEODE_IS_MACOS) || defined(GEODE_IS_IOS)
 
 #include "GameAudioRing.hpp"
 #include "MicStatusPolicy.hpp"
@@ -194,4 +194,4 @@ private:
 
 } // namespace replay
 
-#endif // GEODE_IS_WINDOWS || GEODE_IS_MACOS
+#endif // GEODE_IS_WINDOWS || GEODE_IS_MACOS || GEODE_IS_IOS

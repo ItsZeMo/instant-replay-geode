@@ -1,9 +1,10 @@
 #include "CodecGuidePopup.hpp"
 
-#if defined(GEODE_IS_WINDOWS) || defined(GEODE_IS_MACOS)
+#if defined(GEODE_IS_WINDOWS) || defined(GEODE_IS_MACOS) || defined(GEODE_IS_IOS)
 
+#include "PopupFit.hpp"
 #include <cocos2d.h>
-#ifdef GEODE_IS_MACOS
+#if defined(GEODE_IS_MACOS) || defined(GEODE_IS_IOS)
 #include "../platform/MacVideoCapabilities.hpp"
 #endif
 
@@ -11,6 +12,11 @@ using namespace cocos2d;
 using namespace geode::prelude;
 
 namespace replay {
+
+void CodecGuidePopup::show() {
+    Popup::show();
+    fitPopupToWindow(this);
+}
 
 CodecGuidePopup* CodecGuidePopup::create() {
     auto ret = new CodecGuidePopup();
@@ -41,7 +47,11 @@ void CodecGuidePopup::setup() {
     float centerX = winSize.width / 2.0f;
     float startY = winSize.height - 48.0f;
 
+#ifdef GEODE_IS_IOS
+    auto subTitle = CCLabelBMFont::create("Recommended video codec settings for your iPhone / iPad:", "chatFont.fnt");
+#else
     auto subTitle = CCLabelBMFont::create("Recommended video codec settings for your graphics card:", "chatFont.fnt");
+#endif
     subTitle->setScale(0.48f);
     subTitle->setColor(ccc3(120, 220, 255));
     subTitle->setPosition(ccp(centerX, startY));
@@ -76,10 +86,37 @@ void CodecGuidePopup::setup() {
     const char* av1Desc2 = vtCaps.av1Hardware
         ? "- Cleanest compression with lowest file sizes."
         : "- Automatically routed to HEVC (or H.264) on this Mac.";
+#elif defined(GEODE_IS_IOS)
+    const auto& vtCaps = getMacVideoEncoderCaps();
+    const char* hevcTitle = vtCaps.hevcHardware
+        ? "HEVC / H.265 (Hardware Supported - Recommended):"
+        : "HEVC / H.265 (Not Available on this Device):";
+    const char* hevcDesc1 = vtCaps.hevcHardware
+        ? "- Apple media engine (A10 and newer) via VideoToolbox."
+        : "- This chip has no HEVC encoder; H.264 is used instead.";
 #endif
 
     GuideEntry entries[] = {
-#ifdef GEODE_IS_MACOS
+#ifdef GEODE_IS_IOS
+        {
+            hevcTitle,
+            ccc3(255, 215, 80),
+            hevcDesc1,
+            "- About half the size of H.264 at the same quality; less heat."
+        },
+        {
+            "H.264 (Maximum Compatibility):",
+            ccc3(255, 140, 100),
+            "- Plays everywhere: Discord, browsers, older editors and phones.",
+            "- Larger files; prefer 1080p / 60 FPS on older iPhones."
+        },
+        {
+            "AV1 (Not Available on iPhone / iPad):",
+            ccc3(255, 130, 130),
+            "- Apple chips decode AV1 but cannot encode it.",
+            "- Selecting AV1 records HEVC (or H.264) automatically."
+        }
+#elif defined(GEODE_IS_MACOS)
         {
             hevcTitle,
             ccc3(255, 215, 80),
@@ -161,4 +198,4 @@ void CodecGuidePopup::setup() {
 
 } // namespace replay
 
-#endif // GEODE_IS_WINDOWS || GEODE_IS_MACOS
+#endif // GEODE_IS_WINDOWS || GEODE_IS_MACOS || GEODE_IS_IOS

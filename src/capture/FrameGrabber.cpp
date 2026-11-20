@@ -4,13 +4,16 @@
 
 #include "FrameGrabber.hpp"
 #include "FrameBudget.hpp"
+#include "AspectFit.hpp"
 
-#if defined(GEODE_IS_WINDOWS) || defined(GEODE_IS_MACOS)
+#if defined(GEODE_IS_WINDOWS) || defined(GEODE_IS_MACOS) || defined(GEODE_IS_IOS)
 
 #include "../config/ReplayConfig.hpp"
 #include "../recorder/ReplayManager.hpp"
 #include "../encoder/PlatformEncoder.hpp"
-#ifdef GEODE_IS_MACOS
+#ifdef GEODE_IS_IOS
+#include <CoreFoundation/CoreFoundation.h>
+#elif defined(GEODE_IS_MACOS)
 #include "../platform/MacPlatformUtils.hpp"
 #pragma push_macro("CommentType")
 #undef CommentType
@@ -35,10 +38,16 @@ namespace replay {
 static constexpr size_t kMaxPooledFrames = 6;
 static constexpr size_t kMinPooledFrames = 4;
 static constexpr size_t kBasePooledBytes = 50ull * 1024 * 1024;
+#ifdef GEODE_IS_IOS
+// Tighter idle-pool ceiling under iOS memory limits (a native iPhone frame is ~12 MB, iPad Pro ~22 MB).
+static constexpr size_t kHardMaxPooledBytes = 96ull * 1024 * 1024;
+#else
 static constexpr size_t kHardMaxPooledBytes = 256ull * 1024 * 1024;
+#endif
 
 namespace {
 
+#if defined(GEODE_IS_WINDOWS) || defined(GEODE_IS_MACOS)
 inline bool hasGlPboSupport() noexcept {
 #ifdef GEODE_IS_WINDOWS
     return glGenBuffers && glBindBuffer && glBufferData && glMapBuffer && glUnmapBuffer;
@@ -64,16 +73,25 @@ inline bool hasGlFramebufferBind() noexcept {
     return true;
 #endif
 }
+#endif // GEODE_IS_WINDOWS || GEODE_IS_MACOS
 
-#ifdef GEODE_IS_MACOS
+#if defined(GEODE_IS_MACOS) || defined(GEODE_IS_IOS)
 bool allocateIOSurfacePixelBuffer(int width, int height, CVPixelBufferRef* outPb) noexcept {
     if (!outPb || width <= 0 || height <= 0) return false;
     CFMutableDictionaryRef emptyDict = CFDictionaryCreateMutable(
         kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
     CFMutableDictionaryRef attrs = CFDictionaryCreateMutable(
-        kCFAllocatorDefault, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+        kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
     if (emptyDict && attrs) {
         CFDictionarySetValue(attrs, kCVPixelBufferIOSurfacePropertiesKey, emptyDict);
+#ifdef GEODE_IS_IOS
+        // iOS renders the scaled frame straight into this buffer through CVOpenGLESTextureCache, so the
+        // IOSurface must be usable as an OpenGL ES texture and as an FBO colour attachment.
+        CFDictionarySetValue(attrs, kCVPixelBufferOpenGLESCompatibilityKey, kCFBooleanTrue);
+        CFDictionarySetValue(attrs, kCVPixelBufferOpenGLESTextureCacheCompatibilityKey, kCFBooleanTrue);
+        CFDictionarySetValue(attrs, kCVPixelBufferIOSurfaceOpenGLESTextureCompatibilityKey, kCFBooleanTrue);
+        CFDictionarySetValue(attrs, kCVPixelBufferIOSurfaceOpenGLESFBOCompatibilityKey, kCFBooleanTrue);
+#endif
     }
     CVReturn ret = CVPixelBufferCreate(
         kCFAllocatorDefault,
@@ -110,7 +128,7 @@ bool FrameGrabber::isMediaBufferUnique(IMFMediaBuffer* buf) noexcept {
 bool FrameGrabber::isFrameBufferUnique(const CapturedFrame& frame) noexcept {
 #ifdef GEODE_IS_WINDOWS
     return isMediaBufferUnique(frame.buffer.get());
-#elif defined(GEODE_IS_MACOS)
+#elif defined(GEODE_IS_MACOS) || defined(GEODE_IS_IOS)
     return frame.pixelBuffer && CFGetRetainCount(frame.pixelBuffer.get()) <= 1;
 #else
     return false;
@@ -143,6 +161,7 @@ void FrameGrabber::resetRenderThreadState() noexcept {
     m_lastAllocLogTime = {};
 }
 
+#if defined(GEODE_IS_WINDOWS) || defined(GEODE_IS_MACOS)
 void FrameGrabber::initialize() {
     if (m_initialized) return;
 
@@ -168,6 +187,7 @@ void FrameGrabber::initialize() {
     resetRenderThreadState();
     m_initialized = true;
 }
+#endif // GEODE_IS_WINDOWS || GEODE_IS_MACOS
 
 void FrameGrabber::clearPool() {
     std::lock_guard<std::mutex> lock(m_poolMutex);
@@ -195,6 +215,7 @@ void FrameGrabber::setCapturing(bool active) {
     }
 }
 
+#if defined(GEODE_IS_WINDOWS) || defined(GEODE_IS_MACOS)
 void FrameGrabber::resetGlResources(bool glContextValid) noexcept {
     bool canDeleteGl = glContextValid && m_initialized;
 #ifdef GEODE_IS_WINDOWS
@@ -238,6 +259,7 @@ void FrameGrabber::resetGlResources(bool glContextValid) noexcept {
     resetRenderThreadState();
     m_initialized = false;
 }
+#endif // GEODE_IS_WINDOWS || GEODE_IS_MACOS
 
 void FrameGrabber::cleanup(bool glContextValid) {
     m_capturing.store(false, std::memory_order_release);
@@ -292,7 +314,7 @@ std::shared_ptr<CapturedFrame> FrameGrabber::acquireFrame(int width, int height,
         if (FAILED(MFCreateMemoryBuffer(static_cast<DWORD>(requiredBytes), frame->buffer.put())) || !frame->buffer) {
             return nullptr;
         }
-#elif defined(GEODE_IS_MACOS)
+#elif defined(GEODE_IS_MACOS) || defined(GEODE_IS_IOS)
         if (!allocateIOSurfacePixelBuffer(width, height, frame->pixelBuffer.put())) {
             return nullptr;
         }
@@ -341,6 +363,80 @@ void FrameGrabber::recycleFrame(std::shared_ptr<CapturedFrame> frame) {
     }
 }
 
+bool FrameGrabber::admitSwapForCapture(std::chrono::steady_clock::time_point now, int targetFps) {
+    // Track actual swap interval EMA so 1:1 VSync capture (e.g. 120 Hz -> 120 FPS, 240 Hz -> 240 FPS)
+    // never drops frames when an earlier swap had a large jitter spike (#5).
+    if (m_lastSwapTime != std::chrono::steady_clock::time_point{}) {
+        double swapNs = static_cast<double>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(now - m_lastSwapTime).count());
+        if (swapNs > 0.0 && swapNs < 250000000.0) {
+            m_avgSwapIntervalNs = (m_avgSwapIntervalNs <= 0.0)
+                ? swapNs
+                : (m_avgSwapIntervalNs * 0.85 + swapNs * 0.15);
+        }
+    }
+    m_lastSwapTime = now;
+
+    targetFps = std::max(1, targetFps);
+    auto interval = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<double>(1.0 / static_cast<double>(targetFps))
+    );
+    double intervalNs = 1e9 / static_cast<double>(targetFps);
+    // 3/8 interval tolerance gives wide jitter immunity while staying clear of the 1/2 sub-harmonic
+    auto tolerance = (interval * 3) / 8;
+
+    if (m_lastTargetFps != targetFps || m_nextCaptureTime == std::chrono::steady_clock::time_point{}) {
+        m_lastTargetFps = targetFps;
+        m_nextCaptureTime = now;
+    }
+
+    if (now + tolerance < m_nextCaptureTime) {
+        bool isOneToOneOrSlower = (m_avgSwapIntervalNs >= intervalNs * 0.92) &&
+                                  (m_lastCapturedTime == std::chrono::steady_clock::time_point{} ||
+                                   (now - m_lastCapturedTime) >= (interval / 2));
+        if (!isOneToOneOrSlower) {
+            return false;
+        }
+        // Re-center phase onto real VSync cadence after an unusually late initial/prior frame
+        m_nextCaptureTime = now;
+    }
+
+    m_lastCapturedTime = now;
+    m_nextCaptureTime += interval;
+    // Allow up to 2 intervals of temporary render lag so catch-up frames are still captured;
+    // never snap forward to `now + interval` on jitter (#5).
+    if (m_nextCaptureTime + 2 * interval <= now) {
+        m_nextCaptureTime = now;
+    }
+    return true;
+}
+
+void FrameGrabber::resolveSessionTargetSize(const ReplayConfig& config, int srcW, int srcH, int& dstW, int& dstH) {
+    dstW = m_sessionTargetW.load(std::memory_order_acquire);
+    dstH = m_sessionTargetH.load(std::memory_order_acquire);
+    if (dstW > 0 && dstH > 0) return;
+
+    bool clamped = false;
+    bool clampedOversizeMac = false;
+    auto [w, h] = config.getSessionResolutionDimensions(srcW, srcH, &clamped, &clampedOversizeMac);
+    dstW = w;
+    dstH = h;
+    m_sessionTargetW.store(dstW, std::memory_order_release);
+    m_sessionTargetH.store(dstH, std::memory_order_release);
+    if (clamped) {
+        if (clampedOversizeMac) {
+            geode::log::info(
+                "FrameGrabber: clamped oversized native output from {}x{} to {}x{} (VideoToolbox max 4K fallback)",
+                srcW, srcH, dstW, dstH);
+        } else {
+            geode::log::info(
+                "FrameGrabber: clamped H.264 output size from {}x{} to {}x{} (max {}x{})",
+                srcW, srcH, dstW, dstH, kH264MaxWidth, kH264MaxHeight);
+        }
+    }
+}
+
+#if defined(GEODE_IS_WINDOWS) || defined(GEODE_IS_MACOS)
 bool FrameGrabber::ensureScaleTarget(int width, int height, std::chrono::steady_clock::time_point now) {
     if (m_fbo && m_fboWidth == width && m_fboHeight == height) return true;
     if (width == m_failedBlitW && height == m_failedBlitH && now < m_blitRetryAfter) {
@@ -393,40 +489,6 @@ void FrameGrabber::ensurePbo(int index, size_t bytes) {
     glBindBuffer(GL_PIXEL_PACK_BUFFER, m_pbos[index]);
     glBufferData(GL_PIXEL_PACK_BUFFER, static_cast<GLsizeiptr>(bytes), nullptr, GL_STREAM_READ);
     m_pboCapacity[index] = bytes;
-}
-
-struct DestRect {
-    int x0 = 0;
-    int y0 = 0;
-    int x1 = 0;
-    int y1 = 0;
-    bool hasBars = false;
-};
-
-static DestRect computeAspectFitRect(int srcW, int srcH, int dstW, int dstH) noexcept {
-    if (srcW <= 0 || srcH <= 0 || dstW <= 0 || dstH <= 0) {
-        return {0, 0, dstW, dstH, false};
-    }
-    int64_t lhs = static_cast<int64_t>(srcW) * dstH;
-    int64_t rhs = static_cast<int64_t>(dstW) * srcH;
-    int64_t diff = (lhs >= rhs) ? (lhs - rhs) : (rhs - lhs);
-    if (diff <= std::max<int64_t>(srcH, dstH)) {
-        return {0, 0, dstW, dstH, false};
-    }
-
-    int fitW = dstW;
-    int fitH = dstH;
-    if (lhs > rhs) {
-        fitH = std::max(1, static_cast<int>((static_cast<int64_t>(dstW) * srcH + srcW / 2) / srcW));
-    } else {
-        fitW = std::max(1, static_cast<int>((static_cast<int64_t>(dstH) * srcW + srcH / 2) / srcH));
-    }
-    fitW = std::min(fitW, dstW);
-    fitH = std::min(fitH, dstH);
-    int x0 = (dstW - fitW) / 2;
-    int y0 = (dstH - fitH) / 2;
-    bool hasBars = (x0 > 0 || y0 > 0 || fitW < dstW || fitH < dstH);
-    return {x0, y0, x0 + fitW, y0 + fitH, hasBars};
 }
 
 static void copyBgraRows(
@@ -505,50 +567,8 @@ void FrameGrabber::captureCurrentFrame() {
     if (!ReplayManager::get()->isReplayActive()) return;
 
     auto now = std::chrono::steady_clock::now();
-
-    // Track actual swap interval EMA so 1:1 VSync capture (e.g. 120 Hz -> 120 FPS, 240 Hz -> 240 FPS)
-    // never drops frames when an earlier swap had a large jitter spike (#5).
-    if (m_lastSwapTime != std::chrono::steady_clock::time_point{}) {
-        double swapNs = static_cast<double>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(now - m_lastSwapTime).count());
-        if (swapNs > 0.0 && swapNs < 250000000.0) {
-            m_avgSwapIntervalNs = (m_avgSwapIntervalNs <= 0.0)
-                ? swapNs
-                : (m_avgSwapIntervalNs * 0.85 + swapNs * 0.15);
-        }
-    }
-    m_lastSwapTime = now;
-
-    int targetFps = std::max(1, config.targetFps.load());
-    auto interval = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-        std::chrono::duration<double>(1.0 / static_cast<double>(targetFps))
-    );
-    double intervalNs = 1e9 / static_cast<double>(targetFps);
-    // 3/8 interval tolerance gives wide jitter immunity while staying clear of the 1/2 sub-harmonic
-    auto tolerance = (interval * 3) / 8;
-
-    if (m_lastTargetFps != targetFps || m_nextCaptureTime == std::chrono::steady_clock::time_point{}) {
-        m_lastTargetFps = targetFps;
-        m_nextCaptureTime = now;
-    }
-
-    if (now + tolerance < m_nextCaptureTime) {
-        bool isOneToOneOrSlower = (m_avgSwapIntervalNs >= intervalNs * 0.92) &&
-                                  (m_lastCapturedTime == std::chrono::steady_clock::time_point{} ||
-                                   (now - m_lastCapturedTime) >= (interval / 2));
-        if (!isOneToOneOrSlower) {
-            return;
-        }
-        // Re-center phase onto real VSync cadence after an unusually late initial/prior frame
-        m_nextCaptureTime = now;
-    }
-
-    m_lastCapturedTime = now;
-    m_nextCaptureTime += interval;
-    // Allow up to 2 intervals of temporary render lag so catch-up frames are still captured;
-    // never snap forward to `now + interval` on jitter (#5).
-    if (m_nextCaptureTime + 2 * interval <= now) {
-        m_nextCaptureTime = now;
+    if (!admitSwapForCapture(now, config.targetFps.load())) {
+        return;
     }
 
 #ifdef GEODE_IS_WINDOWS
@@ -580,28 +600,8 @@ void FrameGrabber::captureCurrentFrame() {
     }
     if (srcW < 16 || srcH < 16) return;
 
-    int dstW = m_sessionTargetW.load(std::memory_order_acquire);
-    int dstH = m_sessionTargetH.load(std::memory_order_acquire);
-    if (dstW <= 0 || dstH <= 0) {
-        bool clamped = false;
-        bool clampedOversizeMac = false;
-        auto [w, h] = config.getSessionResolutionDimensions(srcW, srcH, &clamped, &clampedOversizeMac);
-        dstW = w;
-        dstH = h;
-        m_sessionTargetW.store(dstW, std::memory_order_release);
-        m_sessionTargetH.store(dstH, std::memory_order_release);
-        if (clamped) {
-            if (clampedOversizeMac) {
-                geode::log::info(
-                    "FrameGrabber: clamped oversized native output from {}x{} to {}x{} (VideoToolbox max 4K fallback)",
-                    srcW, srcH, dstW, dstH);
-            } else {
-                geode::log::info(
-                    "FrameGrabber: clamped H.264 output size from {}x{} to {}x{} (max {}x{})",
-                    srcW, srcH, dstW, dstH, kH264MaxWidth, kH264MaxHeight);
-            }
-        }
-    }
+    int dstW = 0, dstH = 0;
+    resolveSessionTargetSize(config, srcW, srcH, dstW, dstH);
 
     GLint prevRead = 0, prevDraw = 0, prevPack = 4, prevPackRowLen = 0;
     GLint prevReadBuffer = GL_BACK, prevDrawBuffer = GL_BACK;
@@ -762,7 +762,8 @@ void FrameGrabber::captureCurrentFrame() {
     glPixelStorei(GL_PACK_ROW_LENGTH, prevPackRowLen);
     glPixelStorei(GL_PACK_ALIGNMENT, prevPack);
 }
+#endif // GEODE_IS_WINDOWS || GEODE_IS_MACOS
 
 } // namespace replay
 
-#endif // GEODE_IS_WINDOWS || GEODE_IS_MACOS
+#endif // GEODE_IS_WINDOWS || GEODE_IS_MACOS || GEODE_IS_IOS

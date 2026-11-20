@@ -2,7 +2,7 @@
 
 #include <Geode/Geode.hpp>
 
-#if defined(GEODE_IS_WINDOWS) || defined(GEODE_IS_MACOS)
+#if defined(GEODE_IS_WINDOWS) || defined(GEODE_IS_MACOS) || defined(GEODE_IS_IOS)
 
 #include "../config/ReplayConfig.hpp"
 #ifdef GEODE_IS_WINDOWS
@@ -16,6 +16,8 @@
 #include <OpenGL/CGLTypes.h>
 #undef CommentType
 #pragma pop_macro("CommentType")
+#elif defined(GEODE_IS_IOS)
+#include <CoreVideo/CoreVideo.h>
 #endif
 #include <vector>
 #include <chrono>
@@ -26,7 +28,7 @@
 
 namespace replay {
 
-#ifdef GEODE_IS_MACOS
+#if defined(GEODE_IS_MACOS) || defined(GEODE_IS_IOS)
 // Lightweight RAII wrapper around CVPixelBufferRef for zero-copy VideoToolbox handoff.
 class PixelBufferRef {
 public:
@@ -72,11 +74,12 @@ private:
 #endif
 
 // Frames are tightly packed BGRA scaled to encoder output dimensions (always even).
-// Windows delivers bottom-up OpenGL row order in IMFMediaBuffer; macOS delivers top-down CVPixelBufferRef.
+// Windows delivers bottom-up OpenGL row order in IMFMediaBuffer; macOS and iOS deliver top-down
+// IOSurface-backed CVPixelBufferRef (iOS renders into it on the GPU through CVOpenGLESTextureCache).
 struct CapturedFrame {
 #ifdef GEODE_IS_WINDOWS
     ComRef<IMFMediaBuffer> buffer;
-#elif defined(GEODE_IS_MACOS)
+#elif defined(GEODE_IS_MACOS) || defined(GEODE_IS_IOS)
     PixelBufferRef pixelBuffer;
 #endif
     size_t byteSize = 0;
@@ -88,7 +91,7 @@ struct CapturedFrame {
     bool hasBuffer() const noexcept {
 #ifdef GEODE_IS_WINDOWS
         return static_cast<bool>(buffer);
-#elif defined(GEODE_IS_MACOS)
+#elif defined(GEODE_IS_MACOS) || defined(GEODE_IS_IOS)
         return static_cast<bool>(pixelBuffer);
 #else
         return false;
@@ -119,6 +122,10 @@ public:
     // Called on the OpenGL render thread right BEFORE the back buffer is swapped
     void captureCurrentFrame();
 
+    // Frames still being read back / rendered are dropped instead of delivered (e.g. across an iOS
+    // background pause, so stale timestamps never reach the encoder).
+    void discardPendingFrames() noexcept { m_captureEpoch.fetch_add(1, std::memory_order_acq_rel); }
+
     // Return a consumed frame buffer to the pool so the render thread does not allocate
     void recycleFrame(std::shared_ptr<CapturedFrame> frame);
     void clearPool();
@@ -130,11 +137,17 @@ private:
     FrameGrabber();
     ~FrameGrabber();
 
+#if defined(GEODE_IS_WINDOWS) || defined(GEODE_IS_MACOS)
     bool ensureScaleTarget(int width, int height, std::chrono::steady_clock::time_point now);
     void ensurePbo(int index, size_t bytes);
+#endif
     std::shared_ptr<CapturedFrame> acquireFrame(int width, int height, size_t requiredBytes);
     void resetRenderThreadState() noexcept;
     void resetGlResources(bool glContextValid) noexcept;
+    // Frame pacing shared by every backend: true when this buffer swap should be captured (#5).
+    bool admitSwapForCapture(std::chrono::steady_clock::time_point now, int targetFps);
+    // Locks the session output size on the first captured frame (H.264 / VideoToolbox clamps applied).
+    void resolveSessionTargetSize(const ReplayConfig& config, int srcW, int srcH, int& dstW, int& dstH);
 
     std::atomic<bool> m_capturing{false};
     std::atomic<uint64_t> m_captureEpoch{0};
@@ -149,6 +162,8 @@ private:
     HGLRC m_glContext = nullptr;
 #elif defined(GEODE_IS_MACOS)
     CGLContextObj m_glContext = nullptr;
+#elif defined(GEODE_IS_IOS)
+    void* m_glContext = nullptr; // EAGLContext*, unretained (GD keeps it alive for the whole process)
 #endif
     std::chrono::steady_clock::time_point m_blitRetryAfter{};
     int m_failedBlitW = 0;
@@ -189,9 +204,19 @@ private:
     double m_avgSwapIntervalNs = 0.0;
     int m_lastTargetFps = 0;
 
+#ifdef GEODE_IS_IOS
+    // OpenGL ES capture state (FrameGrabberIOS.mm): texture cache, copy/draw program, GPU fences of frames
+    // still being rendered into their CVPixelBuffer. Render (UIKit main) thread only, under m_glMutex.
+    // Owned raw pointer: the state type is only complete in FrameGrabberIOS.mm, which creates and frees it.
+    struct IOSGLState;
+    IOSGLState* m_ios = nullptr;
+    void iosDeliverCompletedFrames(bool waitForAll);
+    void iosReleaseGlState(bool glContextValid) noexcept;
+#endif
+
     FrameCallback m_callback;
 };
 
 } // namespace replay
 
-#endif // GEODE_IS_WINDOWS || GEODE_IS_MACOS
+#endif // GEODE_IS_WINDOWS || GEODE_IS_MACOS || GEODE_IS_IOS

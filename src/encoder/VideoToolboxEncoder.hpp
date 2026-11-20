@@ -2,7 +2,7 @@
 
 #include <Geode/Geode.hpp>
 
-#ifdef GEODE_IS_MACOS
+#if defined(GEODE_IS_MACOS) || defined(GEODE_IS_IOS)
 
 #include "../config/BitrateMath.hpp"
 #include "../config/CodecUtils.hpp"
@@ -145,4 +145,4 @@ private:
 
 } // namespace replay
 
-#endif // GEODE_IS_MACOS
+#endif // GEODE_IS_MACOS || GEODE_IS_IOS

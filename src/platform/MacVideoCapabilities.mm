@@ -1,6 +1,6 @@
 #include "MacVideoCapabilities.hpp"
 
-#if defined(__APPLE__) && !TARGET_OS_IPHONE
+#if defined(__APPLE__)
 
 #pragma push_macro("CommentType")
 #undef CommentType
@@ -23,6 +23,23 @@ namespace replay {
 namespace {
 
 constexpr CMVideoCodecType kMacCodecTypeAV1 = 'av01';
+
+// Mirrors VideoToolboxEncoder's encoder specification: iOS < 17.4 has no hardware/software keys and only
+// hardware encoders, so it uses the default specification for hardware and reports software as missing.
+NSDictionary* encoderSpecificationFor(bool hardware) {
+#if TARGET_OS_IPHONE
+    if (@available(iOS 17.4, *)) {
+        return hardware
+            ? @{ (__bridge NSString*)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @YES }
+            : @{ (__bridge NSString*)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @NO };
+    }
+    return hardware ? @{} : nil;
+#else
+    return hardware
+        ? @{ (__bridge NSString*)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @YES }
+        : @{ (__bridge NSString*)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @NO };
+#endif
+}
 
 // Mirrors VideoToolboxEncoder::tryStartLocked output settings to verify whether AVAssetWriter
 // actually accepts software encoding for the given codec (e.g. VTCopyVideoEncoderList lists
@@ -58,22 +75,30 @@ bool probeAssetWriterVideoSettings(VideoCodecFamily family, bool hardware, int w
             compProps[AVVideoAverageBitRateKey] = @8000000;
             compProps[(__bridge NSString*)kVTCompressionPropertyKey_DataRateLimits] = @[@1000000, @(1.0)];
 
-            NSDictionary* encoderSpec = hardware
-                ? @{ (__bridge NSString*)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @YES }
-                : @{ (__bridge NSString*)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @NO };
+            NSDictionary* encoderSpec = encoderSpecificationFor(hardware);
+            if (!encoderSpec) {
+                return false;
+            }
 
-            NSDictionary* videoSettings = @{
+            NSMutableDictionary* videoSettings = [@{
                 AVVideoCodecKey: codecKey,
                 AVVideoWidthKey: @(width),
                 AVVideoHeightKey: @(height),
-                AVVideoEncoderSpecificationKey: encoderSpec,
                 AVVideoCompressionPropertiesKey: compProps,
                 AVVideoColorPropertiesKey: @{
                     AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
                     AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
                     AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2,
                 },
-            };
+            } mutableCopy];
+#if TARGET_OS_IPHONE
+            // AVAssetWriter has no encoder-specification key on iOS: it always uses the hardware encoder.
+            if (!hardware) {
+                return false;
+            }
+#else
+            videoSettings[AVVideoEncoderSpecificationKey] = encoderSpec;
+#endif
 
             return [writer canApplyOutputSettings:videoSettings forMediaType:AVMediaTypeVideo] == YES;
         } @catch (NSException*) {
@@ -110,7 +135,14 @@ MacVideoEncoderCaps probeMacVideoEncoderCaps() {
         const CMVideoCodecType codecType = static_cast<CMVideoCodecType>(codecNum.unsignedIntValue);
 
         NSNumber* hwNum = dict[(__bridge NSString*)kVTVideoEncoderList_IsHardwareAccelerated];
+#if TARGET_OS_IPHONE
+        // iOS AVAssetWriter cannot choose between encoders: it always uses the system encoder for the codec
+        // (the media engine on devices), so every listed encoder counts as the "hardware" one.
+        (void)hwNum;
+        const bool isHw = true;
+#else
         const bool isHw = ([hwNum isKindOfClass:[NSNumber class]] && hwNum.boolValue);
+#endif
 
         if (codecType == kMacCodecTypeAV1) {
             if (isHw) caps.av1Hardware = true;
@@ -182,9 +214,10 @@ bool isMacVideoEncodeSizeSupported(VideoCodecFamily family, bool hardware, int w
                 codecType = kCMVideoCodecType_HEVC;
             }
 
-            NSDictionary* encoderSpec = hardware
-                ? @{ (__bridge NSString*)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @YES }
-                : @{ (__bridge NSString*)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @NO };
+            NSDictionary* encoderSpec = encoderSpecificationFor(hardware);
+            if (!encoderSpec) {
+                return false;
+            }
 
             NSDictionary* srcAttrs = @{
                 (__bridge NSString*)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
@@ -228,4 +261,4 @@ bool isMacVideoEncodeSizeSupported(VideoCodecFamily family, bool hardware, int w
 
 } // namespace replay
 
-#endif // __APPLE__ && !TARGET_OS_IPHONE
+#endif // __APPLE__

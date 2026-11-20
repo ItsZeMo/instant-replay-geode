@@ -2,7 +2,7 @@
 
 #include <Geode/Geode.hpp>
 
-#if defined(GEODE_IS_WINDOWS) || defined(GEODE_IS_MACOS)
+#if defined(GEODE_IS_WINDOWS) || defined(GEODE_IS_MACOS) || defined(GEODE_IS_IOS)
 
 #include "../config/ReplayConfig.hpp"
 #include "../encoder/PlatformEncoder.hpp"
@@ -93,6 +93,24 @@ public:
 
     // Direct folder opener
     void openRecordingsFolder();
+
+    // App lifecycle (iOS): pauses recording while the app is inactive or in the background, where the
+    // hardware video encoder is unavailable. The current segment is closed first so the replay buffer
+    // survives; recording continues in a new segment once the app is active again. Main thread only.
+    void setAppSuspended(bool suspended);
+    bool isAppSuspended() const noexcept { return m_appSuspended.load(std::memory_order_acquire); }
+
+#ifdef GEODE_IS_IOS
+    // Opens the system share sheet for the newest replay (this launch's last save, else the newest
+    // replay_*.mp4 in the recordings folder). Main thread only.
+    void shareLastReplay();
+#endif
+
+    // Most recent replay written this launch (empty if none), e.g. for the iOS share sheet.
+    std::filesystem::path getLastSavedReplayPath() const {
+        std::lock_guard<std::mutex> lock(m_lastSavedMutex);
+        return m_lastSavedReplayPath;
+    }
 
     ActiveEncoderInfo getActiveEncoderInfo() const {
         std::lock_guard<std::mutex> lock(m_activeEncoderInfoMutex);
@@ -239,6 +257,13 @@ private:
         std::string& outFatalError
     );
     void handleFatalRecordingError(const std::string& reason);
+    // Worker thread: closes the current segment and drops capture input while the app is suspended.
+    void enterSuspendedState(
+        const ReplayConfig& cfg,
+        std::vector<float>& gameAudioScratch,
+        std::vector<float>& resampledGameAudioScratch,
+        std::vector<float>& silenceScratch
+    );
     void purgeOldSegments(const ReplayConfig& cfg);
     void ensureSessionLock(const std::filesystem::path& pidTempDir);
     void releaseSessionLock(bool removeFiles);
@@ -298,7 +323,11 @@ private:
     std::atomic<bool> m_shuttingDown{false};
     std::atomic<bool> m_backendUnavailable{false};
     std::atomic<bool> m_stoppedByError{false};
+    std::atomic<bool> m_appSuspended{false};
+    bool m_workerSuspended = false; // worker thread only
     uint64_t m_sessionId = 0; // guarded by m_queueMutex (#12, #13)
+    mutable std::mutex m_lastSavedMutex;
+    std::filesystem::path m_lastSavedReplayPath;
 
     // Asynchronous teardown thread & lifecycle state guard for non-blocking Stop/Start
     std::thread m_stopThread;
@@ -417,4 +446,4 @@ private:
 
 } // namespace replay
 
-#endif // GEODE_IS_WINDOWS || GEODE_IS_MACOS
+#endif // GEODE_IS_WINDOWS || GEODE_IS_MACOS || GEODE_IS_IOS

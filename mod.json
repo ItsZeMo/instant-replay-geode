@@ -2,7 +2,8 @@
     "geode": "5.11.2",
     "gd": {
         "win": "2.2081",
-        "mac": "2.2081"
+        "mac": "2.2081",
+        "ios": "2.2081"
     },
     "version": "v1.0.5",
     "id": "zemo.instant-replay",
@@ -47,9 +48,13 @@
         },
         "codec": {
             "name": "Video Codec",
-            "description": "Video encoding format: av1, hevc, h264, or custom",
+            "description": "Video encoding format: av1, hevc, h264, or custom (iOS records HEVC or H.264; Apple devices have no AV1 encoder)",
             "type": "string",
-            "default": "av1",
+            "default": {
+                "win": "av1",
+                "mac": "av1",
+                "ios": "hevc"
+            },
             "one-of": [
                 "av1",
                 "hevc",
@@ -59,7 +64,7 @@
         },
         "hardware-accel": {
             "name": "Hardware Acceleration (GPU)",
-            "description": "Automatically use GPU hardware encoder (NVIDIA NVENC, AMD AMF, Intel QuickSync on Windows; Apple VideoToolbox on macOS). Falls back to CPU software encoding if disabled.",
+            "description": "Automatically use GPU hardware encoder (NVIDIA NVENC, AMD AMF, Intel QuickSync on Windows; Apple VideoToolbox on macOS). Falls back to CPU software encoding if disabled. Always on for iOS (iPhone and iPad only have hardware encoders).",
             "type": "bool",
             "default": true
         },
@@ -201,7 +206,7 @@
         },
         "save-folder": {
             "name": "Save Directory Path",
-            "description": "Custom folder path to save replay MP4 videos (leave empty for default Videos/Geometry Dash on Windows or Movies/Geometry Dash on macOS)",
+            "description": "Custom folder path to save replay MP4 videos (leave empty for default Videos/Geometry Dash on Windows, Movies/Geometry Dash on macOS, or the app's Documents/Instant Replay folder in the Files app on iOS)",
             "type": "string",
             "default": ""
         },
@@ -227,7 +232,7 @@
         },
         "save-replay": {
             "name": "Save Instant Replay",
-            "description": "Save the last minutes of gameplay to an MP4 video file (F6 default)",
+            "description": "Save the last minutes of gameplay to an MP4 video file (F6 default; on iOS use the Save Replay buttons in the pause menu and level-complete screen, or a hardware keyboard)",
             "type": "keybind",
             "category": "universal",
             "default": "F6",

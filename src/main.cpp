@@ -1,11 +1,14 @@
 #include <Geode/Geode.hpp>
 
-#if defined(GEODE_IS_WINDOWS) || defined(GEODE_IS_MACOS)
+#if defined(GEODE_IS_WINDOWS) || defined(GEODE_IS_MACOS) || defined(GEODE_IS_IOS)
 
 #ifdef GEODE_IS_WINDOWS
 #include <Geode/modify/CCEGLView.hpp>
 #elif defined(GEODE_IS_MACOS)
 #include "platform/MacPlatformUtils.hpp"
+#elif defined(GEODE_IS_IOS)
+#include "platform/IOSPlatformUtils.hpp"
+#include <Geode/modify/EndLevelLayer.hpp>
 #endif
 #include <Geode/modify/FMODAudioEngine.hpp>
 #include <Geode/modify/MenuLayer.hpp>
@@ -47,6 +50,18 @@ static void triggerSaveReplay() {
     auto res = ReplayManager::get()->saveReplay();
     ReplayManager::showSaveFeedback(res);
 }
+
+#ifdef GEODE_IS_IOS
+// Touch entry point for saving: there is usually no keyboard for the F6 keybind on iPhone / iPad.
+static CCMenuItemSpriteExtra* createSaveReplayButton(CCObject* target, SEL_MenuHandler selector, float scale) {
+    auto spr = CCSprite::createWithSpriteFrameName("GJ_adVideoBtn_001.png");
+    if (!spr) return nullptr;
+    spr->setScale(scale);
+    auto btn = CCMenuItemSpriteExtra::create(spr, target, selector);
+    btn->setID("save-replay-button"_spr);
+    return btn;
+}
+#endif
 
 static void triggerToggleReplay() {
     geode::log::info("Instant Replay: Keybind triggered Toggle Replay");
@@ -96,12 +111,24 @@ $on_mod(Loaded) {
         []() { FrameGrabber::get()->captureCurrentFrame(); },
         []() { return FrameGrabber::get()->isCapturing(); }
     );
+#elif defined(GEODE_IS_IOS)
+    // On iOS, EAGLView::swapBuffers ends in -[EAGLContext presentRenderbuffer:]; swizzling it (no code patch,
+    // works JIT-less) captures the finished frame after every overlay. Installed before initialize() (M20).
+    bool macHookOk = installIOSGLCaptureHook(
+        []() { FrameGrabber::get()->captureCurrentFrame(); },
+        []() { return FrameGrabber::get()->isCapturing() && !ReplayManager::get()->isAppSuspended(); }
+    );
+    // The hardware encoder is unavailable in the background: pause on resign-active, resume when active.
+    installIOSAppLifecycleObservers(
+        []() { ReplayManager::get()->setAppSuspended(true); },
+        []() { ReplayManager::get()->setAppSuspended(false); }
+    );
 #endif
 
     const bool enabledBeforeInit = geode::Mod::get() && geode::Mod::get()->getSettingValue<bool>("enabled");
     ReplayManager::get()->initialize();
 
-#ifdef GEODE_IS_MACOS
+#if defined(GEODE_IS_MACOS) || defined(GEODE_IS_IOS)
     if (!macHookOk && !enabledBeforeInit) {
         geode::Loader::get()->queueInMainThread([]() {
             geode::Notification::create(
@@ -189,7 +216,7 @@ $on_mod(Loaded) {
                 }
 
                 if (paramChanged) {
-#ifdef GEODE_IS_MACOS
+#if defined(GEODE_IS_MACOS) || defined(GEODE_IS_IOS)
                     auto prevModCodecStr = mod->getSettingValue<std::string>("codec");
                     ReplayConfig::get().loadFromSettings();
                     if (ReplayConfig::codecFromString(prevModCodecStr) != ReplayConfig::get().codec.load()) {
@@ -225,6 +252,8 @@ $on_mod(Loaded) {
 $on_game(Exiting) {
 #ifdef GEODE_IS_MACOS
     disableMacGLCaptureHook();
+#elif defined(GEODE_IS_IOS)
+    disableIOSGLCaptureHook();
 #endif
     ReplayManager::get()->shutdown();
 }
@@ -269,12 +298,57 @@ class $modify(ReplayMenuLayer, MenuLayer) {
 class $modify(ReplayPauseLayer, PauseLayer) {
     void customSetup() {
         PauseLayer::customSetup();
-        addReplayButtonToMenu(this->getChildByID("right-button-menu"), this, menu_selector(ReplayPauseLayer::onOpenReplay));
+        auto menu = this->getChildByID("right-button-menu");
+        addReplayButtonToMenu(menu, this, menu_selector(ReplayPauseLayer::onOpenReplay));
+#ifdef GEODE_IS_IOS
+        if (menu) {
+            if (auto saveBtn = createSaveReplayButton(this, menu_selector(ReplayPauseLayer::onSaveReplay), 0.55f)) {
+                menu->addChild(saveBtn);
+                menu->updateLayout();
+            }
+        }
+#endif
     }
 
     void onOpenReplay(CCObject*) {
         ReplayPopup::toggle();
     }
+
+    void onSaveReplay(CCObject*) {
+        triggerSaveReplay();
+    }
 };
 
-#endif // GEODE_IS_WINDOWS || GEODE_IS_MACOS
+#ifdef GEODE_IS_IOS
+// Level complete is when a replay is usually saved: put a large Save Replay button in the safe area's
+// bottom-right corner of the results screen (it slides in with the drop-down layer).
+class $modify(ReplayEndLevelLayer, EndLevelLayer) {
+    void customSetup() {
+        EndLevelLayer::customSetup();
+        if (!m_mainLayer || !ReplayManager::get()->isReplayActive()) return;
+
+        auto btn = createSaveReplayButton(this, menu_selector(ReplayEndLevelLayer::onSaveReplay), 0.7f);
+        if (!btn) return;
+        // Label left of the icon: keeps the button low in the corner, clear of the results panel on 4:3 iPads.
+        auto label = CCLabelBMFont::create("Save Replay", "bigFont.fnt");
+        label->setScale(0.3f);
+        label->setAnchorPoint(ccp(1.0f, 0.5f));
+        label->setPosition(ccp(-4.0f, btn->getContentSize().height / 2.0f));
+        btn->addChild(label);
+
+        auto menu = CCMenu::create();
+        menu->setID("instant-replay-menu"_spr);
+        menu->addChild(btn);
+        CCRect safe = geode::utils::getSafeAreaRect();
+        menu->setPosition(ccp(safe.getMaxX() - btn->getScaledContentSize().width / 2.0f - 10.0f,
+                              safe.getMinY() + btn->getScaledContentSize().height / 2.0f + 8.0f));
+        m_mainLayer->addChild(menu, 20);
+    }
+
+    void onSaveReplay(CCObject*) {
+        triggerSaveReplay();
+    }
+};
+#endif
+
+#endif // GEODE_IS_WINDOWS || GEODE_IS_MACOS || GEODE_IS_IOS

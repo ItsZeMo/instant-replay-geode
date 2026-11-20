@@ -1,6 +1,6 @@
 #include "ReplayManager.hpp"
 
-#if defined(GEODE_IS_WINDOWS) || defined(GEODE_IS_MACOS)
+#if defined(GEODE_IS_WINDOWS) || defined(GEODE_IS_MACOS) || defined(GEODE_IS_IOS)
 
 #include "../ui/ReplayNotification.hpp"
 #include "../ui/ReplayPopup.hpp"
@@ -18,6 +18,11 @@
 #include <fcntl.h>
 #include <sys/file.h>
 #include <unistd.h>
+#elif defined(GEODE_IS_IOS)
+#include "../platform/IOSPlatformUtils.hpp"
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
 #endif
 #include <sstream>
 #include <iomanip>
@@ -30,7 +35,7 @@ namespace replay {
 
 namespace {
 
-// RAII thread-scope helper for COM (Windows) and Objective-C autorelease pools (macOS).
+// RAII thread-scope helper for COM (Windows) and Objective-C autorelease pools (macOS, iOS).
 struct MediaThreadScope {
 #ifdef GEODE_IS_WINDOWS
     HRESULT coHr = E_FAIL;
@@ -39,8 +44,8 @@ struct MediaThreadScope {
     ~MediaThreadScope() {
         if (SUCCEEDED(coHr)) CoUninitialize();
     }
-#elif defined(GEODE_IS_MACOS)
-    MacAutoreleasePoolScope pool;
+#elif defined(GEODE_IS_MACOS) || defined(GEODE_IS_IOS)
+    AppleAutoreleasePoolScope pool;
     explicit MediaThreadScope(int /*unused*/ = 0) noexcept {}
 #endif
     MediaThreadScope(const MediaThreadScope&) = delete;
@@ -61,14 +66,23 @@ static constexpr double MAX_SEGMENT_DURATION = 120.0;   // safety fallback if pr
 static constexpr double SAVE_PENDING_SWITCH_TIMEOUT = 5.0; // safety fallback for non-blocking F6 switch
 static constexpr size_t MAX_QUEUED_VIDEO_FRAMES = 16;
 static constexpr size_t MIN_QUEUED_VIDEO_FRAMES = 4;
-static constexpr size_t BASE_QUEUED_VIDEO_BYTES = 64ull * 1024 * 1024;
-static constexpr size_t HARD_MAX_QUEUED_VIDEO_BYTES = 256ull * 1024 * 1024;
 static constexpr size_t MAX_IN_FLIGHT_ENCODER_FRAMES = 16;
 static constexpr size_t MIN_IN_FLIGHT_ENCODER_FRAMES = 4;
-static constexpr size_t MAX_IN_FLIGHT_ENCODER_BYTES = 256ull * 1024 * 1024;
 // Large frames (4K BGRA = 33 MB) get room for ~12 in-flight frames instead of 8, capped at 512 MiB (W11).
 static constexpr size_t IN_FLIGHT_BUDGET_FRAMES = 12;
+#ifdef GEODE_IS_IOS
+// iOS terminates apps that exceed the device's memory limit (jetsam), so video frames waiting for the
+// worker or the hardware encoder get a tighter budget than on desktop.
+static constexpr size_t BASE_QUEUED_VIDEO_BYTES = 48ull * 1024 * 1024;
+static constexpr size_t HARD_MAX_QUEUED_VIDEO_BYTES = 128ull * 1024 * 1024;
+static constexpr size_t MAX_IN_FLIGHT_ENCODER_BYTES = 96ull * 1024 * 1024;
+static constexpr size_t MAX_SCALED_IN_FLIGHT_ENCODER_BYTES = 128ull * 1024 * 1024;
+#else
+static constexpr size_t BASE_QUEUED_VIDEO_BYTES = 64ull * 1024 * 1024;
+static constexpr size_t HARD_MAX_QUEUED_VIDEO_BYTES = 256ull * 1024 * 1024;
+static constexpr size_t MAX_IN_FLIGHT_ENCODER_BYTES = 256ull * 1024 * 1024;
 static constexpr size_t MAX_SCALED_IN_FLIGHT_ENCODER_BYTES = 512ull * 1024 * 1024;
+#endif
 static constexpr size_t MAX_MIC_MIX_FRAMES = static_cast<size_t>(AudioGrabber::kMicSampleRate) * 5; // ~5s stereo cap
 // Worker-side microphone queue limits by duration (W15): >= 3 s while recording, 0.25 s while no encoder runs.
 static constexpr size_t MAX_MIC_QUEUE_FRAMES = static_cast<size_t>(AudioGrabber::kMicSampleRate) * 3;
@@ -191,6 +205,10 @@ bool isPidProcessAlive(uint32_t pid) {
 #elif defined(GEODE_IS_MACOS)
     // Verify both existence AND executable identity so OS PID reuse after a crash never stalls cleanup (M13).
     return isMacSameAppProcessAlive(static_cast<int>(pid));
+#elif defined(GEODE_IS_IOS)
+    // The sandbox hides other processes and iOS runs one copy of the game: any other pid_<PID> folder is left
+    // over from an earlier launch. A live owner would still hold session.lock, which the caller checks first.
+    return false;
 #else
     return false;
 #endif
@@ -616,7 +634,7 @@ void ReplayManager::initialize() {
     m_savePending.store(false);
     m_backendUnavailable.store(!isCaptureBackendReady());
     ReplayConfig::refreshNativeFrameHeight();
-#ifdef GEODE_IS_MACOS
+#if defined(GEODE_IS_MACOS) || defined(GEODE_IS_IOS)
     {
         const auto& caps = getMacVideoEncoderCaps();
         geode::log::info(
@@ -721,13 +739,16 @@ void ReplayManager::shutdown() {
 bool ReplayManager::isCaptureBackendReady() noexcept {
 #ifdef GEODE_IS_MACOS
     return isMacGLCaptureHookInstalled();
+#elif defined(GEODE_IS_IOS)
+    return isIOSGLCaptureHookInstalled();
 #else
     return true;
 #endif
 }
 
 void ReplayManager::reportCaptureBackendUnavailable() {
-    geode::log::error("Instant Replay: cannot start recording because the macOS GL capture hook failed to install (M20)");
+    geode::log::error("Instant Replay: cannot start recording because the " GEODE_PLATFORM_NAME
+                      " GL capture hook failed to install (M20)");
     geode::Loader::get()->queueInMainThread([]() {
         geode::Notification::create(
             "Instant Replay: Capture hook failed - cannot record video",
@@ -836,8 +857,8 @@ void ReplayManager::startReplay() {
     m_gameResampler.reset();
 
     m_sessionConfig = ReplayConfig::get().snapshot();
-    if (m_sessionConfig.recordMic.load()) {
-        AudioGrabber::get()->startMicCapture();
+    if (m_sessionConfig.recordMic.load() && !m_appSuspended.load()) {
+        AudioGrabber::get()->startMicCapture(); // a suspended app starts the mic on resume (setAppSuspended)
     } else {
         AudioGrabber::get()->stopMicCapture();
     }
@@ -1007,6 +1028,72 @@ void ReplayManager::setReplayEnabled(bool enabled) {
     } else {
         stopReplay();
     }
+}
+
+void ReplayManager::setAppSuspended(bool suspended) {
+    if (m_appSuspended.exchange(suspended) == suspended) return;
+    // Frames captured before the pause (still on the GPU or in the worker queue) carry stale timestamps.
+    FrameGrabber::get()->discardPendingFrames();
+    const bool recording = m_running.load();
+    if (suspended) {
+        geode::log::info("Instant Replay: app inactive - pausing recording{}",
+                         recording ? " (closing the current segment)" : "");
+        // The microphone is interrupted in the background anyway; stopping it also releases the
+        // record-capable audio session category and turns off the system's microphone indicator.
+        AudioGrabber::get()->stopMicCapture();
+    } else {
+        geode::log::info("Instant Replay: app active - {}", recording ? "resuming recording" : "recording is off");
+        if (recording && m_sessionConfig.recordMic.load()) {
+            AudioGrabber::get()->startMicCapture();
+        }
+    }
+    m_cv.notify_all();
+}
+
+void ReplayManager::enterSuspendedState(
+    const ReplayConfig& cfg,
+    std::vector<float>& gameAudioScratch,
+    std::vector<float>& resampledGameAudioScratch,
+    std::vector<float>& silenceScratch
+) {
+#ifdef GEODE_IS_IOS
+    // Finishing the MP4 must complete even if the app is on its way to the background.
+    IOSBackgroundTaskScope backgroundTask("InstantReplaySegmentClose");
+#endif
+    const auto start = std::chrono::steady_clock::now();
+    m_prepareCancel.store(true);
+    joinPrepareThread();
+    discardPreparedEncoder(); // a pre-warmed encoder would not survive the background either
+
+    const bool hadEncoder = (m_encoder && m_encoder->isRecording());
+    if (hadEncoder) {
+        std::string audioErr;
+        (void)processPendingAudio(cfg, gameAudioScratch, resampledGameAudioScratch, silenceScratch, audioErr,
+                                  std::chrono::steady_clock::now(), true /* bypassHorizon */);
+        finalizeCurrentSegment(true, cfg);
+        purgeOldSegments(cfg);
+    }
+    joinFinalizeThread(); // an earlier rotation may still be finishing its segment
+    if (m_encoder) {
+        m_encoder.reset();
+    }
+    reclaimInFlightFrames(false);
+    m_carryGameChunks.clear();
+    m_carryMicAudio.clear();
+    resetMicMixer();
+    m_gameResampler.reset();
+    m_lastVideoHns = -1;
+    m_lastVideoCaptureTime = {};
+    m_workerSuspended = true;
+
+    size_t keptSegments = 0;
+    {
+        std::lock_guard<std::mutex> lock(m_segmentMutex);
+        keptSegments = m_activeSegments.size();
+    }
+    geode::log::info("Instant Replay: recording paused ({} segment(s) kept, closed in {:.0f} ms)",
+                     keptSegments,
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
 }
 
 ToggleReplayResult ReplayManager::toggleReplay() {
@@ -2373,7 +2460,7 @@ bool ReplayManager::writeEncodedVideoFrame(
 
 #ifdef GEODE_IS_WINDOWS
     EncoderOpResult videoRes = m_encoder->writeVideoFrame(frame->buffer.get(), frame->width, frame->height, ts);
-#elif defined(GEODE_IS_MACOS)
+#elif defined(GEODE_IS_MACOS) || defined(GEODE_IS_IOS)
     EncoderOpResult videoRes = m_encoder->writeVideoFrame(frame->pixelBuffer.get(), frame->width, frame->height, ts);
 #endif
     if (videoRes) {
@@ -2660,6 +2747,10 @@ bool ReplayManager::handleSaveRequest(
             std::atomic<bool>& flag;
             ~ExportFlagGuard() { flag.store(false); }
         } exportGuard{m_exportInFlight};
+#ifdef GEODE_IS_IOS
+        // Keep merging if the player leaves the app right after saving.
+        IOSBackgroundTaskScope backgroundTask("InstantReplayExport");
+#endif
 
         if (extraPending.future.valid()) {
             bool keepExtra = extraPending.future.get();
@@ -2818,6 +2909,10 @@ bool ReplayManager::handleSaveRequest(
         // Exactly one result line per save, logged here so it is recorded even during exit (W7).
         const double mergeSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - exportStart).count();
         if (result.success) {
+            {
+                std::lock_guard<std::mutex> lastLock(m_lastSavedMutex);
+                m_lastSavedReplayPath = finalPath;
+            }
             std::error_code sizeEc;
             const auto bytes = std::filesystem::file_size(finalPath, sizeEc);
             geode::log::info("Instant Replay: replay saved: {} ({:.1f} s, {:.1f} MB, merged in {:.1f} s)",
@@ -2860,8 +2955,8 @@ void ReplayManager::workerThreadFunc(ReplayConfig sessionConfig) {
     bool hadFatalError = false;
 
     while (m_running.load()) {
-#ifdef GEODE_IS_MACOS
-        MacAutoreleasePoolScope iterPool;
+#if defined(GEODE_IS_MACOS) || defined(GEODE_IS_IOS)
+        AppleAutoreleasePoolScope iterPool;
 #endif
         std::shared_ptr<CapturedFrame> frame;
         {
@@ -2921,6 +3016,44 @@ void ReplayManager::workerThreadFunc(ReplayConfig sessionConfig) {
         }
 
         reclaimInFlightFrames(false);
+
+        // App inactive / in the background (iOS): close the segment while the encoder still works, then
+        // drop capture input until the app is active again. A save requested meanwhile exports the buffer.
+        if (m_appSuspended.load(std::memory_order_acquire)) {
+            if (!m_workerSuspended) {
+                enterSuspendedState(sessionConfig, gameAudioScratch, resampledGameAudioScratch, silenceScratch);
+            }
+            if (frame) {
+                FrameGrabber::get()->recycleFrame(std::move(frame));
+                frame.reset();
+            }
+            {
+                std::lock_guard<std::mutex> lock(m_queueMutex);
+                while (!m_frameQueue.empty()) {
+                    FrameGrabber::get()->recycleFrame(std::move(m_frameQueue.front()));
+                    m_frameQueue.pop_front();
+                }
+                m_micAudioQueue.clear();
+            }
+            AudioGrabber::get()->resetGameAudioBuffer();
+            if (m_saveRequested.exchange(false) || m_savePendingSwitch) {
+                m_savePendingSwitch = false;
+                std::string saveFatalErr;
+                if (!handleSaveRequest(true, sessionConfig, std::chrono::steady_clock::now(), false,
+                                       gameAudioScratch, resampledGameAudioScratch, silenceScratch, saveFatalErr)) {
+                    hadFatalError = true;
+                    handleFatalRecordingError(saveFatalErr);
+                    break;
+                }
+            }
+            continue;
+        }
+        if (m_workerSuspended) {
+            // The first frame after the pause starts a fresh (non-continuation) segment below.
+            m_workerSuspended = false;
+            AudioGrabber::get()->resetGameAudioBuffer();
+            geode::log::info("Instant Replay: recording resumed");
+        }
 
         if (!m_encoder || !m_encoder->isRecording()) {
             auto curNow = std::chrono::steady_clock::now();
@@ -3302,11 +3435,12 @@ void ReplayManager::showSaveFeedback(SaveReplayResult result) {
 void ReplayManager::openRecordingsFolder() {
     auto cfg = ReplayConfig::get().snapshot();
     geode::async::runtime().spawnBlocking<void>([cfg]() {
-#ifdef GEODE_IS_MACOS
+#if defined(GEODE_IS_MACOS) || defined(GEODE_IS_IOS)
         std::filesystem::path dir = cfg.getRecordingsDirectory(true);
         std::error_code ec;
         bool exists = std::filesystem::exists(dir, ec) && std::filesystem::is_directory(dir, ec);
-        // Dispatch back to GD's Geode main queue (runs on CVDisplayLink on macOS, N11) after off-thread dir checks (M17).
+        // Dispatch back to GD's Geode main queue (runs on CVDisplayLink on macOS, N11; UIKit main thread on iOS,
+        // where openFolder opens the Files app) after off-thread dir checks (M17).
         geode::queueInMainThread([dir, exists]() {
             bool opened = exists && geode::utils::file::openFolder(dir);
             if (!opened) {
@@ -3343,6 +3477,49 @@ void ReplayManager::openRecordingsFolder() {
     });
 }
 
+#ifdef GEODE_IS_IOS
+void ReplayManager::shareLastReplay() {
+    std::filesystem::path last = getLastSavedReplayPath();
+    auto cfg = ReplayConfig::get().snapshot();
+    // File checks run off the main thread (#16); the share sheet itself must be presented on it.
+    geode::async::runtime().spawnBlocking<void>([cfg, last]() {
+        std::error_code ec;
+        std::filesystem::path target;
+        if (!last.empty() && std::filesystem::is_regular_file(last, ec)) {
+            target = last;
+        } else {
+            std::filesystem::path dir = cfg.getRecordingsDirectory(false);
+            std::filesystem::file_time_type newest{};
+            std::filesystem::directory_iterator it(dir, ec);
+            for (std::filesystem::directory_iterator end; !ec && it != end; it.increment(ec)) {
+                std::error_code fileEc;
+                if (!it->is_regular_file(fileEc)) continue;
+                const std::string name = geode::utils::string::pathToString(it->path().filename());
+                if (name.rfind("replay_", 0) != 0 || name.size() < 4 || name.compare(name.size() - 4, 4, ".mp4") != 0) {
+                    continue;
+                }
+                auto mtime = it->last_write_time(fileEc);
+                if (!fileEc && (target.empty() || mtime > newest)) {
+                    newest = mtime;
+                    target = it->path();
+                }
+            }
+        }
+        geode::queueInMainThread([target]() {
+            if (target.empty()) {
+                geode::Notification::create("Instant Replay: no saved replay to share yet",
+                                            geode::NotificationIcon::Info, 2.0f)->show();
+                return;
+            }
+            if (!presentIOSShareSheet(target)) {
+                geode::Notification::create("Instant Replay: cannot open the share sheet",
+                                            geode::NotificationIcon::Error, 2.5f)->show();
+            }
+        });
+    });
+}
+#endif
+
 } // namespace replay
 
-#endif // GEODE_IS_WINDOWS || GEODE_IS_MACOS
+#endif // GEODE_IS_WINDOWS || GEODE_IS_MACOS || GEODE_IS_IOS

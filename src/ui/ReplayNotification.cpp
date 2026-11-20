@@ -1,10 +1,14 @@
 #include "ReplayNotification.hpp"
 
-#if defined(GEODE_IS_WINDOWS) || defined(GEODE_IS_MACOS)
+#if defined(GEODE_IS_WINDOWS) || defined(GEODE_IS_MACOS) || defined(GEODE_IS_IOS)
 
 #include <cocos2d.h>
 #include <cocos-ext.h>
 #include <algorithm>
+#ifdef GEODE_IS_IOS
+#include "../platform/IOSPlatformUtils.hpp"
+#include <Geode/ui/Notification.hpp>
+#endif
 
 using namespace cocos2d;
 using namespace cocos2d::extension;
@@ -77,6 +81,24 @@ bool ReplayNotification::init(const std::string& filePath, double durationSecond
     subLabel->setPosition(ccp(-width / 2 + 60.0f, -10.0f));
     this->addChild(subLabel);
 
+#ifdef GEODE_IS_IOS
+    // One tap to AirDrop / save to Files / send the clip while the toast is visible.
+    if (auto shareSpr = CCSprite::createWithSpriteFrameName("GJ_shareBtn_001.png")) {
+        shareSpr->setScale(0.36f);
+        std::filesystem::path sharePath(filePath);
+        auto shareBtn = geode::cocos::CCMenuItemExt::createSpriteExtra(shareSpr, [sharePath](auto*) {
+            if (!presentIOSShareSheet(sharePath)) {
+                geode::Notification::create("Instant Replay: cannot open the share sheet",
+                                            geode::NotificationIcon::Error, 2.5f)->show();
+            }
+        });
+        auto menu = CCMenu::create();
+        menu->addChild(shareBtn);
+        menu->setPosition(ccp(width / 2 - 30.0f, 0.0f));
+        this->addChild(menu);
+    }
+#endif
+
     // Position initially offscreen
     this->setPosition(ccp(winSize.width / 2, winSize.height + 60.0f));
     animateIn();
@@ -101,4 +123,4 @@ void ReplayNotification::animateOut() {
 
 } // namespace replay
 
-#endif // GEODE_IS_WINDOWS || GEODE_IS_MACOS
+#endif // GEODE_IS_WINDOWS || GEODE_IS_MACOS || GEODE_IS_IOS

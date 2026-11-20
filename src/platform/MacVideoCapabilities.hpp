@@ -2,7 +2,8 @@
 
 #include <TargetConditionals.h>
 
-#if defined(__APPLE__) && !TARGET_OS_IPHONE
+// VideoToolbox capability probing, shared by macOS and iOS (the "Mac" prefix predates the iOS port).
+#if defined(__APPLE__)
 
 #include "../config/CodecUtils.hpp"
 
@@ -49,8 +50,8 @@ struct MacVideoEncoderCaps {
     }
 };
 
-// Queries macOS VideoToolbox once (thread-safe) via VTCopyVideoEncoderList to detect
-// real hardware and software encoder availability on the host Mac (e.g. M1 lacks AV1 HW).
+// Queries VideoToolbox once (thread-safe) via VTCopyVideoEncoderList to detect real hardware and
+// software encoder availability (e.g. M1 lacks AV1 HW; iPhone and iPad only have hardware H.264 / HEVC).
 const MacVideoEncoderCaps& getMacVideoEncoderCaps();
 
 // Cached VideoToolbox session capability check for oversize Retina resolutions (>4096x2304, M4).
@@ -58,4 +59,4 @@ bool isMacVideoEncodeSizeSupported(VideoCodecFamily family, bool hardware, int w
 
 } // namespace replay
 
-#endif // __APPLE__ && !TARGET_OS_IPHONE
+#endif // __APPLE__

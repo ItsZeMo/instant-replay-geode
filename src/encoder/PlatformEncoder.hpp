@@ -7,7 +7,7 @@
 namespace replay {
 using PlatformEncoder = MediaFoundationEncoder;
 }
-#elif defined(GEODE_IS_MACOS)
+#elif defined(GEODE_IS_MACOS) || defined(GEODE_IS_IOS)
 #include "VideoToolboxEncoder.hpp"
 namespace replay {
 using PlatformEncoder = VideoToolboxEncoder;

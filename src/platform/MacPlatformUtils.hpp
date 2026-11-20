@@ -6,8 +6,7 @@
 
 #include <filesystem>
 
-extern "C" void* objc_autoreleasePoolPush(void);
-extern "C" void objc_autoreleasePoolPop(void*);
+#include "AppleAutoreleasePool.hpp"
 
 namespace replay {
 
@@ -35,23 +34,6 @@ bool isMacGLCaptureHookInstalled() noexcept;
 
 // Disables the flushBuffer callback cleanly during shutdown.
 void disableMacGLCaptureHook() noexcept;
-
-// RAII autorelease pool wrapper for C++ worker/background threads on macOS.
-class MacAutoreleasePoolScope {
-public:
-    MacAutoreleasePoolScope() noexcept : m_pool(objc_autoreleasePoolPush()) {}
-    ~MacAutoreleasePoolScope() noexcept {
-        if (m_pool) {
-            objc_autoreleasePoolPop(m_pool);
-            m_pool = nullptr;
-        }
-    }
-    MacAutoreleasePoolScope(const MacAutoreleasePoolScope&) = delete;
-    MacAutoreleasePoolScope& operator=(const MacAutoreleasePoolScope&) = delete;
-
-private:
-    void* m_pool = nullptr;
-};
 
 } // namespace replay
 

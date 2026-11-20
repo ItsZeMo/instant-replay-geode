@@ -2,7 +2,7 @@
 
 #include <Geode/Geode.hpp>
 
-#if defined(GEODE_IS_WINDOWS) || defined(GEODE_IS_MACOS)
+#if defined(GEODE_IS_WINDOWS) || defined(GEODE_IS_MACOS) || defined(GEODE_IS_IOS)
 
 #include <Geode/ui/Popup.hpp>
 #include <Geode/ui/TextInput.hpp>
@@ -27,6 +27,8 @@ public:
     void updateStatusDisplay(float dt = 0.0f);
     void refreshUI(bool syncTogglers = true);
     void scheduleDiskSpaceCheck(bool immediate);
+    // Scales the dashboard down on windows narrower than it (4:3 iPads).
+    void show() override;
 
 protected:
     bool init(float width, float height);
@@ -164,4 +166,4 @@ private:
 
 } // namespace replay
 
-#endif // GEODE_IS_WINDOWS || GEODE_IS_MACOS
+#endif // GEODE_IS_WINDOWS || GEODE_IS_MACOS || GEODE_IS_IOS

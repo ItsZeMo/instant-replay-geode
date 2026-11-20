@@ -1,7 +1,7 @@
 # 🎬 Instant Replay
 
 > **Developer:** **ZeMo**  
-> **Version:** **v1.0.5** | **Platforms:** Windows 64-bit & macOS Universal (`arm64` / `x86_64`) (Geometry Dash 2.2081 / Geode v5.11.2)
+> **Version:** **v1.0.5** | **Platforms:** Windows 64-bit, macOS Universal (`arm64` / `x86_64`) & iPhone / iPad (iOS 14+) (Geometry Dash 2.2081 / Geode v5.11.2)
 
 Never lose an epic demon completion, new best, or hilarious fail again! **Instant Replay** brings high-performance, background replay recording directly into Geometry Dash with low overhead, GPU hardware acceleration, adaptive bitrate, multi-track audio, and seamless Geode integration.
 
@@ -37,6 +37,13 @@ Never lose an epic demon completion, new best, or hilarious fail again! **Instan
 ### 📁 Custom Save Location
 * Choose any folder or SSD using the native OS folder picker, or jump directly to your recorded clips via the in-game **«Open Folder»** button.
 
+### 📱 iPhone & iPad
+* **Tap to save:** a film-strip **Save Replay** button sits in the **pause menu** and on the **level-complete screen**; the dashboard has one too (a hardware keyboard can still use `F6` / `F9`).
+* **Your clips** go to the app's **Documents/Instant Replay** folder (Files app → On My iPhone / iPad → your Geode launcher). Tap **Share** in the save notification or the dashboard to AirDrop the clip, save it to Files or send it to a friend.
+* **Hardware encoding only:** HEVC (default) or H.264 on the device's media engine. AV1 cannot be encoded on Apple chips, so it records HEVC instead.
+* **Leaving the game** (home gesture, app switcher, a call) pauses recording and keeps everything recorded so far; recording continues when you come back.
+* **Microphone:** only available when your launcher app declares microphone access; otherwise the mod leaves the mic alone (iOS would close the game) and shows *Mic Unavailable in Launcher*.
+
 ---
 
 ## ⌨️ Default Hotkeys
@@ -47,7 +54,7 @@ Never lose an epic demon completion, new best, or hilarious fail again! **Instan
 | **`Ctrl + F6`** | **Toggle Replay On / Off** (with status toast notification) |
 | **`F9`** | **Open Instant Replay In-Game Dashboard** |
 
-> 💡 *Hotkeys do not conflict with NVIDIA App / GeForce Experience or vanilla Geometry Dash. All keybinds can also be customized in the Geode Mod Settings.*
+> 💡 *Hotkeys do not conflict with NVIDIA App / GeForce Experience or vanilla Geometry Dash. All keybinds can also be customized in the Geode Mod Settings. On iPhone / iPad use the Save Replay buttons instead.*
 
 ---
 
@@ -67,6 +74,7 @@ Never lose an epic demon completion, new best, or hilarious fail again! **Instan
 * **AMD Radeon (RX 5000 / 6000):** Select **HEVC** or **H.264** with Hardware Acceleration enabled.
 * **Intel Arc & Core Ultra:** Select **AV1** with Hardware Acceleration enabled.
 * **Apple Silicon / Intel Macs:** Select **HEVC** (recommended) or **H.264** with Hardware Acceleration enabled (AV1 is automatically gated unless Apple VideoToolbox reports hardware encode support).
+* **iPhone / iPad:** **HEVC** (default, iPhone 7 / A10 and newer) or **H.264** for maximum compatibility; **1080p** at **60 FPS** keeps files and heat down on older devices.
 * **Laptops / Integrated Graphics / Budget PCs:** Select **H.264** with Hardware Acceleration (or CPU fallback).
 
 ### 3. Editing Separate Audio Tracks

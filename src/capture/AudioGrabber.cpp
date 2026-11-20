@@ -1,6 +1,6 @@
 #include "AudioGrabber.hpp"
 
-#if defined(GEODE_IS_WINDOWS) || defined(GEODE_IS_MACOS)
+#if defined(GEODE_IS_WINDOWS) || defined(GEODE_IS_MACOS) || defined(GEODE_IS_IOS)
 
 #include "../config/ReplayConfig.hpp"
 #include "../recorder/ReplayManager.hpp"
@@ -941,4 +941,4 @@ void AudioGrabber::micCaptureThreadFunc() {
 
 } // namespace replay
 
-#endif // GEODE_IS_WINDOWS || GEODE_IS_MACOS
+#endif // GEODE_IS_WINDOWS || GEODE_IS_MACOS || GEODE_IS_IOS

@@ -10,9 +10,10 @@ This document provides the complete architectural context, invariants, and build
 - **Target Platforms:**
   - Windows 64-bit (`WIN32` / `x86_64`, guarded by `#ifdef GEODE_IS_WINDOWS`)
   - macOS Universal (`arm64` + `x86_64`, macOS `11.0+`, guarded by `#ifdef GEODE_IS_MACOS`)
+  - iOS / iPadOS (`arm64`, iOS `14.0+`, guarded by `#ifdef GEODE_IS_IOS`): Geometry Dash loaded by a Geode iOS launcher (JIT or JIT-less "patchless" mode). Code shared by both Apple platforms uses `#if defined(GEODE_IS_MACOS) || defined(GEODE_IS_IOS)`.
 - **Target Game / Loader:** Geometry Dash `2.2081`, Geode SDK `v5.11.2`
-- **Language Standard:** C++23 (`clang-cl` / MSVC on Windows; Apple `clang++` + Objective-C++23 with `-fobjc-arc -fobjc-arc-exceptions` on macOS)
-- **Purpose:** ShadowPlay-style background instant replay recorder for Geometry Dash. Continuously records rolling 30-second MP4 segments in the background using hardware-accelerated Windows Media Foundation or macOS VideoToolbox encoders and lossless segment remuxing when the user presses `F6` (Save Replay).
+- **Language Standard:** C++23 (`clang-cl` / MSVC on Windows; Apple `clang++` + Objective-C++23 with `-fobjc-arc -fobjc-arc-exceptions` on macOS and iOS)
+- **Purpose:** ShadowPlay-style background instant replay recorder for Geometry Dash. Continuously records rolling 30-second MP4 segments in the background using hardware-accelerated Windows Media Foundation or Apple VideoToolbox (macOS, iOS) encoders and lossless segment remuxing when the user presses `F6` (Save Replay) or, on iOS, a Save Replay button.
 
 ---
 
@@ -20,8 +21,8 @@ This document provides the complete architectural context, invariants, and build
 
 ```text
 instant-replay-geode/
-├── mod.json                             # Geode manifest, settings schema, keybind definitions
-├── CMakeLists.txt                       # CMake build script (Win32/MF on Windows; ObjC++23 ARC + VT/AVF/CA on macOS)
+├── mod.json                             # Geode manifest (win / mac / ios), settings schema, keybind definitions
+├── CMakeLists.txt                       # CMake build script (Win32/MF on Windows; ObjC++23 ARC + VT/AVF/CA on macOS; + UIKit/OpenGLES on iOS)
 ├── about.md                             # Geode in-game mod description
 ├── changelog.md                         # Release history
 ├── LICENSE                              # MIT License
@@ -33,22 +34,32 @@ instant-replay-geode/
 │       ├── test_host.cpp                # Standalone Windows host unit/MF integration tests (clang-cl /std:c++latest)
 │       ├── test_host_mac.mm             # Standalone macOS VideoToolbox/CGL/remux host integration tests (--long: 10-min export)
 │       ├── shared_pure_tests.hpp        # Platform-independent tests run by BOTH drivers (K7; keep platform headers out)
-│       └── mock_geode/                  # Minimal header mocks for standalone macOS host tests
+│       └── mock_geode/                  # Minimal header mocks for the standalone macOS host tests and the iOS harness
+│   └── ios/
+│       ├── CaptureHarness.mm            # iOS Simulator app: real present hook + FrameGrabberIOS + encoder + concat, decoded and checked
+│       ├── run_capture_harness.sh       # Builds the harness .app, runs it on a Simulator, copies the videos to build-ios-sim/
+│       ├── Info.plist                   # Harness bundle (UIScene lifecycle, landscape like GD)
+│       └── mock/cocos2d.h               # cocos2d namespace stand-in for FrameGrabber.cpp
 └── src/
-    ├── main.cpp                         # Hooks ($on_game(Exiting), CCEGLView / NSOpenGLContext flushBuffer, FMODAudioEngine, menus), keybinds
+    ├── main.cpp                         # Hooks ($on_game(Exiting), CCEGLView / NSOpenGLContext flushBuffer / EAGLContext presentRenderbuffer, FMODAudioEngine, menus, iOS EndLevelLayer), keybinds
     ├── config/
     │   ├── BitrateMath.hpp              # Pure bitrate math: codec/FPS/output-size factors, per-family CodecBitrateTable (W1, W9)
     │   ├── CodecUtils.hpp               # Pure codec parsing (resolveRequestedCodecSpec) & H.264 4096x2304 aspect clamping
     │   └── ReplayConfig.hpp             # Thread-safe singleton configuration, snapshots, Retina size, disk checks & mod.json sync
     ├── platform/
+    │   ├── AppleAutoreleasePool.hpp     # RAII autorelease pool for worker threads (macOS + iOS; MacAutoreleasePoolScope alias)
     │   ├── MacPlatformUtils.hpp / .mm   # Cocoa folders, Retina GL drawable size, CGL-locked flushBuffer hook, PID identity check
-    │   ├── MacVideoCapabilities.hpp/.mm # VTCopyVideoEncoderList hardware/SW gating & cached >4K VideoToolbox size probes
+    │   ├── IOSPlatformUtils.hpp / .mm   # iOS: EAGLContext presentRenderbuffer swizzle, Documents/tmp folders, EAGLView size, app lifecycle observers, background tasks, host Info.plist keys, share sheet
+    │   ├── MacVideoCapabilities.hpp/.mm # VTCopyVideoEncoderList hardware/SW gating & cached >4K VideoToolbox size probes (macOS and iOS)
     │   └── WinVideoCapabilities.hpp/.cpp# Background MFTEnumEx probe of HW/SW AV1 / HEVC / H.264 encoders (Windows, W4)
     ├── capture/
     │   ├── FrameBudget.hpp              # Dynamic byte-budgeted pool/queue/in-flight frame helpers
-    │   ├── FrameGrabber.hpp / .cpp      # OpenGL FBO scaling + async PBO readback + IMFMediaBuffer / BT.709 CVPixelBuffer pool
+    │   ├── AspectFit.hpp                # Pure letterbox / pillarbox fit rectangle shared by all capture backends
+    │   ├── FrameGrabber.hpp / .cpp      # Frame pool + pacing (all platforms); desktop OpenGL FBO scaling + async PBO readback (Win / Mac)
+    │   ├── FrameGrabberIOS.mm           # iOS OpenGL ES capture: copy + scaled/flipped draw into IOSurface CVPixelBuffers (CVOpenGLESTextureCache) with GPU fences; glReadPixels fallback
     │   ├── GameAudioRing.hpp            # Lock-free SPSC ring buffer + packet metadata ring for FMOD audio
     │   ├── AudioGrabber.hpp/.cpp/.mm    # FMOD DSP capture + WASAPI (Win) / CoreAudio + TCC mic capture (Mac)
+    │   ├── AudioGrabberIOS.mm           # iOS mic: AVAudioSession PlayAndRecord (restored afterwards) + AudioQueue, host privacy-key check
     │   └── MicStatusPolicy.hpp          # MicCaptureStatus + Geode-free mic status policy (K1, host-tested)
     ├── encoder/
     │   ├── VideoEncoderTypes.hpp        # Shared EncoderOpResult struct (+ ConcatResult.hpp, Geode-free)
@@ -57,7 +68,7 @@ instant-replay-geode/
     │   ├── SegmentAudioLayout.hpp       # Windows segment AAC pre-roll (50 ms) constants (W2)
     │   ├── MediaFoundationEncoder.*     # IMFSinkWriter encoding, fallback cascade, segment audio pre-roll (Windows)
     │   ├── MfSegmentConcat.hpp/.cpp     # Geode-free MF exporter: video remux + continuous AAC re-encode (Windows, host-tested)
-    │   └── VideoToolboxEncoder.hpp/.mm  # AVAssetWriter + VT encoding, deferred AAC FIFO & AVAssetReader remuxing (macOS)
+    │   └── VideoToolboxEncoder.hpp/.mm  # AVAssetWriter + VT encoding, deferred AAC FIFO & AVAssetReader remuxing (macOS and iOS)
     ├── recorder/
     │   ├── MicMixFifo.hpp               # Timeline-anchored stereo mic mixing FIFO (drift/pause/overlap/rebase)
     │   ├── SegmentRules.hpp             # Segment duration (max of video / game audio) & keep rule (W14)
@@ -66,6 +77,7 @@ instant-replay-geode/
     └── ui/
         ├── ReplayPopup.hpp / .cpp       # 4-tab in-game dashboard & settings popup (F9)
         ├── CodecGuidePopup.hpp / .cpp   # GPU / VideoToolbox codec recommendation modal
+        ├── PopupFit.hpp                 # Scales popups down on windows narrower than them (4:3 iPads, 5:4 monitors)
         └── ReplayNotification.hpp / .cpp# Toast notification when a replay is saved
 ```
 
@@ -80,9 +92,18 @@ instant-replay-geode/
    - Reads pixels asynchronously via 2 alternating PBOs (`m_pbos[2]`) in `GL_BGRA` into a byte-budgeted pool (`kMaxPooledFrames = 6`, `max(50 MB, min(256 MB, 4 * frameBytes))`) of `IMFMediaBuffer` (Windows) or BT.709-tagged IOSurface-backed `CVPixelBuffer` (macOS).
    - **Note:** OpenGL readback is bottom-up. Windows keeps pixels bottom-up with negative stride (`-width * 4`) in Media Foundation; macOS flips Y inside the GPU `glBlitFramebuffer` pass so VideoToolbox receives top-down rows at zero CPU cost.
 
-2. **Audio Capture (`src/capture/AudioGrabber.cpp`, `src/capture/AudioGrabberMac.mm`)**
-   - **Game Audio:** Custom FMOD DSP attached to the tail of the Master `ChannelGroup`. Writes normalized 2-channel stereo float PCM into a pre-allocated **lock-free SPSC ring buffer + 8192-entry packet metadata ring** (`GameAudioRing`, 262144 stereo frames / ~5.46s @ 48 kHz) with zero heap allocations or mutex locks on the FMOD mixer thread.
+1b. **iOS Video Capture (`src/capture/FrameGrabberIOS.mm`, `src/platform/IOSPlatformUtils.mm`)**
+   - GD iOS renders with cocos2d-x's `EAGLView` into a CAEAGLLayer renderbuffer through an **OpenGL ES 2** `EAGLContext` on the UIKit main thread (CADisplayLink); ES 2 has no `glBlitFramebuffer` and no PBOs. `-[EAGLContext presentRenderbuffer:]` is swizzled with `replaceObjcMethod` (works in Geode's JIT-less mode, unlike runtime `Mod::hook`); the callback runs only for GD's context (`[[EAGLView sharedEGLView] context]`) while it is current, after every overlay has been drawn.
+   - The presented renderbuffer (`GL_RENDERBUFFER_BINDING`) is attached to our own read FBO and copied (`glCopyTexSubImage2D`, `GL_RGB` so RGBA8 and RGB565 drawables both work) into a source texture; a textured quad (own program + VAO, `highp` texcoords) scales it to the session size with letterbox/pillarbox bars and flips Y so rows come out top-down.
+   - **Device path:** the quad is drawn straight into the pooled IOSurface `CVPixelBuffer` through a `CVOpenGLESTextureCache` texture (`kCVPixelBufferOpenGLESCompatibilityKey`); a GPU fence (`GL_APPLE_sync`, ES 3 core on ES 3 contexts) marks the frame and it is handed to the encoder on a later present (<= 3 frames in flight, never more than a 2 ms wait). The CV texture is released and the cache flushed before delivery so the pool's retain-count check sees the buffer as free again.
+   - **Fallback:** if the texture cache rejects the buffer (the iOS Simulator cannot map IOSurfaces into OpenGL ES, `-6683`) or the FBO with that texture is incomplete, capture switches permanently to an offscreen texture + synchronous `glReadPixels` (BGRA when the driver offers it, otherwise RGBA with R/B swapped in the shader). If even that fails, capture is disabled for the launch and the player gets one notification. Pool buffers carry `kCVPixelBufferIOSurfaceOpenGLESTextureCompatibilityKey` / `...FBOCompatibilityKey`.
+   - Every GL state the pass touches is saved and restored (READ/DRAW framebuffers, renderbuffer, program, active texture + unit-0 binding, array buffer, VAO, viewport, clear colour, colour mask, blend/scissor/depth/stencil/cull/dither, pack alignment) because cocos2d-x caches GL state (`ccGLStateCache`).
+
+2. **Audio Capture (`src/capture/AudioGrabber.cpp`, `src/capture/AudioGrabberMac.mm`, `src/capture/AudioGrabberIOS.mm`)**
+   - **Game Audio:** Custom FMOD DSP attached to the tail of the Master `ChannelGroup` (FMOD is statically linked into GD on iOS; the mod reaches it through the iOS addresses in the bindings' `FMOD.bro`). Writes normalized 2-channel stereo float PCM into a pre-allocated **lock-free SPSC ring buffer + 8192-entry packet metadata ring** (`GameAudioRing`, 262144 stereo frames / ~5.46s @ 48 kHz) with zero heap allocations or mutex locks on the FMOD mixer thread.
    - **Microphone Audio:** Event-driven WASAPI capture (Windows) and CoreAudio `AudioQueue` (macOS), started only when both `enabled` and `recordMic` are true and stopped immediately in `ReplayManager::stopReplay()`. On Windows an `IMMNotificationClient` flags device arrival/removal and default-device changes; the capture thread re-resolves the wanted device (selected mic while active, else the default) and reports `Active` / `UsingFallbackDevice` / `NoInputDevice` / `DigitalSilenceDetected` (W6). On macOS, checks `[AVCaptureDevice authorizationStatusForMediaType:]` + bundle `NSMicrophoneUsageDescription` before touching CoreAudio and falls back to the system default input when a chosen mic disconnects (reattaching when it returns). GD ships without `NSMicrophoneUsageDescription` (Steam and launcher builds), so macOS grants the mic only through the responsible app (Steam asks for it). Status policy (`MicStatusPolicy.hpp`, K1): only an explicit privacy denial (`Denied` / `Restricted` or a refused prompt) is `PermissionDenied` and stops capture for the launch; >= 3 s of pure digital silence is a *soft* status (`BlockedNoUsageDescription` when the grant is undetermined and the bundle has no usage key, `DigitalSilenceDetected` when granted) that keeps the `AudioQueue` running and returns to `Active` on real audio. Every capture run resets the status, and live statuses are published with a CAS that never overwrites a denial.
+
+   - **iOS Microphone:** `AudioGrabberIOS.mm` first checks `NSMicrophoneUsageDescription` in the Info.plist of the bundle that owns the running executable (`iosHostHasInfoKey`; a LiveContainer-based launcher, not GD's own bundle) because iOS kills a process that touches the mic without it; without the key the mic is never touched, whatever the permission state says. Then the record permission (requested once, the prompt is answered asynchronously). The `AudioQueue` state is heap-allocated and shared with the `AVAudioSession` notification blocks. While capturing it switches `AVAudioSession` to `PlayAndRecord` (`DefaultToSpeaker`, `AllowBluetoothA2DP`, `MixWithOthers` kept if the game mixed) and restores the previous category when capture stops; interruptions, route changes and media-services resets restart the `AudioQueue`. The mic stops while the app is inactive (see 3b).
 
 3. **Worker Thread & Rolling Segments (`src/recorder/ReplayManager.cpp`)**
    - Takes an immutable `ReplayConfig` snapshot (`m_sessionConfig`) at `startReplay()`, locks the session output resolution and video bitrates once.
@@ -90,9 +111,15 @@ instant-replay-geode/
    - **Pre-Warming, Async Rotation & Seam Audio Rules:** Pre-warms the next segment's encoder on `m_prepareThread` after `25 s` (<= 2 live encoders). Audio tracks write up to the session-wide horizon `m_lastWrittenVideoCaptureTime`, hold newer PCM in carry queues, and split cleanly on boundary `S` (trimming `< S - 1 ms` uniformly). Offloads `Finalize()` on `m_finalizeThread` and exports on `m_exportThread`.
    - **Per-Stream Error & Recovery Handling:** Stops immediately on fatal storage errors (`ERROR_DISK_FULL`/`ENOSPC`, access denied, write-protect), tolerates transient `retryable` encoder backpressure (e.g. deferred macOS AAC buffering up to 10s), and attempts 1 encoder recreation/fallback on repeated non-storage write failures. A fatal error stops only the current session (`isStoppedByError()`); the persisted `enabled` setting is never switched off, Toggle Replay retries and the next game start records again (W19).
 
+3b. **iOS App Lifecycle (`ReplayManager::setAppSuspended`, `IOSPlatformUtils.mm`)**
+   - VideoToolbox's hardware encoder is unavailable to background apps and GPU work in the background gets the app killed. `UIApplicationWillResignActive` (and `DidEnterBackground`) call `setAppSuspended(true)`: the capture hook stops, pending GPU/queued frames are discarded (`FrameGrabber::discardPendingFrames`), the mic stops, and the worker's `enterSuspendedState` flushes pending audio, finalizes the current segment synchronously under an `IOSBackgroundTaskScope`, discards the pre-warmed encoder and drops input. Completed segments stay in the replay buffer; a save requested meanwhile exports them. `DidBecomeActive` resumes: the next frame starts a fresh (non-continuation) segment and the mic restarts.
+   - Exports run under a background task too, so a replay saved right before leaving the app still finishes. Temp segments of a process that was killed are removed on the next launch (only one GD runs on iOS; `session.lock` still protects a live owner).
+
 4. **Platform Encoders & Fallback Cascade (`MediaFoundationEncoder` / `VideoToolboxEncoder`)**
    - **Windows (`MediaFoundationEncoder.cpp`):** `IMFSinkWriter` with `MF_SINK_WRITER_DISABLE_THROTTLING = TRUE` and fallback cascade `Cached -> Requested (HW) -> HEVC (HW) -> H.264 (HW) -> H.264 (SW)`. Each attempt uses its own family's bitrate from the session `CodecBitrateTable` (W1); video types carry BT.709 / limited-range metadata and H.264 uses High profile with level 5.2 (6.2 when needed) so NVENC does not clamp the peak bitrate, with one retry without these extensions (W12, W13). Mean/max bitrates are read back via `ICodecAPI`. Every segment AAC track starts with 50 ms of silence pre-roll (`SegmentAudioLayout.hpp`, W2).
    - **macOS (`VideoToolboxEncoder.mm`):** each cascade attempt encodes at its own family's bitrate from the session `CodecBitrateTable` (`setFamilyBitrateTable`, `activeBitrateMbps()`, K3, like W1). `AVAssetWriter` + VideoToolbox (`VTCompressionSession` probe, `VTCopyVideoEncoderList` + `AVAssetWriter canApplyOutputSettings` gating so unsupported codecs like AV1 or non-writable SW HEVC switch cleanly to `H.264`; `H.264 (SW)` preferred in software mode if the selected codec is unsupported), BT.709 color properties, buffered deferred AAC FIFO (`kMaxPendingAudioSeconds = 10.0`), 60s `finishWriting` timeouts, `@try/@catch` ObjC exception guards with `-fobjc-arc-exceptions`, and `-fobjc-arc`.
+
+   - **iOS (`VideoToolboxEncoder.mm` shared with macOS):** iOS `AVAssetWriter` has no encoder-specification key and always uses the system (hardware media-engine) encoder, so capability probing treats every listed encoder as hardware and `ReplayConfig::kHardwareEncodingOnly` keeps hardware acceleration on. `kVTVideoEncoderSpecification_*` keys are only used on macOS / iOS 17.4+, `kVTCompressionPropertyKey_ConstantBitRate` only on macOS 13 / iOS 16+. HEVC requests 8-bit Main (`kVTProfileLevel_HEVC_Main_AutoLevel`) because the default can be Main10. Settings an encoder rejects are relaxed in order before giving up on the codec (all platforms): the peak-rate cap (`DataRateLimits`), then CQ without a bitrate, then the profile / level. No AV1 encode exists on Apple chips (the iOS `codec` default is `hevc`).
 
 5. **Saving & Segment Export (`concatenateSegments`)**
    - On `F6`, performs a hot-swap onto the pre-warmed encoder, locks selected segment paths in `m_exportLockedSegments`, and scans segment 0 for a keyframe near `trimStartSeconds`.
@@ -118,11 +145,20 @@ instant-replay-geode/
 7. **macOS ARC, ObjC Exceptions & Capture Hooks:**
    `.mm` files compile with `-fobjc-arc -fobjc-arc-exceptions`; wrap AVFoundation/VideoToolbox calls in `@try / @catch (NSException*)` so Objective-C exceptions never unwind into C++ frames. Never inline-hook AppKit/system frameworks on macOS; use `geode::hook::replaceObjcMethod` (`method_setImplementation`).
 
+8. **iOS Capture Must Leave GD's GL State Untouched:**
+   `FrameGrabberIOS.mm` runs inside GD's `presentRenderbuffer:` with GD's context current. Save and restore every GL state it touches (`SavedGlState`), keep `GL_RENDERBUFFER` bound to the presented renderbuffer, never touch GD's VAO 0 attribute state (use the private VAO), and never issue GL calls while the app is not active (`isIOSAppActive`, GL teardown is skipped in the background). Release CV textures and flush the texture cache before handing a buffer to the encoder.
+9. **iOS Privacy Keys:**
+   Never call `AVAudioSession` record APIs or start an input `AudioQueue` unless `iosHostHasInfoKey("NSMicrophoneUsageDescription")` (the bundle of the running executable) or the permission is already granted; never offer "Save Video" to Photos in the share sheet without a Photos usage key. iOS terminates the whole game otherwise.
+10. **iOS Hooks & Lifecycle:**
+   Only `$modify` hooks and `geode::hook::replaceObjcMethod` are allowed (Geode's JIT-less mode cannot patch runtime addresses). All UIKit work (share sheet, `openFolder` via `shareddocuments://`) runs on the main thread, which is also cocos' thread on iOS. Recording must close its segment on `setAppSuspended(true)`; long work after that runs inside `IOSBackgroundTaskScope`.
+11. **iOS Build Workaround:**
+   The 2.2081 bindings generate the iOS thunks of FMOD's C API (`FMOD_Debug_Initialize`, ...) without including `fmod.h`; `CMakeLists.txt` force-includes it into `GeodeBindings` for iOS only. Remove it once the bindings include the header themselves.
+
 ---
 
 ## 5. Building & Testing
 
-> **Platform Note:** Builds for **Windows x64** (`WIN32`) and **macOS Universal** (`arm64;x86_64`), and intentionally errors on Linux (`CMakeLists.txt`). CI (`.github/workflows/build.yml`) builds `Win64` (`build`), `MacOS` (`build-mac`), and runs the macOS (`host-tests-mac`) and Windows (`host-tests-win`) host tests.
+> **Platform Note:** Builds for **Windows x64** (`WIN32`), **macOS Universal** (`arm64;x86_64`) and **iOS** (`arm64`, iOS 14.0+), and intentionally errors on Linux/Android (`CMakeLists.txt`). CI (`.github/workflows/build.yml`) builds `Win64` (`build`), `MacOS` (`build-mac`), `iOS` (`build-ios`), and runs the macOS (`host-tests-mac`) and Windows (`host-tests-win`) host tests and the iOS Simulator capture harness (`ios-sim-harness`).
 
 ### Option A: Geode CLI (Recommended)
 Requires [Geode CLI](https://github.com/geode-sdk/cli), Geode SDK (`GEODE_SDK` env var), CMake, Ninja, and `clang-cl`/MSVC (Windows) or Xcode CLT (macOS):
@@ -137,6 +173,23 @@ cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DGEODE_DONT_INSTALL_M
 cmake --build build --config RelWithDebInfo
 ```
 Without `-DGEODE_DONT_INSTALL_MODS=ON`, `setup_geode_mod` runs `geode package --install` into the Geometry Dash of the active Geode CLI profile after every build.
+
+### iOS
+Needs Xcode with the iOS SDK and the iOS loader binary of the SDK (`geode sdk install-binaries -p ios`):
+```bash
+geode build -p ios                      # configures build-ios with -DCMAKE_SYSTEM_NAME=iOS -DGEODE_TARGET_PLATFORM=iOS
+# or
+cmake -B build-ios -G Ninja -DGEODE_TARGET_PLATFORM=iOS -DCMAKE_BUILD_TYPE=RelWithDebInfo -DGEODE_DONT_INSTALL_MODS=ON
+cmake --build build-ios
+```
+The package is `build-ios/zemo.instant-replay.geode` (`zemo.instant-replay.ios.dylib` inside).
+
+### iOS Simulator Capture Harness (`tests/ios/`)
+Geometry Dash cannot run in the Simulator (set `SIMCTL_CHILD_IR_HARNESS_SHARE_ONLY=1` when launching it with `simctl` to test only the share sheet), so `tests/ios/CaptureHarness.mm` is a small app with a cocos2d-x shaped `EAGLView` (ES 2 context, CAEAGLLayer renderbuffer) that draws a known pattern and presents it. Capture runs through the production code (`installIOSGLCaptureHook`, `FrameGrabberIOS.mm`, `VideoToolboxEncoder.mm`, `concatenateSegments`); the app decodes the MP4s and checks orientation, colours, letterbox bars, motion, A/V sync and that GD's GL state is unchanged after every present.
+```bash
+tests/ios/run_capture_harness.sh            # default "iPhone 18 Pro", else the first available iPhone simulator
+```
+The Simulator renders OpenGL ES in software and cannot map IOSurfaces into it, so the harness exercises the `glReadPixels` fallback; the IOSurface texture-cache path only runs on devices. Videos are copied to `build-ios-sim/videos/`.
 
 ### Host Unit & Platform Integration Tests (`tests/host/`)
 - **Shared (`tests/host/shared_pure_tests.hpp`):** platform-independent tests (ConcatTimestampMath, frame budgets, GameAudioRing, MicMixFifo, codec bounds, W1 / W9 / W14 / W15, K1 mic policy) included and run by both drivers below; keep platform headers out of it.
