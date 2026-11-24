@@ -1,8 +1,12 @@
 # Changelog
 
-## Unreleased
-- **iOS / iPadOS port (Geometry Dash 2.2081, Geode 5.11.2, iOS 14+):**
-  - New iOS build (`"ios": "2.2081"` in `mod.json`, iOS branch in `CMakeLists.txt`, `build-ios` CI job).
+## v1.1.0
+- **Geometry Dash 2.2091 & Geode v6.0.0 port:**
+  - Updated target Geometry Dash version to `2.2091` (`win`, `mac`, `ios`), Geode SDK to `v6.0.0`, and CI Geode CLI to `v4.0.2`.
+  - Migrated `geode::dirs`, `geode::utils::file::openFolder`, and `geode::utils::file::pick` to `asp::fs::Path`, and replaced the removed `geode::utils::string::pathToString` helper with `replay::pathToUtf8` / `replay::utf8ToStdPath` (`src/config/PathUtils.hpp`) to preserve full Windows UTF-8 path safety across all three platforms.
+  - Updated `ReplayPopup` for Geode v6.0.0 `geode::TextInput` and `geode::Popup` (`isFocused()`, `unfocus()`, `setFocusCallback`, `setNumericMode(true)`, `setDisplayEmojis(false)`, `CommonFilter::None` for Unicode folder paths, and public `Popup::onClose`).
+- **iOS / iPadOS port (iOS 14+):**
+  - New iOS build (`"ios": "2.2091"` in `mod.json`, iOS branch in `CMakeLists.txt`, `build-ios` CI job).
   - Capture at `-[EAGLContext presentRenderbuffer:]` (ObjC swizzle, works in Geode's JIT-less mode). The frame is copied and scaled/flipped on the GPU straight into IOSurface `CVPixelBuffer`s through `CVOpenGLESTextureCache` and reaches the encoder after a GPU fence; GD's GL state is restored exactly. A `glReadPixels` fallback covers devices (and the Simulator) where the texture cache cannot map the buffers.
   - The VideoToolbox encoder and capability probing build for iOS: hardware media engine only, 8-bit HEVC Main, encoder-spec keys only where iOS has them, and encoder settings an encoder rejects (peak bitrate cap, profile) are dropped instead of switching codecs. `codec` defaults to `hevc` on iOS (no AV1 encode on Apple chips).
   - Recording pauses when the app leaves the foreground: the segment is closed in time (the hardware encoder is unavailable in the background), the replay buffer is kept and recording resumes in a new segment. Saving keeps running briefly in the background.

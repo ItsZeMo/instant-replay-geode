@@ -27,6 +27,7 @@
 #include "capture/FrameBudget.hpp"
 #include "capture/GameAudioRing.hpp"
 #include "config/CodecUtils.hpp"
+#include "config/PathUtils.hpp"
 #include "encoder/ConcatTimestampMath.hpp"
 #include "encoder/VideoToolboxEncoder.hpp"
 #include "platform/MacVideoCapabilities.hpp"
@@ -761,7 +762,7 @@ void test240FpsTimescaleAndBT709() {
     CHECK(concatRes.success);
 
     @autoreleasepool {
-        std::string u8 = geode::utils::string::pathToString(merged);
+        std::string u8 = replay::pathToUtf8(merged);
         NSURL* url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:u8.c_str()]];
         AVURLAsset* asset = [AVURLAsset URLAssetWithURL:url options:@{ AVURLAssetPreferPreciseDurationAndTimingKey: @YES }];
         CHECK(asset != nil);
@@ -858,7 +859,7 @@ void test10SegmentAacContinuity() {
         verifyMp4NoOverlapAndDuration(merged, 1, 9.6, 10.5);
 
         @autoreleasepool {
-            std::string u8 = geode::utils::string::pathToString(merged);
+            std::string u8 = replay::pathToUtf8(merged);
             NSURL* url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:u8.c_str()]];
             AVURLAsset* asset = [AVURLAsset URLAssetWithURL:url options:@{ AVURLAssetPreferPreciseDurationAndTimingKey: @YES }];
             CHECK(asset != nil);
@@ -1117,7 +1118,7 @@ void testAudioVideoMarkersContinuousSync() {
         CHECK(concatRes.success);
 
         @autoreleasepool {
-            std::string u8 = geode::utils::string::pathToString(merged);
+            std::string u8 = replay::pathToUtf8(merged);
             NSURL* url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:u8.c_str()]];
             for (int audioIdx : {0, 1}) {
                 std::vector<double> aOn, vOn;
@@ -1207,7 +1208,7 @@ void testContinuousSineWaveSeamContinuity() {
     CHECK(concatRes.success);
 
     @autoreleasepool {
-        std::string u8 = geode::utils::string::pathToString(merged);
+        std::string u8 = replay::pathToUtf8(merged);
         NSURL* url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:u8.c_str()]];
         AVURLAsset* asset = [AVURLAsset URLAssetWithURL:url options:@{AVURLAssetPreferPreciseDurationAndTimingKey: @YES}];
         CHECK(asset != nil);
@@ -1343,7 +1344,7 @@ void testAacRoundingOverlapTolerance() {
 double maxMarkerOffsetMs(const std::filesystem::path& merged, size_t expectedMarkers, const char* label) {
     double worst = 0.0;
     @autoreleasepool {
-        std::string u8 = geode::utils::string::pathToString(merged);
+        std::string u8 = replay::pathToUtf8(merged);
         NSURL* url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:u8.c_str()]];
         for (int audioIdx : {0, 1}) {
             std::vector<double> aOn, vOn;
@@ -1431,7 +1432,7 @@ void testPartialExportPathK2() {
     CHECK(!ec);
     CHECK(!std::filesystem::exists(partPath));
     @autoreleasepool {
-        std::string u8 = geode::utils::string::pathToString(finalPath);
+        std::string u8 = replay::pathToUtf8(finalPath);
         AVURLAsset* asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:[NSString stringWithUTF8String:u8.c_str()]]
                                                 options:@{AVURLAssetPreferPreciseDurationAndTimingKey: @YES}];
 #pragma clang diagnostic push

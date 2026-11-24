@@ -7,6 +7,7 @@
 #include <Geode/ui/Popup.hpp>
 #include <Geode/ui/TextInput.hpp>
 #include <Geode/utils/async.hpp>
+#include <Geode/utils/file.hpp>
 #include "../config/ReplayConfig.hpp"
 #include "../recorder/ReplayManager.hpp"
 #include "../capture/AudioGrabber.hpp"
@@ -24,6 +25,7 @@ public:
 
     ~ReplayPopup() override;
 
+    void onClose(cocos2d::CCObject* sender) override;
     void updateStatusDisplay(float dt = 0.0f);
     void refreshUI(bool syncTogglers = true);
     void scheduleDiskSpaceCheck(bool immediate);
@@ -33,7 +35,6 @@ public:
 protected:
     bool init(float width, float height);
     void setup();
-    void onClose(cocos2d::CCObject* sender) override;
 
 private:
     struct DiskSpaceResult {
@@ -142,7 +143,7 @@ private:
 
     // Asynchronous folder browse preflight & picker
     geode::async::TaskHolder<std::filesystem::path> m_browsePathTask;
-    geode::async::TaskHolder<geode::Result<std::optional<std::filesystem::path>>> m_browsePickerTask;
+    geode::async::TaskHolder<geode::utils::file::PickResult> m_browsePickerTask;
     uint64_t m_browseRequestId = 0;
 
     // Settings dirty tracking & lock state (#17, #24, #31)

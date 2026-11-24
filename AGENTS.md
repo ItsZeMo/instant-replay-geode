@@ -11,7 +11,7 @@ This document provides the complete architectural context, invariants, and build
   - Windows 64-bit (`WIN32` / `x86_64`, guarded by `#ifdef GEODE_IS_WINDOWS`)
   - macOS Universal (`arm64` + `x86_64`, macOS `11.0+`, guarded by `#ifdef GEODE_IS_MACOS`)
   - iOS / iPadOS (`arm64`, iOS `14.0+`, guarded by `#ifdef GEODE_IS_IOS`): Geometry Dash loaded by a Geode iOS launcher (JIT or JIT-less "patchless" mode). Code shared by both Apple platforms uses `#if defined(GEODE_IS_MACOS) || defined(GEODE_IS_IOS)`.
-- **Target Game / Loader:** Geometry Dash `2.2081`, Geode SDK `v5.11.2`
+- **Target Game / Loader:** Geometry Dash `2.2091`, Geode SDK `v6.0.0` (Geode CLI `v4.0+`)
 - **Language Standard:** C++23 (`clang-cl` / MSVC on Windows; Apple `clang++` + Objective-C++23 with `-fobjc-arc -fobjc-arc-exceptions` on macOS and iOS)
 - **Purpose:** ShadowPlay-style background instant replay recorder for Geometry Dash. Continuously records rolling 30-second MP4 segments in the background using hardware-accelerated Windows Media Foundation or Apple VideoToolbox (macOS, iOS) encoders and lossless segment remuxing when the user presses `F6` (Save Replay) or, on iOS, a Save Replay button.
 
@@ -45,6 +45,7 @@ instant-replay-geode/
     ├── config/
     │   ├── BitrateMath.hpp              # Pure bitrate math: codec/FPS/output-size factors, per-family CodecBitrateTable (W1, W9)
     │   ├── CodecUtils.hpp               # Pure codec parsing (resolveRequestedCodecSpec) & H.264 4096x2304 aspect clamping
+    │   ├── PathUtils.hpp                # UTF-8 <-> std::filesystem::path helpers bridging Geode v6 asp::fs::Path safely on Win/Mac/iOS
     │   └── ReplayConfig.hpp             # Thread-safe singleton configuration, snapshots, Retina size, disk checks & mod.json sync
     ├── platform/
     │   ├── AppleAutoreleasePool.hpp     # RAII autorelease pool for worker threads (macOS + iOS; MacAutoreleasePoolScope alias)
@@ -131,13 +132,13 @@ instant-replay-geode/
 ## 4. Critical Invariants & Gotchas (Do Not Break)
 
 1. **Unicode Paths on Windows:**
-   Never use `std::filesystem::path::string()` or `std::filesystem::path(std::string)` directly, nor `_dupenv_s("USERPROFILE" / "TEMP")` — on Windows MSVC they use the narrow ANSI codepage instead of UTF-8. Always use `geode::utils::string::pathToString(path)`, `geode::utils::string::utf8ToWide(str)`, `SHGetKnownFolderPath(FOLDERID_Videos, ...)`, and `GetTempPathW`.
+   Never use `std::filesystem::path::string()` or `std::filesystem::path(std::string)` directly, nor `_dupenv_s("USERPROFILE" / "TEMP")` — on Windows MSVC they use the narrow ANSI codepage instead of UTF-8. Always use `replay::pathToUtf8(path)` / `replay::utf8ToStdPath(str)` (`src/config/PathUtils.hpp`), `geode::utils::string::utf8ToWide(str)`, `SHGetKnownFolderPath(FOLDERID_Videos, ...)`, and `GetTempPathW`. At Geode v6 `asp::fs::Path` boundaries (`geode::dirs::*`, `geode::utils::file::openFolder`, `file::pick`), convert via `utf8ToStdPath(aspPath.string())` and `asp::fs::Path(replay::pathToUtf8(stdPath))`.
 2. **Zero Disk I/O on Main Thread:**
    UI getters (`getRecordingsDirectory(false)`, `getTempDirectory(false)`) must not perform filesystem checks (`exists`, `space`, `create_directories`). Disk space monitoring in `ReplayPopup` runs asynchronously off the main thread.
 3. **Settings Clamping & Re-entrancy Guard (`ReplayConfig::s_isSavingSettings`):**
-   In Geode 5.10+, `IntSettingV3::setValue` resets to `defaultValue` if a value exceeds `min`/`max` in `mod.json`. Always write integer/float settings through `setClampedSetting` and keep `s_isSavingSettings = true` while saving.
+   In Geode 5.10+/6.0, `IntSettingV3::setValue` resets to `defaultValue` if a value exceeds `min`/`max` in `mod.json`. Always write integer/float settings through `setClampedSetting` and keep `s_isSavingSettings = true` while saving.
 4. **Do Not Overwrite Focused `geode::TextInput`:**
-   In `ReplayPopup::refreshUI()`, `updateFolderDisplay()`, and `syncUnfocusedInputsToConfig()`, always check `!isInputFocused(input)` before calling `input->setString(...)`, otherwise typing multi-digit numbers (like `"35"` or `"100"`) will clobber the user's input mid-keystroke.
+   In `ReplayPopup::refreshUI()`, `updateFolderDisplay()`, and `syncUnfocusedInputsToConfig()`, always check `!isInputFocused(input)` (`input->isFocused()` in Geode v6.0.0) before calling `input->setString(...)`, otherwise typing multi-digit numbers (like `"35"` or `"100"`) will clobber the user's input mid-keystroke. Use `input->unfocus()`, `setDisplayEmojis(false)`, and `CommonFilter::None` for Unicode folder paths.
 5. **Clean Shutdown, OpenGL Contexts & COM Lifetime:**
    `ReplayManager::shutdown()` is hooked on `$on_game(Exiting)` in `src/main.cpp` (disabling the macOS `flushBuffer` hook first) so OpenGL FBOs/PBOs and FMOD DSPs are released while valid. On macOS/Windows `FrameGrabber::resetGlResources(true)` verifies the current thread holds the owning GL context before `glDelete*`, and the `flushBuffer` hook saves/restores any previous CGL context. **macOS:** Geode sends `Exiting` from `-[AppController gameDidSave]` on the AppKit main thread (`[Main]` in the log) while cocos / `FMODAudioEngine::update` keep running on `[CVDisplayLink]`: the GD context is not current there, so `glDelete*` is skipped (harmless at exit), and state shared with the game thread must be synchronized (e.g. the capture DSP behind `AudioGrabber::m_dspMutex`, K5). All `ComRef` wrappers on Windows worker/WASAPI threads must be destroyed before `CoUninitialize()`.
 6. **Game/UI-Thread-Only Cocos2d / GD APIs, `Notification`, and `FMODAudioEngine`:**

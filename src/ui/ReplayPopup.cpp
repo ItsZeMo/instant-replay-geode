@@ -34,7 +34,7 @@ void setBtnScale(CCMenuItemSpriteExtra* btn, float scale) {
 }
 
 bool isInputFocused(TextInput* input) {
-    return input && input->getInputNode() && input->getInputNode()->m_selected;
+    return input && input->isFocused();
 }
 
 std::string utf8TailWithEllipsis(const std::string& str, size_t maxCodepoints) {
@@ -92,7 +92,7 @@ void setSliderLocked(Slider* slider, bool locked) {
 void setTextInputLocked(TextInput* input, bool locked) {
     if (!input) return;
     if (locked) {
-        input->defocus();
+        input->unfocus();
     }
     input->setEnabled(!locked);
 }
@@ -364,7 +364,7 @@ void ReplayPopup::defocusAllInputs() {
     TextInput* inputs[] = {m_durationInput, m_customCodecInput, m_customBitrateInput, m_saveFolderInput};
     for (TextInput* input : inputs) {
         if (input) {
-            input->defocus();
+            input->unfocus();
         }
     }
 }
@@ -662,8 +662,15 @@ void ReplayPopup::setupDashboardTab(CCNode* page, CCSize const& winSize, float c
 
     m_durationInput = TextInput::create(75.0f, "sec", "chatFont.fnt");
     m_durationInput->setCommonFilter(CommonFilter::Uint);
+    m_durationInput->setNumericMode(true);
+    m_durationInput->setDisplayEmojis(false);
     m_durationInput->setString(std::to_string(ReplayConfig::get().durationSeconds.load()));
     m_durationInput->setPosition(ccp(160.0f, winSize.height - 215.0f));
+    m_durationInput->setFocusCallback([this](TextInput::FocusState state) {
+        if (state == TextInput::FocusState::Unfocused) {
+            this->syncUnfocusedInputsToConfig();
+        }
+    });
     m_durationInput->setCallback([this](std::string const& str) {
         if (this->guardLocked()) {
             m_durationInput->setString(std::to_string(ReplayConfig::get().durationSeconds.load()));
@@ -835,6 +842,7 @@ void ReplayPopup::setupCodecTab(CCNode* page, CCSize const& winSize, float cente
     m_customCodecInput = TextInput::create(150.0f, "e.g. av1_nvenc", "chatFont.fnt");
 #endif
     m_customCodecInput->setCommonFilter(CommonFilter::Any);
+    m_customCodecInput->setDisplayEmojis(false);
     m_customCodecInput->setString(ReplayConfig::get().getCustomCodec());
     m_customCodecInput->setPosition(ccp(centerX - 10.0f, winSize.height - 135.0f));
     m_customCodecInput->setCallback([this](std::string const& str) {
@@ -1009,8 +1017,15 @@ void ReplayPopup::setupBitrateTab(CCNode* page, CCSize const& winSize, float cen
 
     m_customBitrateInput = TextInput::create(75.0f, "Mbps", "chatFont.fnt");
     m_customBitrateInput->setCommonFilter(CommonFilter::Uint);
+    m_customBitrateInput->setNumericMode(true);
+    m_customBitrateInput->setDisplayEmojis(false);
     m_customBitrateInput->setString(std::to_string(ReplayConfig::get().bitrateMbps.load()));
     m_customBitrateInput->setPosition(ccp(160.0f, winSize.height - 156.0f));
+    m_customBitrateInput->setFocusCallback([this](TextInput::FocusState state) {
+        if (state == TextInput::FocusState::Unfocused) {
+            this->syncUnfocusedInputsToConfig();
+        }
+    });
     m_customBitrateInput->setCallback([this](std::string const& str) {
         if (this->guardLocked()) {
             m_customBitrateInput->setString(std::to_string(ReplayConfig::get().bitrateMbps.load()));
@@ -1246,7 +1261,8 @@ void ReplayPopup::setupAudioStorageTab(CCNode* page, CCSize const& winSize, floa
     page->addChild(storageTitle);
 
     m_saveFolderInput = TextInput::create(280.0f, "Custom directory path", "chatFont.fnt");
-    m_saveFolderInput->setCommonFilter(CommonFilter::Any);
+    m_saveFolderInput->setCommonFilter(CommonFilter::None);
+    m_saveFolderInput->setDisplayEmojis(false);
     m_saveFolderInput->setString(ReplayConfig::get().getCustomSaveFolder());
     m_saveFolderInput->setPosition(ccp(centerX - 10.0f, winSize.height - 224.0f));
     m_saveFolderInput->setCallback([this](std::string const& str) {
@@ -1310,7 +1326,7 @@ void ReplayPopup::switchTab(int tabIndex) {
 }
 
 void ReplayPopup::updateFolderDisplay() {
-    std::string dir = geode::utils::string::pathToString(ReplayConfig::get().getRecordingsDirectory(false));
+    std::string dir = replay::pathToUtf8(ReplayConfig::get().getRecordingsDirectory(false));
     if (m_folderPathLabel) {
         std::string displayStr = utf8TailWithEllipsis(dir, 32);
         m_folderPathLabel->setString(displayStr.c_str());
@@ -1335,18 +1351,20 @@ void ReplayPopup::onBrowseFolder() {
                 return;
             }
             file::FilePickOptions options;
-            options.defaultPath = std::move(defaultDir);
+            if (!defaultDir.empty()) {
+                options.defaultPath = asp::fs::Path(replay::pathToUtf8(defaultDir));
+            }
 
             m_browsePickerTask.spawn(
                 file::pick(file::PickMode::OpenFolder, options),
-                [this, reqId](Result<std::optional<std::filesystem::path>> result) {
+                [this, reqId](file::PickResult result) {
                     if (s_instance != this || !this->getParent() || reqId != m_browseRequestId || this->guardLocked()) {
                         return;
                     }
                     if (!result.isOk() || !result.unwrap().has_value()) return;
 
                     auto path = std::move(result).unwrap().value();
-                    ReplayConfig::get().setCustomSaveFolder(geode::utils::string::pathToString(path));
+                    ReplayConfig::get().setCustomSaveFolder(std::string(path.string()));
                     this->markSettingsDirty(true);
                     this->updateFolderDisplay();
                     this->updateStatusDisplay(0.0f);

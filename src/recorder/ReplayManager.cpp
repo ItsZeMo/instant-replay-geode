@@ -96,7 +96,7 @@ static constexpr int MAX_ENCODER_START_FAILURES = 3;
 static constexpr int MAX_CONSECUTIVE_WRITE_ERRORS = 5;
 
 static bool isSegmentFile(const std::filesystem::path& path) {
-    std::string name = geode::utils::string::pathToString(path.filename());
+    std::string name = replay::pathToUtf8(path.filename());
     // Match exact pattern "seg_<digits>.mp4"
     if (name.size() <= 8) return false; // at least "seg_1.mp4"
     if (name.compare(0, 4, "seg_") != 0) return false;
@@ -237,7 +237,7 @@ void ReplayManager::ensureSessionLock(const std::filesystem::path& pidTempDir) {
         );
         if (hNew == INVALID_HANDLE_VALUE) {
             geode::log::warn("ReplayManager: failed to lock session file '{}': err={}",
-                geode::utils::string::pathToString(lockPath), GetLastError());
+                replay::pathToUtf8(lockPath), GetLastError());
             return;
         }
 
@@ -260,12 +260,12 @@ void ReplayManager::ensureSessionLock(const std::filesystem::path& pidTempDir) {
         int fdNew = ::open(lockPath.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0644);
         if (fdNew < 0) {
             geode::log::warn("ReplayManager: failed to open session file '{}': errno={}",
-                geode::utils::string::pathToString(lockPath), errno);
+                replay::pathToUtf8(lockPath), errno);
             return;
         }
         if (::flock(fdNew, LOCK_EX | LOCK_NB) != 0) {
             geode::log::warn("ReplayManager: failed to lock session file '{}': errno={}",
-                geode::utils::string::pathToString(lockPath), errno);
+                replay::pathToUtf8(lockPath), errno);
             ::close(fdNew);
             return;
         }
@@ -292,7 +292,7 @@ void ReplayManager::ensureSessionLock(const std::filesystem::path& pidTempDir) {
     }
 
     if (!baseToPersist.empty()) {
-        std::string baseUtf8 = geode::utils::string::pathToString(baseToPersist);
+        std::string baseUtf8 = replay::pathToUtf8(baseToPersist);
         geode::Loader::get()->queueInMainThread([baseUtf8]() {
             if (auto* mod = geode::Mod::get()) {
                 mod->setSavedValue<std::string>("last-temp-base", baseUtf8);
@@ -373,7 +373,7 @@ void ReplayManager::cleanupTempDir() {
             if (!isDir) continue;
 
             uint32_t otherPid = 0;
-            if (!parsePidFolderName(geode::utils::string::pathToString(dirPath.filename()), otherPid) || otherPid == selfPid) {
+            if (!parsePidFolderName(replay::pathToUtf8(dirPath.filename()), otherPid) || otherPid == selfPid) {
                 continue;
             }
 
@@ -575,7 +575,7 @@ void ReplayManager::cleanupStalePartialReplays() {
             const bool isFile = it->is_regular_file(entryEc);
             it.increment(ec);
             if (!isFile) continue;
-            const std::string name = geode::utils::string::pathToString(path.filename());
+            const std::string name = replay::pathToUtf8(path.filename());
             const std::string_view kPrefix = "replay_";
             const std::string_view kSuffix = ".mp4.part";
             if (name.size() <= kPrefix.size() + kSuffix.size() ||
@@ -2853,7 +2853,7 @@ bool ReplayManager::handleSaveRequest(
 
         geode::log::info(
             "Instant Replay: saving replay: {} segment(s), {:.1f} s buffered, trimming {:.1f} s -> {}",
-            segsToMerge.size(), totalSeconds, trimStartSeconds, geode::utils::string::pathToString(finalPath));
+            segsToMerge.size(), totalSeconds, trimStartSeconds, replay::pathToUtf8(finalPath));
         const auto exportStart = std::chrono::steady_clock::now();
 
         ConcatResult result;
@@ -2901,7 +2901,7 @@ bool ReplayManager::handleSaveRequest(
         }
         m_exportProgressPermille.store(-1, std::memory_order_relaxed);
 
-        std::string finalPathStr = geode::utils::string::pathToString(finalPath);
+        std::string finalPathStr = replay::pathToUtf8(finalPath);
         double savedDuration = (result.durationSeconds > 0.0)
             ? result.durationSeconds
             : std::max(0.0, totalSeconds - trimStartSeconds);
@@ -3442,9 +3442,9 @@ void ReplayManager::openRecordingsFolder() {
         // Dispatch back to GD's Geode main queue (runs on CVDisplayLink on macOS, N11; UIKit main thread on iOS,
         // where openFolder opens the Files app) after off-thread dir checks (M17).
         geode::queueInMainThread([dir, exists]() {
-            bool opened = exists && geode::utils::file::openFolder(dir);
+            bool opened = exists && geode::utils::file::openFolder(asp::fs::Path(replay::pathToUtf8(dir)));
             if (!opened) {
-                std::string dirStr = geode::utils::string::pathToString(dir);
+                std::string dirStr = replay::pathToUtf8(dir);
                 geode::Notification::create(
                     "Instant Replay: failed to open folder (" + dirStr + ")",
                     geode::NotificationIcon::Error,
@@ -3460,11 +3460,11 @@ void ReplayManager::openRecordingsFolder() {
             dir = cfg.getRecordingsDirectory(true);
             std::error_code ec;
             bool exists = std::filesystem::exists(dir, ec) && std::filesystem::is_directory(dir, ec);
-            opened = exists && geode::utils::file::openFolder(dir);
+            opened = exists && geode::utils::file::openFolder(asp::fs::Path(replay::pathToUtf8(dir)));
         }
 
         if (!opened) {
-            std::string dirStr = geode::utils::string::pathToString(dir);
+            std::string dirStr = replay::pathToUtf8(dir);
             geode::queueInMainThread([dirStr]() {
                 geode::Notification::create(
                     "Instant Replay: failed to open folder (" + dirStr + ")",
@@ -3494,7 +3494,7 @@ void ReplayManager::shareLastReplay() {
             for (std::filesystem::directory_iterator end; !ec && it != end; it.increment(ec)) {
                 std::error_code fileEc;
                 if (!it->is_regular_file(fileEc)) continue;
-                const std::string name = geode::utils::string::pathToString(it->path().filename());
+                const std::string name = replay::pathToUtf8(it->path().filename());
                 if (name.rfind("replay_", 0) != 0 || name.size() < 4 || name.compare(name.size() - 4, 4, ".mp4") != 0) {
                     continue;
                 }

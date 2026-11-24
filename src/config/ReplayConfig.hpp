@@ -6,6 +6,7 @@
 
 #include "BitrateMath.hpp"
 #include "CodecUtils.hpp"
+#include "PathUtils.hpp"
 #include <Geode/loader/SettingV3.hpp>
 #include <Geode/utils/string.hpp>
 #ifdef GEODE_IS_WINDOWS
@@ -883,7 +884,7 @@ struct ReplayConfig {
             addUnique(customPath);
         }
         addUnique(cachedDefaultTempDir());
-        addUnique(geode::dirs::getTempDir() / "InstantReplay");
+        addUnique(utf8ToStdPath(geode::dirs::getTempDir().string()) / "InstantReplay");
         return bases;
     }
 
@@ -991,9 +992,9 @@ private:
         }
 
 #ifdef GEODE_IS_WINDOWS
-        std::filesystem::path fallback = geode::dirs::getGameDir() / "Replays";
+        std::filesystem::path fallback = utf8ToStdPath(geode::dirs::getGameDir().string()) / "Replays";
 #else
-        std::filesystem::path fallback = geode::dirs::getSaveDir() / "Replays";
+        std::filesystem::path fallback = utf8ToStdPath(geode::dirs::getSaveDir().string()) / "Replays";
 #endif
         if (createIfMissing) {
             std::error_code ec;
@@ -1021,7 +1022,7 @@ private:
             }
         }
 
-        std::filesystem::path fallback = geode::dirs::getTempDir() / "InstantReplay";
+        std::filesystem::path fallback = utf8ToStdPath(geode::dirs::getTempDir().string()) / "InstantReplay";
         if (createIfMissing) {
             std::error_code ec;
             std::filesystem::create_directories(fallback, ec);

@@ -3,6 +3,7 @@
 #if defined(GEODE_IS_MACOS) || defined(GEODE_IS_IOS)
 
 #include "ConcatTimestampMath.hpp"
+#include "../config/PathUtils.hpp"
 #include "../platform/AppleAutoreleasePool.hpp"
 #include "../platform/MacVideoCapabilities.hpp"
 
@@ -786,7 +787,7 @@ bool VideoToolboxEncoder::tryStartLocked(
         std::error_code rmEc;
         std::filesystem::remove(outputPath, rmEc);
 
-        std::string utf8Path = geode::utils::string::pathToString(outputPath);
+        std::string utf8Path = replay::pathToUtf8(outputPath);
         NSString* nsPath = [NSString stringWithUTF8String:utf8Path.c_str()];
         if (!nsPath) {
             outCode = EINVAL;
@@ -1487,7 +1488,7 @@ ConcatResult concatenateImpl(
         };
 
         auto pathToURL = [](const std::filesystem::path& p) -> NSURL* {
-            std::string utf8 = geode::utils::string::pathToString(p);
+            std::string utf8 = replay::pathToUtf8(p);
             NSString* s = [NSString stringWithUTF8String:utf8.c_str()];
             return s ? [NSURL fileURLWithPath:s] : nil;
         };

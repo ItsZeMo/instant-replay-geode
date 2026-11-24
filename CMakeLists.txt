@@ -22,7 +22,7 @@ else()
     set(IR_TARGET_IOS OFF)
 endif()
 
-project(InstantReplay VERSION 1.0.5)
+project(InstantReplay VERSION 1.1.0)
 
 if (APPLE)
     enable_language(OBJCXX)

@@ -1,7 +1,7 @@
 # 🎬 Instant Replay for Geometry Dash (Geode)
 
 > **Developer:** ZeMo (`zemo.instant-replay`)  
-> **Platforms:** Windows 64-bit (`x86_64`), macOS Universal (`arm64` + `x86_64`) & iOS / iPadOS (`arm64`, iOS 14+) | **Geometry Dash:** `2.2081` | **Geode SDK:** `v5.11.2` | **Standard:** C++23 / Objective-C++23
+> **Platforms:** Windows 64-bit (`x86_64`), macOS Universal (`arm64` + `x86_64`) & iOS / iPadOS (`arm64`, iOS 14+) | **Geometry Dash:** `2.2091` | **Geode SDK:** `v6.0.0` | **Standard:** C++23 / Objective-C++23
 
 Hardware-accelerated, ShadowPlay-style background **Instant Replay** recorder built natively into Geometry Dash. Continuously buffers the last `N` seconds of gameplay (5s – 3600s) into rolling segments and exports an MP4 on demand (`F6`, or the **Save Replay** buttons on iPhone / iPad) with low capture overhead.
 
@@ -73,13 +73,13 @@ flowchart LR
 ## 🛠️ Building & Host Tests
 
 ### Windows
-1. Install [Geode CLI](https://github.com/geode-sdk/cli), [Geode SDK v5.11.2](https://github.com/geode-sdk/geode), CMake 3.21+, Ninja, and Visual Studio 2022 / LLVM (`clang-cl`).
+1. Install [Geode CLI v4.0+](https://github.com/geode-sdk/cli), [Geode SDK v6.0.0](https://github.com/geode-sdk/geode), CMake 3.21+, Ninja, and Visual Studio 2022 / LLVM (`clang-cl`).
 2. Ensure `GEODE_SDK` points to your Geode SDK directory and run `geode build --ninja`.
 3. Standalone Windows host tests (from a Developer PowerShell; the platform-independent tests in `tests/host/shared_pure_tests.hpp` run on both platforms):
    `clang-cl /std:c++latest /EHsc /O2 /W3 /I src tests/host/test_host.cpp src/encoder/MfSegmentConcat.cpp /Febuild\test_host.exe /Fobuild\ mfplat.lib mfreadwrite.lib mfuuid.lib ole32.lib /link /DELAYLOAD:mfplat.dll /DELAYLOAD:mfreadwrite.dll delayimp.lib && .\build\test_host.exe`
 
 ### macOS (Universal `arm64` + `x86_64`)
-1. Install Xcode Command Line Tools (`clang++`), CMake 3.21+, Ninja, [Geode CLI](https://github.com/geode-sdk/cli), and [Geode SDK v5.11.2](https://github.com/geode-sdk/geode).
+1. Install Xcode Command Line Tools (`clang++`), CMake 3.21+, Ninja, [Geode CLI v4.0+](https://github.com/geode-sdk/cli), and [Geode SDK v6.0.0](https://github.com/geode-sdk/geode).
 2. Ensure `GEODE_SDK` points to your Geode SDK directory and build with:
    ```bash
    cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DGEODE_DONT_INSTALL_MODS=ON
@@ -92,7 +92,7 @@ flowchart LR
    ```
 
 ### iOS / iPadOS (`arm64`)
-1. Install Xcode (iOS SDK), CMake 3.21+, Ninja, [Geode CLI](https://github.com/geode-sdk/cli) and [Geode SDK v5.11.2](https://github.com/geode-sdk/geode), then the iOS loader binary: `geode sdk install-binaries -p ios`.
+1. Install Xcode (iOS SDK), CMake 3.21+, Ninja, [Geode CLI v4.0+](https://github.com/geode-sdk/cli) and [Geode SDK v6.0.0](https://github.com/geode-sdk/geode), then the iOS loader binary: `geode sdk install-binaries -p ios`.
 2. Build with `geode build -p ios`, or:
    ```bash
    cmake -B build-ios -G Ninja -DGEODE_TARGET_PLATFORM=iOS -DCMAKE_BUILD_TYPE=RelWithDebInfo -DGEODE_DONT_INSTALL_MODS=ON
